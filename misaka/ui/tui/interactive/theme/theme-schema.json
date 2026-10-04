@@ -3,7 +3,10 @@
 	"title": "Harn Coding Agent Theme",
 	"description": "Theme schema for Harn coding agent",
 	"type": "object",
-	"required": ["name", "colors"],
+	"required": [
+		"name",
+		"colors"
+	],
 	"properties": {
 		"$schema": {
 			"type": "string",
@@ -322,6 +325,52 @@
 				"infoBg": {
 					"$ref": "#/$defs/colorValue",
 					"description": "Info sections background (system prompt, notices)"
+				}
+			},
+			"additionalProperties": false
+		},
+		"desktop": {
+			"type": "object",
+			"description": "Optional styling tokens for the desktop client",
+			"properties": {
+				"surface2": {
+					"$ref": "#/$defs/colorValue",
+					"description": "Desktop surface 2 background"
+				},
+				"surface3": {
+					"$ref": "#/$defs/colorValue",
+					"description": "Desktop surface 3 background"
+				},
+				"surfaceHover": {
+					"$ref": "#/$defs/colorValue",
+					"description": "Desktop surface hover state"
+				},
+				"borderSubtle": {
+					"$ref": "#/$defs/colorValue",
+					"description": "Desktop subtle border"
+				},
+				"border": {
+					"$ref": "#/$defs/colorValue",
+					"description": "Desktop standard border"
+				},
+				"borderAccent": {
+					"$ref": "#/$defs/colorValue",
+					"description": "Desktop accent border"
+				},
+				"disabled": {
+					"$ref": "#/$defs/colorValue",
+					"description": "Desktop disabled text / element color"
+				},
+				"focusRing": {
+					"$ref": "#/$defs/colorValue",
+					"description": "Desktop focus ring outline"
+				},
+				"chart": {
+					"type": "array",
+					"description": "Desktop chart 6-color palette",
+					"items": {
+						"$ref": "#/$defs/colorValue"
+					}
 				}
 			},
 			"additionalProperties": false

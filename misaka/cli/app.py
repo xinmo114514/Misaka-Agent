@@ -207,6 +207,8 @@ def _parser(extension_commands=None):
     rm = sub.add_parser("remove", help="Remove a Sister's profile; her cards, conversations and workspaces are kept")
     rm.add_argument("sid", help="Sister ID")
     rm.add_argument("--yes", action="store_true", help="Skip confirmation")
+    from misaka.cli.args import add_desktop_bridge_subparser
+    add_desktop_bridge_subparser(sub)
     return p
 
 def _doc_tree_lines(tree, depth=1):
@@ -720,10 +722,16 @@ def _cmd_uninstall(args):
     sys.exit(uninstall.run(mode=args.mode, assume_yes=args.yes, dry_run=args.dry_run))
 
 
+def _cmd_desktop_bridge(args):
+    from misaka.cli.desktop_bridge import main as desktop_bridge_main
+    return desktop_bridge_main(args)
+
+
 COMMANDS = {
     "setup": _cmd_setup,
     "update": _cmd_update,
     "uninstall": _cmd_uninstall,
+    "desktop-bridge": _cmd_desktop_bridge,
     "chat": _cmd_chat,
     "panel": _cmd_panel,
     "net-daemon": _cmd_net_daemon,

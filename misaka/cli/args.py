@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import sys
 from dataclasses import dataclass, field
-from typing import Literal, TextIO
+from typing import Any, Literal, TextIO
 
 from misaka.ai.types import ModelThinkingLevel
 from misaka.config import APP_NAME, home
@@ -38,6 +38,7 @@ class Args:
     name: str | None = None
     fork: str | None = None
     sessionDir: str | None = None
+    cwd: str | None = None
     models: list[str] | None = None
     tools: list[str] | None = None
     agents: str | None = None
@@ -77,7 +78,7 @@ def is_valid_thinking_level(level: str) -> bool:
 # `--name` and `--use-theme` are absent on purpose: they report the missing value themselves.
 _FLAGS_REQUIRING_A_VALUE = frozenset({
     "api-key", "append-system-prompt", "exclude-tools", "export", "extension", "fork",
-    "model", "models", "prompt-template", "provider", "session", "session-dir",
+    "model", "models", "prompt-template", "provider", "session", "session-dir", "cwd",
     "session-id", "system-prompt", "theme", "thinking", "tools", "agents",
 })
 
@@ -170,6 +171,9 @@ def parse_args(args: list[str]) -> Args:
             index += 1
         elif arg == "--session-dir" and has_next:
             result.sessionDir = args[index + 1]
+            index += 1
+        elif arg == "--cwd" and has_next:
+            result.cwd = args[index + 1]
             index += 1
         elif arg == "--models" and has_next:
             result.models = [item.strip() for item in args[index + 1].split(",")]
@@ -443,8 +447,21 @@ Built-in Tool Names:
 
 isValidThinkingLevel = is_valid_thinking_level
 
+
+def add_desktop_bridge_subparser(sub: Any) -> Any:
+    """Add the desktop-bridge sub-command parser and arguments."""
+    db = sub.add_parser("desktop-bridge", help="Run the JSONL stdio desktop bridge for desktop client")
+    db.add_argument("--cwd", help="Working directory for the session")
+    db.add_argument("--session", help="Session file or ID to resume")
+    db.add_argument("--model", help="Model to use (provider/model)")
+    db.add_argument("--theme", help="Theme name or path")
+    db.add_argument("--no-session", action="store_true", help="Run ephemeral session without saving to disk")
+    return db
+
+
 __all__ = [
     "Args",
     "Mode",
+    "add_desktop_bridge_subparser",
     "isValidThinkingLevel",
-    ]
+]

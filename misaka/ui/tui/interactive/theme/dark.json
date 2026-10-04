@@ -19,7 +19,8 @@
     "toolPendingBg": "#2a1e23",
     "toolSuccessBg": "#242c24",
     "toolErrorBg": "#3a2126",
-    "customMsgBg": "#2f2030"
+    "customMsgBg": "#2f2030",
+    "plumLite": "#c99bb4"
   },
   "colors": {
     "accent": "accent",
@@ -32,7 +33,7 @@
     "muted": "gray",
     "dim": "dimGray",
     "text": "text",
-    "thinkingText": "plum",
+    "thinkingText": "plumLite",
     "selectedBg": "selectedBg",
     "userMessageBg": "accent",
     "userMessageText": "text",
@@ -44,16 +45,16 @@
     "toolErrorBg": "toolErrorBg",
     "toolTitle": "text",
     "toolOutput": "gray",
-    "mdHeading": "rose",
+    "mdHeading": "roseLite",
     "mdLink": "roseLite",
-    "mdLinkUrl": "plum",
+    "mdLinkUrl": "plumLite",
     "mdCode": "accent",
     "mdCodeBlock": "green",
     "mdCodeBlockBorder": "gray",
     "mdQuote": "gray",
     "mdQuoteBorder": "gray",
     "mdHr": "gray",
-    "mdListBullet": "rose",
+    "mdListBullet": "roseLite",
     "toolDiffAdded": "green",
     "toolDiffRemoved": "red",
     "toolDiffContext": "gray",
@@ -81,5 +82,23 @@
     "pageBg": "#18181e",
     "cardBg": "#1e1e24",
     "infoBg": "#3c3728"
+  },
+  "desktop": {
+    "surface2": "#25252d",
+    "surface3": "#2c2c36",
+    "surfaceHover": "#232329",
+    "borderSubtle": "#2a2a33",
+    "border": "#37373f",
+    "borderAccent": "#8f2545",
+    "disabled": "#6e5f64",
+    "focusRing": "#e8698c",
+    "chart": [
+      "#cb3862",
+      "#e0b23e",
+      "#acd39c",
+      "#3c9a80",
+      "#4f70c4",
+      "#c191d4"
+    ]
   }
 }
