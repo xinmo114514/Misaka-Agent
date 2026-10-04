@@ -139,7 +139,9 @@ function createWindow() {
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: true,
-      preload: path.join(__dirname, 'preload.mjs'),
+      preload: fs.existsSync(path.join(__dirname, 'preload.mjs'))
+        ? path.join(__dirname, 'preload.mjs')
+        : path.join(__dirname, 'preload.js'),
     },
   })
 
