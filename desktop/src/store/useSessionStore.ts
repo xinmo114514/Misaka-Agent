@@ -1,5 +1,5 @@
 import { create } from 'zustand'
-import type { ChatMessage, ProjectGroup } from '../types/session'
+import type { ChatMessage, ProjectGroup, ToolCall } from '../types/session'
 import type { BridgeMessage } from '../types/global'
 
 interface SessionState {
@@ -209,7 +209,7 @@ export const useSessionStore = create<SessionState>((set, get) => ({
     const ev = msg.event
     const evType = ev.type
 
-    // 1. message_update: Buffer into rAF queue
+    // 1. message_update: Buffer deltas into rAF queue
     if (evType === 'message_update') {
       const assistantEvent = ev.assistantMessageEvent
       if (assistantEvent) {
@@ -217,6 +217,25 @@ export const useSessionStore = create<SessionState>((set, get) => ({
           pendingTextDelta += assistantEvent.delta || ''
         } else if (assistantEvent.type === 'thinking_delta') {
           pendingThinkingDelta += assistantEvent.delta || ''
+        } else if (assistantEvent.type === 'toolcall_start') {
+          set((state) => {
+            const list = [...state.messages]
+            const lastIdx = list.length - 1
+            if (lastIdx >= 0 && list[lastIdx].role === 'assistant') {
+              const current = list[lastIdx]
+              const toolCalls: ToolCall[] = current.toolCalls ? [...current.toolCalls] : []
+              if (!toolCalls.some((tc) => tc.id === assistantEvent.id)) {
+                toolCalls.push({
+                  id: assistantEvent.id,
+                  name: assistantEvent.toolName || 'tool',
+                  status: 'running',
+                  arguments: {},
+                })
+              }
+              list[lastIdx] = { ...current, toolCalls }
+            }
+            return { messages: list }
+          })
         }
       }
 
@@ -258,10 +277,29 @@ export const useSessionStore = create<SessionState>((set, get) => ({
       pendingThinkingDelta = ''
 
       const rawMsg = ev.message || {}
+
+      if (rawMsg.role === 'toolResult') {
+        set((state) => {
+          const list = [...state.messages]
+          for (let i = list.length - 1; i >= 0; i--) {
+            if (list[i].toolCalls) {
+              const tc = list[i].toolCalls?.find((c) => c.id === rawMsg.toolCallId)
+              if (tc) {
+                tc.status = rawMsg.isError ? 'error' : 'success'
+                tc.result = rawMsg.content
+                break
+              }
+            }
+          }
+          return { messages: list }
+        })
+        return
+      }
+
       if (rawMsg.role === 'assistant') {
         let fullText = ''
         let fullThinking = ''
-        const toolCalls: any[] = []
+        const toolCalls: ToolCall[] = []
 
         const contentBlocks = Array.isArray(rawMsg.content)
           ? rawMsg.content

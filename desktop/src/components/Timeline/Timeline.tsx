@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState, useCallback } from 'react'
+import React, { useEffect, useRef, useState, useCallback, useMemo } from 'react'
 import { ArrowDown, MessageSquare } from 'lucide-react'
 import { useSessionStore } from '../../store/useSessionStore'
 import { MessageItem } from './MessageItem'
@@ -9,6 +9,26 @@ export const Timeline: React.FC = () => {
   const scrollRef = useRef<HTMLDivElement>(null)
   const [showScrollBottom, setShowScrollBottom] = useState(false)
   const isAtBottomRef = useRef(true)
+
+  // ZCode battle-tested pattern: split live tail from historical turns
+  // Prevents ResizeObserver 1-frame latency scroll jitter during high-speed token streaming
+  const { historicalMessages, liveMessage } = useMemo(() => {
+    const isLastLive =
+      isStreaming &&
+      messages.length > 0 &&
+      messages[messages.length - 1].role === 'assistant'
+
+    if (isLastLive) {
+      return {
+        historicalMessages: messages.slice(0, -1),
+        liveMessage: messages[messages.length - 1],
+      }
+    }
+    return {
+      historicalMessages: messages,
+      liveMessage: null,
+    }
+  }, [messages, isStreaming])
 
   const handleScroll = useCallback(() => {
     if (!scrollRef.current) return
@@ -29,12 +49,12 @@ export const Timeline: React.FC = () => {
     setShowScrollBottom(false)
   }
 
-  // Stick-to-bottom on new streaming tokens
+  // Smooth stick-to-bottom on new streaming tokens
   useEffect(() => {
     if (isAtBottomRef.current) {
       scrollToBottom(false)
     }
-  }, [messages, isStreaming])
+  }, [messages, liveMessage?.content, liveMessage?.thinking])
 
   return (
     <div className="relative flex-1 h-full overflow-hidden flex flex-col bg-surface-0">
@@ -52,7 +72,21 @@ export const Timeline: React.FC = () => {
             <p className="text-xs text-dim">在下方输入框中提出问题或课题，Misaka 将开始研究。</p>
           </div>
         ) : (
-          messages.map((msg) => <MessageItem key={msg.id} message={msg} />)
+          <>
+            {/* Historical turns */}
+            <div className="space-y-4">
+              {historicalMessages.map((msg) => (
+                <MessageItem key={msg.id} message={msg} />
+              ))}
+            </div>
+
+            {/* Live Tail: normal document flow, 0 scroll jitter */}
+            {liveMessage && (
+              <div className="live-tail pt-1">
+                <MessageItem message={liveMessage} />
+              </div>
+            )}
+          </>
         )}
 
         {/* Bottom padding so content is not obscured by floating composer */}
