@@ -76,7 +76,7 @@ export default function App() {
       <div className="flex-1 flex overflow-hidden">
         <Group orientation="horizontal" className="h-full w-full">
           {/* Left Panel: Sidebar */}
-          <Panel defaultSize={22} minSize={16} maxSize={35} className="h-full overflow-hidden">
+          <Panel id="sidebar" defaultSize="22%" minSize="16%" maxSize="38%" className="h-full overflow-hidden">
             <Sidebar />
           </Panel>
 
@@ -84,7 +84,7 @@ export default function App() {
           <Separator className="w-[1px] bg-border hover:bg-accent transition-colors cursor-col-resize select-none" />
 
           {/* Right Panel: Active Workspace Timeline */}
-          <Panel defaultSize={78} minSize={50} className="h-full flex flex-col overflow-hidden bg-surface-0">
+          <Panel id="timeline" defaultSize="78%" minSize="50%" className="h-full flex flex-col overflow-hidden bg-surface-0">
             {/* Top Workspace Header matching screenshot */}
             <div className="flex items-center justify-between px-5 h-11 border-b border-border bg-surface-1/90 select-none shrink-0">
               {/* Task Title */}
