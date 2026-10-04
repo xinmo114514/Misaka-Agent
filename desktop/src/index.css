@@ -1,0 +1,86 @@
+@import "tailwindcss";
+
+@theme inline {
+  --color-accent: var(--accent);
+  --color-rose: var(--rose);
+  --color-rose-lite: var(--rose-lite);
+  --color-surface-0: var(--surface-0);
+  --color-surface-1: var(--surface-1);
+  --color-surface-2: var(--surface-2);
+  --color-surface-3: var(--surface-3);
+  --color-surface-hover: var(--surface-hover);
+  --color-border-subtle: var(--border-subtle);
+  --color-border: var(--border);
+  --color-border-strong: var(--border-strong);
+  --color-border-accent: var(--border-accent);
+  --color-text-main: var(--text-main);
+  --color-muted: var(--muted);
+  --color-dim: var(--dim);
+  --color-disabled: var(--disabled);
+  --color-focus-ring: var(--focus-ring);
+  --color-thinking-text: var(--thinking-text);
+  --color-chart-1: var(--chart-1);
+  --color-chart-2: var(--chart-2);
+  --color-chart-3: var(--chart-3);
+  --color-chart-4: var(--chart-4);
+  --color-chart-5: var(--chart-5);
+  --color-chart-6: var(--chart-6);
+
+  --radius-sm: 8px;
+  --radius-md: 11px;
+  --radius-lg: 12px;
+}
+
+:root {
+  --accent: #cb3862;
+  --rose: #cb3862;
+  --rose-lite: #e8698c;
+  --surface-0: #18181e;
+  --surface-1: #1e1e24;
+  --surface-2: #25252d;
+  --surface-3: #2c2c36;
+  --surface-hover: #232329;
+  --border-subtle: #2a2a33;
+  --border: #37373f;
+  --border-strong: #4a3d42;
+  --border-accent: #8f2545;
+  --text-main: #ffffff;
+  --muted: #bba8ad;
+  --dim: #a99398;
+  --disabled: #6e5f64;
+  --focus-ring: #e8698c;
+  --thinking-text: #c99bb4;
+  --chart-1: #cb3862;
+  --chart-2: #e0b23e;
+  --chart-3: #acd39c;
+  --chart-4: #3c9a80;
+  --chart-5: #4f70c4;
+  --chart-6: #c191d4;
+}
+
+body {
+  margin: 0;
+  padding: 0;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  font-size: 13.5px;
+  line-height: 1.55;
+  background-color: var(--surface-0);
+  color: var(--text-main);
+  overflow: hidden;
+}
+
+/* Custom scrollbars */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--surface-3);
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--muted);
+}
