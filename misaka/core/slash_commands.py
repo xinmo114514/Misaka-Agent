@@ -53,6 +53,8 @@ BUILTIN_SLASH_COMMANDS: tuple[BuiltinSlashCommand, ...] = (
     BuiltinSlashCommand("clone", "Duplicate the current session at the current position"),
     BuiltinSlashCommand("tree", "Navigate session tree (switch branches)"),
     BuiltinSlashCommand("trust", "Save project trust decision for future sessions"),
+    BuiltinSlashCommand("mode", "Select agent permission mode (opens selector UI)", argumentHint="[mode]"),
+    BuiltinSlashCommand("permission", "Select agent permission mode (opens selector UI)", argumentHint="[mode]"),
     BuiltinSlashCommand(
         "login",
         "Configure provider authentication",

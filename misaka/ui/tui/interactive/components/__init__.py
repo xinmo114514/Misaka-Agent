@@ -46,6 +46,9 @@ from misaka.ui.tui.interactive.components.login_dialog import (
 from misaka.ui.tui.interactive.components.model_selector import (
     ModelSelectorComponent,
 )
+from misaka.ui.tui.interactive.components.permission_selector import (
+    PermissionSelectorComponent,
+)
 from misaka.ui.tui.interactive.components.oauth_selector import (
     OAuthSelectorComponent,
 )
@@ -116,6 +119,7 @@ __all__ = [
     "ModelsCallbacks",
     "ModelsConfig",
     "OAuthSelectorComponent",
+    "PermissionSelectorComponent",
     "RenderDiffOptions",
     "ScopedModelsSelectorComponent",
     "SessionSelectorComponent",

@@ -1,6 +1,6 @@
 import React from 'react'
 import { Handle, Position, type NodeProps, type Node } from '@xyflow/react'
-import { CheckCircle2, Loader2, ShieldAlert, Clock, GitMerge, Sparkles, MessageCircle } from 'lucide-react'
+import { CheckCircle2, Loader2, ShieldAlert, Clock, GitMerge, Sparkles, XCircle, FileText } from 'lucide-react'
 import type { ResearchNodeData } from '../../types/research'
 
 export const ResearchNodeComponent: React.FC<NodeProps<Node<ResearchNodeData>>> = ({
@@ -12,12 +12,14 @@ export const ResearchNodeComponent: React.FC<NodeProps<Node<ResearchNodeData>>> 
   const isRunning = data.status === 'running'
   const isReview = data.status === 'review'
   const isDone = data.status === 'done'
+  const isFailed = data.status === 'failed'
+  const evidenceCount = data.evidence?.length || 0
 
   return (
     <div
-      className={`w-80 rounded-xl bg-surface-1 border transition-all cursor-pointer shadow-lg select-none ${
+      className={`w-80 rounded-xl bg-card border transition-all cursor-pointer shadow-e2 select-none ${
         selected
-          ? 'border-accent ring-2 ring-accent/30 shadow-accent/10'
+          ? 'border-accent ring-2 ring-accent/30'
           : 'border-border hover:border-border-accent'
       }`}
     >
@@ -36,7 +38,7 @@ export const ResearchNodeComponent: React.FC<NodeProps<Node<ResearchNodeData>>> 
         <div className="flex items-center gap-1.5 font-medium text-text-main">
           <div
             className="w-5 h-5 rounded-full flex items-center justify-center text-[10px] font-bold text-white shrink-0"
-            style={{ backgroundColor: data.assignee.avatarBg || '#cb3862' }}
+            style={{ backgroundColor: data.assignee.avatarBg || 'var(--accent)' }}
           >
             {data.assignee.id === 'lo' ? 'LO' : data.assignee.id.slice(-2)}
           </div>
@@ -46,19 +48,24 @@ export const ResearchNodeComponent: React.FC<NodeProps<Node<ResearchNodeData>>> 
         {/* Status Badge */}
         <div>
           {isDone ? (
-            <span className="flex items-center gap-1 px-2 py-0.5 rounded text-[10.5px] font-medium bg-emerald-950/80 text-emerald-400 border border-emerald-800/60">
+            <span className="flex items-center gap-1 px-2 py-0.5 rounded text-[10.5px] font-medium bg-success-surface text-success border border-success-border">
               <CheckCircle2 className="w-3 h-3" />
               <span>已完成</span>
             </span>
           ) : isRunning ? (
-            <span className="flex items-center gap-1 px-2 py-0.5 rounded text-[10.5px] font-medium bg-amber-950/80 text-amber-400 border border-amber-800/60 animate-pulse">
+            <span className="flex items-center gap-1 px-2 py-0.5 rounded text-[10.5px] font-medium bg-warning-surface text-warning border border-warning-border animate-pulse">
               <Loader2 className="w-3 h-3 animate-spin" />
               <span>研究中</span>
             </span>
           ) : isReview ? (
-            <span className="flex items-center gap-1 px-2 py-0.5 rounded text-[10.5px] font-medium bg-rose-950/80 text-rose-400 border border-rose-800/60">
+            <span className="flex items-center gap-1 px-2 py-0.5 rounded text-[10.5px] font-medium bg-danger-surface text-danger border border-danger-border">
               <ShieldAlert className="w-3 h-3" />
               <span>红队审阅</span>
+            </span>
+          ) : isFailed ? (
+            <span className="flex items-center gap-1 px-2 py-0.5 rounded text-[10.5px] font-medium bg-danger-surface text-danger border border-danger-border">
+              <XCircle className="w-3 h-3" />
+              <span>失败</span>
             </span>
           ) : (
             <span className="flex items-center gap-1 px-2 py-0.5 rounded text-[10.5px] font-medium bg-surface-3 text-dim border border-border-subtle">
@@ -95,10 +102,10 @@ export const ResearchNodeComponent: React.FC<NodeProps<Node<ResearchNodeData>>> 
           <span>深度 D{data.depth}</span>
         </div>
 
-        {data.replies && data.replies.length > 0 && (
-          <span className="flex items-center gap-1 text-accent font-medium">
-            <MessageCircle className="w-3 h-3" />
-            <span>{data.replies.length} 条应答</span>
+        {evidenceCount > 0 && (
+          <span className="flex items-center gap-1 text-accent font-medium" title="该节点的卡片产出">
+            <FileText className="w-3 h-3" />
+            <span>{evidenceCount} 项产出</span>
           </span>
         )}
       </div>

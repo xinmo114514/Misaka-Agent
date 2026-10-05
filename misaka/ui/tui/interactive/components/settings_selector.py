@@ -64,6 +64,16 @@ DEFAULT_PROJECT_TRUST_BY_LABEL = {
     label: value for value, label in DEFAULT_PROJECT_TRUST_LABELS.items()
 }
 
+PERMISSION_MODE_LABELS = {
+    "default": "Default (ask on sensitive actions)",
+    "plan": "Plan (strict read-only, ideal for research)",
+    "acceptEdits": "Accept Edits (auto-allow workspace writes)",
+    "bypassPermissions": "Bypass Permissions (unrestricted)",
+}
+PERMISSION_MODE_BY_LABEL = {
+    label: value for value, label in PERMISSION_MODE_LABELS.items()
+}
+
 
 @dataclass(slots=True)
 class SettingsConfig:
@@ -98,6 +108,7 @@ class SettingsConfig:
     clearOnShrink: bool
     showTerminalProgress: bool
     warnings: WarningSettings
+    permissionMode: str = "default"
     # Off is also SettingsManager's default; a host that does not pass the matching
     # callback below shows no row for it.
     enableInstallTelemetry: bool = False
@@ -135,6 +146,7 @@ class SettingsCallbacks:
     onShowTerminalProgressChange: Callable[[bool], None]
     onWarningsChange: Callable[[WarningSettings], None]
     onCancel: Callable[[], None]
+    onPermissionModeChange: Callable[[str], None] | None = None
     # Optional: the client-attribution row appears only for a host that passes it.
     onEnableInstallTelemetryChange: Callable[[bool], None] | None = None
 
@@ -424,6 +436,17 @@ class SettingsSelectorComponent(Container):
                 values=list(DEFAULT_PROJECT_TRUST_LABELS.values()),
             ),
             SettingItem(
+                id="permission-mode",
+                label="Permission mode",
+                description=(
+                    "Agent tool permission boundary: default (ask on sensitive actions), "
+                    "plan (strict read-only, ideal for research/planning), "
+                    "acceptEdits (auto-allow workspace file edits), bypassPermissions (unrestricted)"
+                ),
+                currentValue=PERMISSION_MODE_LABELS.get(config.permissionMode, config.permissionMode),
+                values=list(PERMISSION_MODE_LABELS.values()),
+            ),
+            SettingItem(
                 id="double-escape-action",
                 label="Double-escape action",
                 description="Action when pressing Escape twice with empty editor",
@@ -691,6 +714,10 @@ class SettingsSelectorComponent(Container):
                 value = DEFAULT_PROJECT_TRUST_BY_LABEL.get(new_value)
                 if value is not None:
                     callbacks.onDefaultProjectTrustChange(value)
+            case "permission-mode":
+                perm_val = PERMISSION_MODE_BY_LABEL.get(new_value, new_value)
+                if callbacks.onPermissionModeChange is not None:
+                    callbacks.onPermissionModeChange(perm_val)
             case "double-escape-action":
                 callbacks.onDoubleEscapeActionChange(new_value)
             case "tree-filter-mode":

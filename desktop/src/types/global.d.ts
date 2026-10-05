@@ -27,11 +27,14 @@ export interface ThemeData {
   name: string
   colors: Record<string, string>
   desktop?: {
+    surface0?: string
+    surface1?: string
     surface2?: string
     surface3?: string
     surfaceHover?: string
     borderSubtle?: string
     border?: string
+    borderStrong?: string
     borderAccent?: string
     disabled?: string
     focusRing?: string
@@ -39,13 +42,25 @@ export interface ThemeData {
   }
 }
 
+/** Outcome of window.theme.setTheme: `name` is the theme actually in effect. */
+export interface ThemeSetResult {
+  ok: boolean
+  name: string
+  error?: string
+}
+
 export interface ThemeAPI {
   onChange: (handler: (themeData: ThemeData) => void) => () => void
-  getTheme: () => Promise<ThemeData>
+  /** Resolves to null for an unsupported name or an unreadable theme file. */
+  getTheme: (name?: string) => Promise<ThemeData | null>
+  setTheme: (name: string) => Promise<ThemeSetResult>
 }
 
 export interface AppAPI {
   getVersion: () => Promise<string>
+  pickDirectory: () => Promise<string | null>
+  openPath: (targetPath: string) => Promise<boolean>
+  showItemInFolder: (targetPath: string) => Promise<void>
 }
 
 declare global {

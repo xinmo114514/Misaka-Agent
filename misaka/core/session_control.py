@@ -9,6 +9,7 @@ import asyncio
 import json
 import os
 import tempfile
+import uuid
 from pathlib import Path
 
 from misaka.utils import local_socket
@@ -127,6 +128,45 @@ class SessionControl:
             if card is None or card._owned_row() is None:
                 raise ValueError("This card execution no longer holds its original claim; open the current owner from Sessions.")
 
+    async def _research_command(self, command, operation):
+        """Run a phase command this session published for the wait it is currently in.
+
+        The desktop may ask the conversation that owns a run to approve, withdraw, skip or
+        reconcile -- but only through the tools the driver registered for that phase and removed
+        when it ended (``workflow._await_approval`` and friends set ``review_tools``). The
+        ownership gate in ``research.commands`` compares the caller's conversation against the
+        run's, and here that is this session's own context: the answer is observed, never
+        supplied. So this reaches exactly what a terminal user's turn would reach, and nothing
+        wider -- and the phase's own validation, which lives in the driver's closures, still runs.
+        """
+        tools = list(getattr(self, "review_tools", None) or ())
+        if operation == "research_tools":
+            return {"tools": [tool.name for tool in tools]}
+
+        name = command.get("tool")
+        tool = next((item for item in tools if item.name == name), None)
+        if tool is None:
+            raise ValueError(
+                f"This conversation has no research command {name!r} waiting for the user right now."
+                if name else "No research command is waiting for the user in this conversation.")
+        payload = command.get("payload")
+        if not isinstance(payload, dict):
+            raise ValueError("A research command needs its payload as an object.")
+
+        call_id = str(command.get("call_id") or f"desktop:{uuid.uuid4().hex[:12]}")
+        async with self.ingress:
+            if not self.accepting or not self._owns(command):
+                raise ValueError("The original session ended before it could record this command.")
+            self._check_input_owner()
+            # The tool validates its own arguments; pre-validating here would only paraphrase it
+            # and let the two drift apart.
+            result = await tool.execute(call_id, payload, None, None,
+                                        self.session.extensionRunner.create_context())
+        content = result.get("content") or []
+        text = "".join(str(block.get("text") or "") for block in content
+                       if isinstance(block, dict) and block.get("type") == "text")
+        return {"tool": name, "callId": call_id, "text": text, "details": result.get("details")}
+
     async def _serve(self, reader, writer):
         from misaka.core.session_manager import _dump_json
 
@@ -180,6 +220,10 @@ class SessionControl:
             self.paused = operation == "pause"
             self.catalog.refresh()
             return "Pause requested: current request/tool may finish; new work waits." if self.paused else "Resumed."
+        # A research intervention asked of the process that actually owns the run. `input` stays
+        # the last branch: it is the only one that schedules a turn.
+        if operation in {"research_tools", "research_tool"}:
+            return await self._research_command(command, operation)
         if operation != "input":
             raise ValueError(f"Unknown session operation: {operation}")
         text = command.get("text")

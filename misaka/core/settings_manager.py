@@ -839,6 +839,12 @@ class SettingsManager:
     def setDefaultProjectTrust(self, defaultProjectTrust: DefaultProjectTrust) -> None:
         self._set_global_value("defaultProjectTrust", defaultProjectTrust)
 
+    def getPermissionMode(self) -> str:
+        return str(self.settings.get("permissionMode") or "default")
+
+    def setPermissionMode(self, mode: str) -> None:
+        self._set_global_value("permissionMode", mode)
+
     def getModelThinkingLevel(self, provider: str, modelId: str) -> ModelThinkingLevel | None:
         levels = self.settings.get("modelThinkingLevels")
         return levels.get(f"{provider}/{modelId}") if isinstance(levels, dict) else None

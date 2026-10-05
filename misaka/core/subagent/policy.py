@@ -1605,33 +1605,64 @@ class AgentPolicy:
                 action = "allow"
 
             can_prompt = bool(getattr(self.context, "permission_can_prompt", False))
-            if action == "ask" and (not can_prompt or not callable(_permission_broker)):
-                return {
-                    "block": True,
-                    "reason": reason
-                    or "Background agent cannot display a permission prompt",
-                }
             if action == "ask":
-                try:
-                    approved = await request_permission(
-                        {
-                            "toolName": name,
-                            "toolInput": dict(tool_input),
-                            "toolCallId": read_field(event, "toolCallId"),
-                            "mode": self.permission_mode or "default",
-                            "reason": reason,
+                if callable(_permission_broker):
+                    try:
+                        approved = await request_permission(
+                            {
+                                "toolName": name,
+                                "toolInput": dict(tool_input),
+                                "toolCallId": read_field(event, "toolCallId"),
+                                "mode": self.permission_mode or "default",
+                                "reason": reason,
+                            }
+                        )
+                    except Exception as error:  # noqa: BLE001 - an ask path fails closed
+                        return {
+                            "block": True,
+                            "reason": f"Parent permission request failed: {error}",
                         }
-                    )
-                except Exception as error:  # noqa: BLE001 - an ask path fails closed
-                    return {
-                        "block": True,
-                        "reason": f"Parent permission request failed: {error}",
-                    }
-                if not approved:
-                    return {
-                        "block": True,
-                        "reason": reason or "Parent denied agent permission",
-                    }
+                    if not approved:
+                        return {
+                            "block": True,
+                            "reason": reason or "Parent denied agent permission",
+                        }
+                else:
+                    resolver = getattr(self.session, "requestAgentPermission", None)
+                    if callable(resolver):
+                        try:
+                            approved = await resolver(
+                                None,
+                                {
+                                    "toolName": name,
+                                    "toolInput": dict(tool_input),
+                                    "toolCallId": read_field(event, "toolCallId"),
+                                    "mode": self.permission_mode or "default",
+                                    "reason": reason,
+                                },
+                            )
+                        except Exception as error:  # noqa: BLE001
+                            return {
+                                "block": True,
+                                "reason": f"Permission request failed: {error}",
+                            }
+                        if not approved:
+                            return {
+                                "block": True,
+                                "reason": reason or "User denied agent permission",
+                            }
+                    elif not can_prompt:
+                        return {
+                            "block": True,
+                            "reason": reason
+                            or "Background agent cannot display a permission prompt",
+                        }
+                    else:
+                        return {
+                            "block": True,
+                            "reason": reason
+                            or "No permission handler available for this tool call",
+                        }
         return {"updatedInput": updated_input} if updated_input is not None else None
 
     def _configured_permission(self, name: str, tool_input: Mapping[str, Any], permissions=None) -> str | None:

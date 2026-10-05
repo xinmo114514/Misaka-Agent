@@ -1,5 +1,6 @@
-import React, { useState } from 'react'
+import React, { useState, useEffect } from 'react'
 import { ChevronDown, ChevronRight, Sparkles } from 'lucide-react'
+import { useSettingsStore } from '../../store/useSettingsStore'
 
 interface ThinkingBlockProps {
   thinking: string
@@ -10,12 +11,20 @@ export const ThinkingBlock: React.FC<ThinkingBlockProps> = ({
   thinking,
   isStreaming,
 }) => {
-  const [expanded, setExpanded] = useState(true)
+  const hideThinkingBlock = useSettingsStore((s) => s.hideThinkingBlock)
+  const [expanded, setExpanded] = useState(() => !hideThinkingBlock)
+
+  // Auto expand when streaming starts, or follow user preference initially
+  useEffect(() => {
+    if (isStreaming) {
+      setExpanded(true)
+    }
+  }, [isStreaming])
 
   if (!thinking) return null
 
   return (
-    <div className="my-2 rounded-lg border border-border-subtle bg-surface-1/70 overflow-hidden">
+    <div className="my-2 rounded-xl border border-border-subtle bg-card overflow-hidden shadow-e1">
       {/* Header */}
       <button
         onClick={() => setExpanded(!expanded)}
@@ -40,7 +49,7 @@ export const ThinkingBlock: React.FC<ThinkingBlockProps> = ({
 
       {/* Thinking content with WCAG AA thinkingText color */}
       {expanded && (
-        <div className="px-3.5 py-2.5 border-t border-border-subtle/60 text-xs font-sans leading-relaxed text-thinking-text whitespace-pre-wrap selection:bg-accent/20 bg-surface-0/40">
+        <div className="px-3.5 py-2.5 border-t border-border-subtle/60 text-[length:var(--font-size-prose-sm)] font-sans leading-relaxed text-thinking-text whitespace-pre-wrap selection:bg-accent/20 bg-well">
           {thinking}
         </div>
       )}

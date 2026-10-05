@@ -25,9 +25,13 @@ contextBridge.exposeInMainWorld('theme', {
       ipcRenderer.removeListener('theme:change', listener)
     }
   },
-  getTheme: () => ipcRenderer.invoke('theme:get'),
+  getTheme: (name?: string) => ipcRenderer.invoke('theme:get', name),
+  setTheme: (name: string) => ipcRenderer.invoke('theme:set', name),
 })
 
 contextBridge.exposeInMainWorld('app', {
   getVersion: () => ipcRenderer.invoke('app:get-version'),
+  pickDirectory: () => ipcRenderer.invoke('app:pick-directory'),
+  openPath: (targetPath: string) => ipcRenderer.invoke('app:open-path', targetPath),
+  showItemInFolder: (targetPath: string) => ipcRenderer.invoke('app:show-item-in-folder', targetPath),
 })

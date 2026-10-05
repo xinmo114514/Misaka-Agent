@@ -166,6 +166,16 @@ class FooterComponent:
             else:
                 right_side_without_provider = f"{model_name} • {thinking_level}"
 
+        perm_mode = getattr(self.session, "getPermissionMode", lambda: "default")() or "default"
+        mode_tags = {
+            "default": "safe",
+            "plan": "plan",
+            "acceptEdits": "edit",
+            "bypassPermissions": "bypass",
+        }
+        mode_tag = mode_tags.get(perm_mode, perm_mode)
+        right_side_without_provider = f"{right_side_without_provider} • [{mode_tag}]"
+
         right_side = right_side_without_provider
         if self.footerData.getAvailableProviderCount() > 1 and model is not None:
             right_side = f"({read_field(model, 'provider')}) {right_side_without_provider}"

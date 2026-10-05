@@ -122,6 +122,7 @@ from misaka.ui.tui.interactive.components.keybinding_hints import (
     raw_key_hint,
 )
 from misaka.ui.tui.interactive.components.login_dialog import LoginDialogComponent
+from misaka.ui.tui.interactive.components.permission_selector import PermissionSelectorComponent
 from misaka.ui.tui.interactive.components.model_selector import (
     ModelSelectorComponent,
     ScopedModelItem,
@@ -3380,6 +3381,15 @@ class InteractiveMode(Conversation):
             self._set_editor_text("")
             self.showTreeSelector()
             return
+        if text in ("/mode", "/permission"):
+            self._set_editor_text("")
+            self.showPermissionSelector()
+            return
+        if text.startswith("/mode ") or text.startswith("/permission "):
+            target_mode = text.split(" ", 1)[1].strip()
+            self._set_editor_text("")
+            self.handlePermissionModeSwitch(target_mode)
+            return
         if text == "/trust":
             self._set_editor_text("")
             self.showTrustSelector()
@@ -4358,6 +4368,10 @@ class InteractiveMode(Conversation):
             await self.init()
 
         event_type = read_field(event, "type")
+        if event_type == "permission_mode_change":
+            self.footer.invalidate()
+            self._request_render()
+            return
         if event_type == "agent_start":
             self._toolComponentsById.clear()
             if self.retryEscapeHandler is not None:
@@ -4812,6 +4826,8 @@ class InteractiveMode(Conversation):
         if self._sessionUnsubscribe is not None:
             self._sessionUnsubscribe()
             self._sessionUnsubscribe = None
+        if hasattr(self.session, "setAgentPermissionResolver"):
+            self.session.setAgentPermissionResolver(self.handleAgentPermissionRequest)
         self.applyRuntimeSettings()
         await self.bindCurrentSessionExtensions()
         self.subscribeToSession()
@@ -5245,6 +5261,49 @@ class InteractiveMode(Conversation):
         if set_focus is not None:
             set_focus(focus)
         self._request_render()
+
+    def showPermissionSelector(self) -> None:
+        current_mode = getattr(self.session, "getPermissionMode", lambda: "default")() or "default"
+        self.showSelector(
+            lambda done: {
+                "component": PermissionSelectorComponent(
+                    current_mode,
+                    lambda mode: (done(), self.handlePermissionModeSwitch(mode)),
+                    lambda: (done(), self._request_render()),
+                ),
+            }
+        )
+
+    def handlePermissionModeSwitch(self, mode: str) -> None:
+        try:
+            self.session.setPermissionMode(mode)
+            self.footer.invalidate()
+            self._request_render()
+            self.showStatus(f"Permission mode: {mode}")
+        except Exception as error:  # noqa: BLE001
+            self.showError(f"Failed to set permission mode: {error}")
+
+    async def handleAgentPermissionRequest(self, task: Any, event: dict[str, Any]) -> bool:
+        tool_name = str(event.get("toolName") or "tool")
+        reason = event.get("reason") or "Tool requires permission to execute"
+        rendered = json.dumps(event.get("toolInput") or {}, ensure_ascii=False, sort_keys=True)
+        if len(rendered) > 400:
+            rendered = rendered[:400] + "..."
+        agent_prefix = f"Agent {task.id}" if task is not None and getattr(task, "id", None) else "Agent"
+        title = f"{agent_prefix} permission: {tool_name}"
+        message = str(reason) + "\n" + rendered
+        options = [
+            "Yes, allow once",
+            "Yes, always allow in this session",
+            "No, deny",
+        ]
+        prompt_text = title + "\n" + message
+        choice = await self.showExtensionSelector(prompt_text, options)
+        if choice == "Yes, always allow in this session":
+            if hasattr(self.session, "addSessionPermission"):
+                self.session.addSessionPermission(tool_name)
+            return True
+        return choice == "Yes, allow once"
 
     def showTrustSelector(self) -> None:
         cwd = str(self.sessionManager.getCwd())
@@ -6181,6 +6240,7 @@ class InteractiveMode(Conversation):
                         ),
                         quietStartup=_safe_call_bool(self.settingsManager, "getQuietStartup", False),
                         defaultProjectTrust=default_project_trust,
+                        permissionMode=str(getattr(self.session, "getPermissionMode", lambda: "default")() or "default"),
                         clearOnShrink=_safe_call_bool(self.settingsManager, "getClearOnShrink", False),
                         showTerminalProgress=_safe_call_bool(self.settingsManager, "getShowTerminalProgress", False),
                         enableInstallTelemetry=_safe_call_bool(
@@ -6190,6 +6250,7 @@ class InteractiveMode(Conversation):
                     ),
                     SettingsCallbacks(
                         onAutoCompactChange=_on_auto_compact_change,
+                        onPermissionModeChange=self.handlePermissionModeSwitch,
                         onShowImagesChange=_on_show_images_change,
                         onImageWidthCellsChange=_on_image_width_cells_change,
                         onAutoResizeImagesChange=lambda enabled: (

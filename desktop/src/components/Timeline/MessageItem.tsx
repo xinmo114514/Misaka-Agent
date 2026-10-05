@@ -1,8 +1,10 @@
 import React, { useState } from 'react'
 import { Copy, Check, GitFork, User, Sparkles } from 'lucide-react'
 import type { ChatMessage } from '../../types/session'
+import { useSessionStore } from '../../store/useSessionStore'
 import { ThinkingBlock } from './ThinkingBlock'
 import { ToolCallCard } from './ToolCallCard'
+import { CustomNotice } from './CustomNotice'
 import { MarkdownContent } from './MarkdownContent'
 
 interface MessageItemProps {
@@ -11,7 +13,10 @@ interface MessageItemProps {
 
 export const MessageItem: React.FC<MessageItemProps> = ({ message }) => {
   const [copied, setCopied] = useState(false)
+  const forkSession = useSessionStore((s) => s.forkSession)
   const isUser = message.role === 'user'
+  // Only persisted messages carry a real session entry; a live/unsaved turn cannot be a fork point.
+  const canFork = Boolean(message.entryId) && !message.isStreaming
 
   const handleCopy = async () => {
     try {
@@ -28,9 +33,12 @@ export const MessageItem: React.FC<MessageItemProps> = ({ message }) => {
     minute: '2-digit',
   })
 
+  // An engine notice is not something Last Order said; it gets its own feed row.
+  if (message.role === 'custom') return <CustomNotice message={message} />
+
   if (isUser) {
     return (
-      <div className="group relative py-3 px-4 rounded-xl bg-surface-1/60 hover:bg-surface-1 border border-border-subtle/80 transition-colors my-2.5 max-w-[85%] ml-auto">
+      <div className="group relative py-3 px-4 rounded-xl bg-card border border-border-subtle shadow-e1 hover:shadow-e2 transition-all my-2.5 max-w-[85%] ml-auto">
         <div className="flex items-center gap-2 mb-1.5 text-xs text-muted">
           <div className="w-5 h-5 rounded-full bg-surface-3 flex items-center justify-center text-text-main">
             <User className="w-3 h-3 text-muted" />
@@ -39,7 +47,7 @@ export const MessageItem: React.FC<MessageItemProps> = ({ message }) => {
           <span className="text-[11px] text-dim ml-auto">{timeStr}</span>
         </div>
 
-        <div className="text-[13.5px] leading-relaxed text-text-main whitespace-pre-wrap selection:bg-accent/20">
+        <div className="text-[length:var(--font-size-body)] leading-relaxed text-text-main whitespace-pre-wrap selection:bg-accent/20">
           {message.content}
         </div>
       </div>
@@ -86,12 +94,21 @@ export const MessageItem: React.FC<MessageItemProps> = ({ message }) => {
           className="flex items-center gap-1 hover:text-text-main transition-colors cursor-pointer"
           title="复制回答内容"
         >
-          {copied ? <Check className="w-3.5 h-3.5 text-emerald-400" /> : <Copy className="w-3.5 h-3.5" />}
+          {copied ? <Check className="w-3.5 h-3.5 text-success" /> : <Copy className="w-3.5 h-3.5" />}
         </button>
 
         <button
-          className="flex items-center gap-1 hover:text-text-main transition-colors cursor-pointer"
-          title="从此消息分叉会话 (Fork)"
+          onClick={() => {
+            if (!canFork) return
+            forkSession(message.entryId!, isUser ? 'before' : 'at')
+          }}
+          disabled={!canFork}
+          className={`flex items-center gap-1 transition-colors ${
+            canFork
+              ? 'hover:text-text-main cursor-pointer'
+              : 'opacity-40 cursor-not-allowed'
+          }`}
+          title={canFork ? '从此消息分叉会话 (Fork)' : '仅已保存的消息可分叉'}
         >
           <GitFork className="w-3.5 h-3.5" />
         </button>

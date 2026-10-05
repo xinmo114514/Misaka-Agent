@@ -308,12 +308,20 @@ class AgentSessionRuntime:
         if before_result["cancelled"]:
             return before_result
 
+        target_cwd = (options.get("cwd") if options else None) or self.cwd
         previous_session_file = self.session.sessionFile
-        session_dir = self.session.sessionManager.getSessionDir()
+        current_session_dir = self.session.sessionManager.getSessionDir()
+        if target_cwd != self.cwd and current_session_dir:
+            from misaka.core.session_manager import get_session_dir_for_cwd, sessions_root_of
+            root = sessions_root_of(current_session_dir)
+            session_dir = get_session_dir_for_cwd(target_cwd, root) if root else current_session_dir
+        else:
+            session_dir = current_session_dir
+
         session_manager = (
-            SessionManager.create(self.cwd, session_dir)
+            SessionManager.create(target_cwd, session_dir)
             if self.session.sessionManager.isPersisted()
-            else SessionManager.inMemory(self.cwd)
+            else SessionManager.inMemory(target_cwd)
         )
         if options and options.get("parentSession"):
             session_manager.newSession(NewSessionOptions(parentSession=options["parentSession"]))
@@ -323,7 +331,7 @@ class AgentSessionRuntime:
         self.apply(
             await self.createRuntime(
                 {
-                    "cwd": self.cwd,
+                    "cwd": target_cwd,
                     "agentDir": self.services.agentDir,
                     "sessionManager": session_manager,
                     "sessionStartEvent": {

@@ -244,7 +244,11 @@ class RoleContext:
             tool_rule_layers=rule_layers,
             tool_vocabulary=vocabulary,
             permission_mode=os.environ.get("MISAKA_SUBAGENT_PERMISSION_MODE") or None,
-            permission_can_prompt=os.environ.get("MISAKA_SUBAGENT_CAN_PROMPT") == "1",
+            permission_can_prompt=(
+                os.environ.get("MISAKA_SUBAGENT_CAN_PROMPT") == "1"
+                if os.environ.get("MISAKA_SUBAGENT_ID")
+                else True
+            ),
             agent_hooks=os.environ.get("MISAKA_SUBAGENT_HOOKS") or None,
             host_hooks=os.environ.get("MISAKA_SUBAGENT_HOST_HOOKS") or None,
             critical_system_reminder=os.environ.get("MISAKA_SUBAGENT_CRITICAL_REMINDER") or None,

@@ -4,6 +4,15 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Misaka Agent</title>
+    <script>
+      // Electron passes the active theme in the load URL. This runs while the document is still
+      // being parsed, so the first frame already uses the matching [data-theme] palette instead
+      // of index.css's dark :root default — light users were flashing dark on every launch.
+      try {
+        var stamp = new URLSearchParams(location.search).get('theme')
+        if (stamp === 'dark' || stamp === 'light') document.documentElement.setAttribute('data-theme', stamp)
+      } catch (e) {}
+    </script>
   </head>
   <body class="bg-surface-0 text-text-main antialiased select-none">
     <div id="root"></div>

@@ -306,6 +306,8 @@ class AgentSession:
         self._sessionStartEvent = resolved.sessionStartEvent or {"type": "session_start", "reason": "startup"}
 
         self._eventListeners: list[AgentSessionEventListener] = []
+        self._agentPermissionResolver: Any = None
+        self._sessionPermissions: list[str] = []
         self._unsubscribeAgent = self.agent.subscribe(self._handle_agent_event)
         self._extensionErrorUnsubscriber: Callable[[], None] | None = None
         self._extensionAbortHandler: Callable[[], None] | None = None
@@ -1172,20 +1174,49 @@ class AgentSession:
         self.agent.followUpMode = mode
         self.settingsManager.setFollowUpMode(mode)
 
+    def setAgentPermissionResolver(self, resolver: Any) -> None:
+        self._agentPermissionResolver = resolver
+
+    async def requestAgentPermission(self, task: Any, event: dict[str, Any]) -> bool:
+        resolver = getattr(self, "_agentPermissionResolver", None)
+        if callable(resolver):
+            res = resolver(task, event)
+            return bool(await res) if inspect.isawaitable(res) else bool(res)
+        return False
+
+    def addSessionPermission(self, rule: str) -> None:
+        if not hasattr(self, "_sessionPermissions"):
+            self._sessionPermissions = []
+        if rule not in self._sessionPermissions:
+            self._sessionPermissions.append(rule)
+        for part in self.moments.parts:
+            adder = getattr(part, "add_session_permission", None)
+            if callable(adder):
+                adder(rule)
+
     def getPermissionMode(self) -> str | None:
         for part in self.moments.parts:
             getter = getattr(part, "get_permission_mode", None)
             if callable(getter):
-                return getter()
-        return None
+                val = getter()
+                if val is not None:
+                    return val
+        if hasattr(self, "settingsManager"):
+            return self.settingsManager.getPermissionMode()
+        return "default"
 
     def setPermissionMode(self, mode: str) -> None:
+        from misaka.core.subagent.configuration import validate_permission_mode
+
+        validated_mode = validate_permission_mode(mode)
+        previous_mode = self.getPermissionMode()
         for part in self.moments.parts:
             setter = getattr(part, "set_permission_mode", None)
             if callable(setter):
-                setter(mode)
-                return
-        raise ValueError("This session has no agent permission policy part")
+                setter(validated_mode)
+        if hasattr(self, "settingsManager"):
+            self.settingsManager.setPermissionMode(validated_mode)
+        self._emit({"type": "permission_mode_change", "mode": validated_mode, "previousMode": previous_mode})
 
     def registerCustomTools(self, definitions: list[Any]) -> None:
         # MISAKA fork: a part adding tools after startup (an MCP server that answered late)

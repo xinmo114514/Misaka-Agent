@@ -28,7 +28,7 @@ export const MarkdownContent: React.FC<MarkdownContentProps> = ({ content }) => 
     parts.push(renderTextSegment(content.slice(lastIndex), `seg-${lastIndex}`))
   }
 
-  return <div className="space-y-2.5 text-[13.5px] leading-[1.65] text-text-main selection:bg-accent/20">{parts}</div>
+  return <div className="space-y-2.5 text-[length:var(--font-size-body)] leading-[1.65] text-text-main selection:bg-accent/20">{parts}</div>
 }
 
 function renderTextSegment(text: string, keyPrefix: string): React.ReactNode {
@@ -67,7 +67,7 @@ function renderTextSegment(text: string, keyPrefix: string): React.ReactNode {
     if (line.startsWith('# ')) {
       flushList(`${lineKey}-list`)
       elements.push(
-        <h1 key={lineKey} className="text-lg font-bold text-text-main mt-4 mb-2 first:mt-0 pb-1 border-b border-border-subtle">
+        <h1 key={lineKey} className="text-h1 font-bold text-text-main mt-4 mb-2 first:mt-0 pb-1 border-b border-border-subtle">
           {formatInline(line.slice(2))}
         </h1>
       )
@@ -78,7 +78,7 @@ function renderTextSegment(text: string, keyPrefix: string): React.ReactNode {
     if (line.startsWith('## ')) {
       flushList(`${lineKey}-list`)
       elements.push(
-        <h2 key={lineKey} className="text-base font-bold text-text-main mt-3.5 mb-1.5 first:mt-0">
+        <h2 key={lineKey} className="text-h2 font-bold text-text-main mt-3.5 mb-1.5 first:mt-0">
           {formatInline(line.slice(3))}
         </h2>
       )
@@ -89,7 +89,7 @@ function renderTextSegment(text: string, keyPrefix: string): React.ReactNode {
     if (line.startsWith('### ')) {
       flushList(`${lineKey}-list`)
       elements.push(
-        <h3 key={lineKey} className="text-sm font-semibold text-text-main mt-3 mb-1 first:mt-0">
+        <h3 key={lineKey} className="text-h3 font-semibold text-text-main mt-3 mb-1 first:mt-0">
           {formatInline(line.slice(4))}
         </h3>
       )
@@ -162,7 +162,7 @@ function formatInline(str: string): React.ReactNode {
     parts.push(
       <code
         key={`inline-code-${match.index}`}
-        className="px-1.5 py-0.5 mx-0.5 rounded text-[12px] font-mono bg-surface-2 border border-border-subtle text-rose-lite font-medium"
+        className="px-1.5 py-0.5 mx-0.5 rounded text-[length:var(--font-size-prose-sm)] font-mono bg-surface-2 border border-border-subtle text-rose-lite font-medium"
       >
         {match[1]}
       </code>

@@ -20,7 +20,18 @@
     "toolPendingBg": "#f6eff2",
     "toolSuccessBg": "#e9f2e9",
     "toolErrorBg": "#f8e5e8",
-    "customMsgBg": "#f3e8f4"
+    "customMsgBg": "#f3e8f4",
+    "surface0": "#faf4f6",
+    "surface1": "#ffffff",
+    "surface2": "#f3e9ee",
+    "surface3": "#e9dde4",
+    "surfaceHover": "#f7eef3",
+    "borderSubtle": "#ede0e6",
+    "borderNormal": "#dcc8d1",
+    "borderStrong": "#c4a4b1",
+    "borderAccent": "#e0a9bd",
+    "disabled": "#b8a6ad",
+    "focusRing": "#b12a55"
   },
   "colors": {
     "accent": "accent",
@@ -82,5 +93,26 @@
     "pageBg": "#faf4f6",
     "cardBg": "#ffffff",
     "infoBg": "#f3ead4"
+  },
+  "desktop": {
+    "surface0": "surface0",
+    "surface1": "surface1",
+    "surface2": "surface2",
+    "surface3": "surface3",
+    "surfaceHover": "surfaceHover",
+    "borderSubtle": "borderSubtle",
+    "border": "borderNormal",
+    "borderStrong": "borderStrong",
+    "borderAccent": "borderAccent",
+    "disabled": "disabled",
+    "focusRing": "focusRing",
+    "chart": [
+      "#b12a55",
+      "#a56a1e",
+      "#3f7a3f",
+      "#2f7a68",
+      "#4f5fa8",
+      "#8d4470"
+    ]
   }
 }

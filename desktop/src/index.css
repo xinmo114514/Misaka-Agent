@@ -1,5 +1,24 @@
 @import "tailwindcss";
 
+/* Shadow ink is derived from the runtime --rose so elevation follows whichever
+   theme JSON is active; applyThemeToDom never writes these, so they are safe here. */
+:root {
+  --shadow-ink: color-mix(in srgb, var(--rose) 16%, #000);
+  --shadow-catch: color-mix(in srgb, #ffffff 8%, transparent);
+  /* Recessed layer. Tinting the well with --shadow-ink would *raise* the red channel
+     on a near-black surface, so it mixes toward black instead; dark has far less
+     headroom below surface-0 and needs to push harder to read as recessed. */
+  --well: color-mix(in srgb, var(--surface-0) 82%, #000);
+}
+
+:root[data-theme="light"] {
+  --shadow-ink: color-mix(in srgb, var(--rose) 30%, #000);
+  /* A white top light-catch on a white card is a no-op; keep the layer count
+     identical across themes so box-shadow stays interpolable during the cross-fade. */
+  --shadow-catch: transparent;
+  --well: color-mix(in srgb, var(--surface-0) 92%, #000);
+}
+
 @theme inline {
   --color-accent: var(--accent);
   --color-rose: var(--rose);
@@ -19,6 +38,21 @@
   --color-disabled: var(--disabled);
   --color-focus-ring: var(--focus-ring);
   --color-thinking-text: var(--thinking-text);
+
+  /* Semantic status colors: themed, so they stay legible on both surfaces */
+  --color-success: var(--success);
+  --color-warning: var(--warning);
+  --color-danger: var(--danger);
+  --color-info: var(--info);
+  --color-success-surface: var(--success-surface);
+  --color-warning-surface: var(--warning-surface);
+  --color-danger-surface: var(--danger-surface);
+  --color-info-surface: var(--info-surface);
+  --color-success-border: var(--success-border);
+  --color-warning-border: var(--warning-border);
+  --color-danger-border: var(--danger-border);
+  --color-info-border: var(--info-border);
+
   --color-chart-1: var(--chart-1);
   --color-chart-2: var(--chart-2);
   --color-chart-3: var(--chart-3);
@@ -26,12 +60,68 @@
   --color-chart-5: var(--chart-5);
   --color-chart-6: var(--chart-6);
 
+  /* Layering roles, derived from the themed surfaces so nothing forks the palette:
+     canvas = the recessed app background, card = floating content, well = sunken pane. */
+  --color-canvas: var(--surface-0);
+  --color-card: var(--surface-1);
+  --color-well: var(--well);
+
+  /* Reading type scale. Ratios are written as N/13 so a 13px base reproduces exactly the px
+     the fixed utilities used (18/16/14, with text-lg/base/sm's own line-heights 28/24/20) and
+     12px / 14px bases keep the same proportions. `inline` is what makes this work: the utility
+     gets the calc itself, so the runtime --font-size-base override is what gets evaluated. */
+  --text-h1: calc(var(--font-size-base) * 18 / 13);
+  --text-h1--line-height: calc(var(--font-size-base) * 28 / 13);
+  --text-h2: calc(var(--font-size-base) * 16 / 13);
+  --text-h2--line-height: calc(var(--font-size-base) * 24 / 13);
+  --text-h3: calc(var(--font-size-base) * 14 / 13);
+  --text-h3--line-height: calc(var(--font-size-base) * 20 / 13);
+  --text-micro: calc(var(--font-size-base) * 11.5 / 13);
+  --text-label: calc(var(--font-size-base) * 10 / 13);
+
+  /* `--radius` without a suffix is what the bare `rounded` utility resolves against. */
+  --radius: 7px;
+  --radius-xs: 6px;
   --radius-sm: 8px;
-  --radius-md: 11px;
+  --radius-md: 10px;
   --radius-lg: 12px;
+  --radius-xl: 18px;
+  --radius-2xl: 24px;
+  --radius-3xl: 30px;
+
+  /* Elevation. Layer counts are identical across themes on purpose: differing
+     counts would make the 240ms theme cross-fade snap instead of interpolate.
+     The inset layer is the only depth cue that survives a near-black surface. */
+  --shadow-e1: 0 1px 2px color-mix(in srgb, var(--shadow-ink) 22%, transparent);
+  --shadow-e2:
+    0 1px 2px color-mix(in srgb, var(--shadow-ink) 14%, transparent),
+    0 6px 16px -2px color-mix(in srgb, var(--shadow-ink) 13%, transparent),
+    inset 0 1px 0 var(--shadow-catch);
+  --shadow-e3:
+    0 2px 4px color-mix(in srgb, var(--shadow-ink) 12%, transparent),
+    0 14px 30px -8px color-mix(in srgb, var(--shadow-ink) 22%, transparent),
+    0 30px 60px -18px color-mix(in srgb, var(--shadow-ink) 16%, transparent),
+    inset 0 1px 0 var(--shadow-catch);
+  --shadow-e4:
+    0 12px 28px -12px color-mix(in srgb, var(--shadow-ink) 26%, transparent),
+    0 40px 80px -20px color-mix(in srgb, var(--shadow-ink) 40%, transparent),
+    inset 0 1px 0 var(--shadow-catch);
+  --shadow-cta: 0 6px 18px -6px color-mix(in srgb, var(--accent) 55%, transparent);
+
+  /* Re-point Tailwind's neutral black-alpha shadows, which are invisible on the
+     dark surfaces, at the themed elevation scale. */
+  --shadow-2xs: var(--shadow-e1);
+  --shadow-xs: var(--shadow-e1);
+  --shadow-sm: var(--shadow-e2);
+  --shadow-md: var(--shadow-e2);
+  --shadow-lg: var(--shadow-e3);
+  --shadow-xl: var(--shadow-e3);
+  --shadow-2xl: var(--shadow-e4);
 }
 
-:root {
+/* Dark defaults. Runtime values are overwritten from the active theme JSON. */
+:root,
+:root[data-theme="dark"] {
   --accent: #cb3862;
   --rose: #cb3862;
   --rose-lite: #e8698c;
@@ -50,6 +140,20 @@
   --disabled: #6e5f64;
   --focus-ring: #e8698c;
   --thinking-text: #c99bb4;
+
+  --success: #acd39c;
+  --warning: #e0b23e;
+  --danger: #e05252;
+  --info: #8fb8e8;
+  --success-surface: #1e2a22;
+  --warning-surface: #2f2716;
+  --danger-surface: #331d20;
+  --info-surface: #1c2531;
+  --success-border: #3c5a42;
+  --warning-border: #5c4a1f;
+  --danger-border: #5e3238;
+  --info-border: #34506e;
+
   --chart-1: #cb3862;
   --chart-2: #e0b23e;
   --chart-3: #acd39c;
@@ -58,11 +162,116 @@
   --chart-6: #c191d4;
 }
 
+:root[data-theme="light"] {
+  --surface-0: #faf4f6;
+  --surface-1: #ffffff;
+  --surface-2: #f3e9ee;
+  --surface-3: #e9dde4;
+  --surface-hover: #f7eef3;
+  --border-subtle: #ede0e6;
+  --border: #dcc8d1;
+  --border-strong: #c4a4b1;
+  --border-accent: #e0a9bd;
+  --text-main: #332028;
+  --muted: #8a7078;
+  --dim: #a89098;
+  --disabled: #b8a6ad;
+  --accent: #b12a55;
+  --rose: #b12a55;
+  --rose-lite: #cf4a76;
+  --focus-ring: #b12a55;
+  --thinking-text: #8d4470;
+
+  --success: #2f6b34;
+  --warning: #8a5d12;
+  --danger: #b3302f;
+  --info: #2c5c94;
+  --success-surface: #e8f3e9;
+  --warning-surface: #f8efdc;
+  --danger-surface: #f8e5e6;
+  --info-surface: #e7eff8;
+  --success-border: #b6d5b9;
+  --warning-border: #e0c68c;
+  --danger-border: #e8b6b7;
+  --info-border: #b3cbe6;
+
+  --chart-1: #b12a55;
+  --chart-2: #a56a1e;
+  --chart-3: #3f7a3f;
+  --chart-4: #2f7a68;
+  --chart-5: #4f5fa8;
+  --chart-6: #8d4470;
+}
+
+/* Theme switch cross-fade: applyThemeToDom toggles the class for the length of one switch. */
+html.theme-switching,
+html.theme-switching *,
+html.theme-switching *::before,
+html.theme-switching *::after {
+  transition:
+    background-color 240ms ease,
+    border-color 240ms ease,
+    color 240ms ease,
+    fill 240ms ease,
+    stroke 240ms ease,
+    box-shadow 240ms ease !important;
+  transition-delay: 0s !important;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  html.theme-switching,
+  html.theme-switching * {
+    transition: none !important;
+  }
+}
+
+/* Brand atmosphere: the rose tint lives in background-color (which the cross-fade
+   above transitions) and only the shape lives in the mask, because a gradient in
+   background-image cannot interpolate and would snap mid-switch. */
+.misaka-atmosphere {
+  position: fixed;
+  inset: 0;
+  z-index: 0;
+  pointer-events: none;
+  background-color: color-mix(in srgb, var(--rose) 5%, transparent);
+  -webkit-mask-image:
+    radial-gradient(720px 420px at 16% -6%, #000 0%, transparent 66%),
+    radial-gradient(640px 380px at 90% 106%, #000 0%, transparent 70%);
+  mask-image:
+    radial-gradient(720px 420px at 16% -6%, #000 0%, transparent 66%),
+    radial-gradient(640px 380px at 90% 106%, #000 0%, transparent 70%);
+}
+
+/* Typography. Two independent roles on purpose: --font-size-ui is chrome and stays 13.5px
+   (what body always painted), while --font-size-base is the 阅读字号 the 外观设置 scopes to
+   "时间线问答、思维链推导及文献引用". Making body use --font-size-base would shrink every
+   unclassified text node by 0.5px and couple chrome density to a reading preference.
+   The desktop client sets data-font-size; the derived sizes keep code and thinking
+   proportional to the body text. */
+/* Reading surfaces reference these through `text-[length:var(--font-size-…)]`. The `length:`
+   hint is required: Tailwind v4 guesses `color:` for a bare `text-[var(--x)]`, which compiles
+   to a rule that sets the wrong property and silently leaves the font size untouched. */
+:root {
+  --font-size-ui: 13.5px;
+  --font-size-base: 13px;
+  --font-size-body: var(--font-size-base);
+  --font-size-prose-sm: calc(var(--font-size-base) * 0.92);
+  --font-size-code: calc(var(--font-size-base) * 0.96);
+}
+
+:root[data-font-size="compact"] {
+  --font-size-base: 12px;
+}
+
+:root[data-font-size="spacious"] {
+  --font-size-base: 14px;
+}
+
 body {
   margin: 0;
   padding: 0;
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
-  font-size: 13.5px;
+  font-size: var(--font-size-ui);
   line-height: 1.55;
   background-color: var(--surface-0);
   color: var(--text-main);
@@ -79,7 +288,7 @@ body {
 }
 ::-webkit-scrollbar-thumb {
   background: var(--surface-3);
-  border-radius: 3px;
+  border-radius: var(--radius-xs);
 }
 ::-webkit-scrollbar-thumb:hover {
   background: var(--muted);

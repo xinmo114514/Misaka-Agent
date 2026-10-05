@@ -7,8 +7,12 @@ from typing import Any
 
 
 def to_jsonable(value: Any) -> Any:
-    if hasattr(value, "model_dump"):
+    if hasattr(value, "model_dump") and not isinstance(value, type):
         return to_jsonable(value.model_dump())
+    if isinstance(value, type):
+        if hasattr(value, "model_json_schema"):
+            return to_jsonable(value.model_json_schema())
+        return str(value)
     if dataclasses.is_dataclass(value) and not isinstance(value, type):
         return to_jsonable(dataclasses.asdict(value))
     if isinstance(value, dict):

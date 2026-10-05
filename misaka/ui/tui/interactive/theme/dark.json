@@ -84,11 +84,14 @@
     "infoBg": "#3c3728"
   },
   "desktop": {
+    "surface0": "#18181e",
+    "surface1": "#1e1e24",
     "surface2": "#25252d",
     "surface3": "#2c2c36",
     "surfaceHover": "#232329",
     "borderSubtle": "#2a2a33",
     "border": "#37373f",
+    "borderStrong": "#4a3d42",
     "borderAccent": "#8f2545",
     "disabled": "#6e5f64",
     "focusRing": "#e8698c",

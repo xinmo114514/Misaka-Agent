@@ -57,7 +57,7 @@ export const Timeline: React.FC = () => {
   }, [messages, liveMessage?.content, liveMessage?.thinking])
 
   return (
-    <div className="relative flex-1 h-full overflow-hidden flex flex-col bg-surface-0">
+    <div className="relative flex-1 h-full overflow-hidden flex flex-col">
       <div
         ref={scrollRef}
         onScroll={handleScroll}
@@ -65,7 +65,7 @@ export const Timeline: React.FC = () => {
       >
         {messages.length === 0 ? (
           <div className="h-full flex flex-col items-center justify-center text-muted gap-3 select-none">
-            <div className="w-12 h-12 rounded-2xl bg-surface-1 border border-border flex items-center justify-center text-dim shadow-sm">
+            <div className="w-12 h-12 rounded-xl bg-card border border-border-subtle flex items-center justify-center text-dim shadow-e2">
               <MessageSquare className="w-6 h-6 text-rose-lite" />
             </div>
             <p className="text-sm font-medium text-text-main">开始新的研究对话</p>
@@ -97,7 +97,7 @@ export const Timeline: React.FC = () => {
       {showScrollBottom && (
         <button
           onClick={() => scrollToBottom(true)}
-          className="absolute right-8 bottom-32 flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-surface-2 hover:bg-surface-3 border border-border text-xs text-text-main shadow-md transition-all hover:scale-105 cursor-pointer z-20"
+          className="absolute right-8 bottom-32 flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-card border border-border-subtle text-xs text-text-main shadow-e2 hover:shadow-e3 transition-all hover:scale-105 cursor-pointer z-20"
         >
           <ArrowDown className="w-3.5 h-3.5 text-accent" />
           <span>回到底部</span>

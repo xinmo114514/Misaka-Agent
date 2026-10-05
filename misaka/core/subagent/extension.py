@@ -252,6 +252,7 @@ class SubagentPart:
         self._disallowed_tools = frozenset(name.casefold() for name in disallowed_tools)
         self._can_manage_tasks = not {TASK_OUTPUT_TOOL_NAME.casefold(), TASK_STOP_TOOL_NAME.casefold()} & self._disallowed_tools
         self.policy = subagent_policy.policy_for(context)
+        self._session_permissions: list[str] = []
         self.manager: SubagentManager | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._flag_agents: Any = None
@@ -464,11 +465,31 @@ class SubagentPart:
             self.policy.session = self.session
         self.policy.permission_mode = mode
 
+    def add_session_permission(self, rule: str) -> None:
+        if not hasattr(self, "_session_permissions"):
+            self._session_permissions = []
+        if rule not in self._session_permissions:
+            self._session_permissions.append(rule)
+
+    def get_permission_settings(self) -> dict[str, Any] | None:
+        rules = getattr(self, "_session_permissions", [])
+        if rules:
+            return {"allow": list(rules)}
+        return None
+
     def attach(self, session: Any) -> None:
         self.session = session
         if self.manager is not None:
             self.manager.session = session
-        if self.policy is not None:
+        if self.policy is None:
+            from misaka.core.subagent import policy as subagent_policy
+
+            self.policy = subagent_policy.AgentPolicy(self.role_context)
+            self.policy.session = session
+            mode = getattr(getattr(session, "settingsManager", None), "getPermissionMode", lambda: None)()
+            if mode:
+                self.policy.permission_mode = mode
+        else:
             self.policy.session = session
 
     def configure_agents(self, definitions: Any) -> None:
