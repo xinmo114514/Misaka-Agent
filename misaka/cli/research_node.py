@@ -20,6 +20,8 @@ def main(argv: list[str] | None = None) -> int:
     if len(args) not in (2, 4) or args[0] != "--run-card" or (len(args) == 4 and args[2] != "--say"):
         sys.exit("usage: python -m misaka.cli.research_node --run-card TASK_ID [--say TEXT]")
     bootstrap.install()
+    from misaka.utils import loop_watchdog
+    loop_watchdog.configure(f"card-{args[1]}", exit_on_stall=True)
     from misaka.config import env as env_file
     env_file.load()
     return node.main_card(args[1], say=args[3] if len(args) == 4 else None)

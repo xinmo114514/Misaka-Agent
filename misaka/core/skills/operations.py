@@ -191,9 +191,9 @@ def run_llm_review(prompt):
 
 async def _run_review_session(scope, prompt):
     from misaka.agent.guards import finish_turn_from_stop_predicate
+    from misaka.core.platform import metering
     from misaka.core.platform.session import (
         install_guards,
-        install_turn_budget,
         settle_after_prompt,
     )
     from misaka.core.resource_loader import DefaultResourceLoader
@@ -236,17 +236,18 @@ async def _run_review_session(scope, prompt):
             _REVIEW_MAX_INPUT_TOKENS_DEFAULT,
             _REVIEW_MAX_ITERATIONS,
         )
-        limiter = install_turn_budget(session, _REVIEW_MAX_INPUT_TOKENS_DEFAULT)
         iterations = 0
         def stop_after_turn(context, signal=None):
             nonlocal iterations
             iterations += 1
             return iterations >= _REVIEW_MAX_ITERATIONS
         session.agent.finishTurn = finish_turn_from_stop_predicate(stop_after_turn, session.agent.finishTurn)
-        install_guards(session, limiter, wall_seconds=600)
-        async with asyncio.timeout(600):
-            await session.prompt(prompt)
-            await settle_after_prompt(session)
+        install_guards(session, metering.allowance, wall_seconds=600)
+        # The review's own budget, with nothing on the board behind it; reasoning stays on.
+        with metering.local_allowance(_REVIEW_MAX_INPUT_TOKENS_DEFAULT):
+            async with asyncio.timeout(600):
+                await session.prompt(prompt)
+                await settle_after_prompt(session)
         for message in session.state.messages:
             value = message if isinstance(message, dict) else message.model_dump()
             if value.get("role") != "assistant":

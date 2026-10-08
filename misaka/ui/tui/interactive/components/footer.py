@@ -55,6 +55,7 @@ class FooterComponent:
         self.autoCompactEnabled = True
         self.session = session
         self.footerData = footerData
+        self.sessionStats: dict[str, Any] | None = None
 
     def setSession(self, session: Any) -> None:
         self.session = session
@@ -68,8 +69,30 @@ class FooterComponent:
     def dispose(self) -> None:
         return None
 
-    def render(self, width: int) -> list[str]:
-        state = self.session.state
+    def getSessionStats(self) -> dict[str, Any]:
+        """Usage totals and context usage scan the whole session, and the footer renders on every frame.
+        Entries are append-only and every append moves the leaf, so the results only change with the
+        session, leaf, entry count, or the model whose context window applies (pi footer.ts).
+
+        PORT-NOTE: without this cache a streaming reply re-estimated the whole context, system prompt
+        included, on every frame: ~22 ms of a ~25 ms frame here, which left the event loop too
+        little time to read the stream (GitHub issue #6)."""
+        session_manager = self.session.sessionManager
+        entry_count = session_manager.getEntryCount()
+        session_id = session_manager.getSessionId()
+        leaf_id = session_manager.getLeafId()
+        limits_model = self.session.model
+        cached = self.sessionStats
+        if (
+            cached is not None
+            and cached["session"] is self.session
+            and cached["sessionId"] == session_id
+            and cached["leafId"] == leaf_id
+            and cached["entryCount"] == entry_count
+            and cached["limitsModel"] is limits_model
+        ):
+            return cached
+
         usage_totals = createUsageTotals()
         latest_cache_hit_rate: float | None = None
 
@@ -96,7 +119,25 @@ class FooterComponent:
             elif entry_type in ("branch_summary", "compaction") and read_field(entry, "usage"):
                 addUsageToTotals(usage_totals, read_field(entry, "usage"))
 
-        context_usage = self.session.getContextUsage()
+        self.sessionStats = {
+            "session": self.session,
+            "sessionId": session_id,
+            "leafId": leaf_id,
+            "entryCount": entry_count,
+            "limitsModel": limits_model,
+            "usageTotals": usage_totals,
+            "latestCacheHitRate": latest_cache_hit_rate,
+            # After compaction, tokens are unknown until the next LLM response.
+            "contextUsage": self.session.getContextUsage(),
+        }
+        return self.sessionStats
+
+    def render(self, width: int) -> list[str]:
+        state = self.session.state
+        stats = self.getSessionStats()
+        usage_totals = stats["usageTotals"]
+        latest_cache_hit_rate = stats["latestCacheHitRate"]
+        context_usage = stats["contextUsage"]
         model = read_field(state, "model")
         context_window = int(read_field(context_usage, "contextWindow", read_field(model, "contextWindow", 0)) or 0)
         context_percent_value = float(read_field(context_usage, "percent", 0) or 0)

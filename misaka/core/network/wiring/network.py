@@ -238,7 +238,9 @@ def _install(harn, runtime):
             lines.insert(0, f"(showing the last {len(rows)} of {total} cards)")
         if mine and any(line.startswith("*") for line in lines):
             lines.append("* = created in this conversation")
-        b = budget.status(con, _cfg()["token_cap"])
+        # The cap is each research run's (``/research status`` reads a run against it); the board's
+        # total is everything recorded, contact turns and plain cards included, and has no mode.
+        spent = budget.spent(con)
         from misaka.core.network import roster as roster_mod
         named = ", ".join(
             f"{s} ({roster_mod.describe_line(s, root=_cfg()['profiles_root']) or 'no description'})"
@@ -248,7 +250,7 @@ def _install(harn, runtime):
             f"Sister roster: {named or '(empty)'}"
             f"{' (use misaka_sister_view for introduction excerpts)' if named else ''}\n"
             + (f"Allies (external agents, assigned cards like a Sister): {allies}\n" if allies else "") +
-            f"Budget used: {b['used']:,} tokens ({b['mode']} mode)\n\n"
+            f"Tokens recorded on this board: {spent:,} (research.token_cap applies to each research run)\n\n"
         )
         return _text(header + ("\n".join(lines) if lines else "(no task cards)"))
 
@@ -538,7 +540,8 @@ def _install(harn, runtime):
             signal=signal,
         )
         _require_project_tasks(ctx, params)  # A blocking read may span a new generation.
-        return _text(json.dumps(result, ensure_ascii=False))
+        # The Sister's summary and result are her session's output: fenced, as peek and card-log are.
+        return _text(untrusted(f"sister-output:{params.task_id}", json.dumps(result, ensure_ascii=False)))
 
 
     class SisterPeekParams(CardReadParams):

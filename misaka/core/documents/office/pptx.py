@@ -874,3 +874,15 @@ def render(path):
     while out and not out[-1].strip():
         out.pop()
     return "\n".join(out) + "\n"
+
+
+def hidden_slides(path):
+    """The numbers (from 1, as the rendering numbers them) of the deck's hidden slides.
+
+    A PDF export through LibreOffice leaves hidden slides out, so the export's page for slide N
+    is N less the hidden slides before it -- and a hidden slide has no page at all.
+    """
+    from pptx import Presentation
+    deck = Presentation(str(path))
+    return {number for number, slide in enumerate(deck.slides, 1)
+            if slide._element.get("show") in ("0", "false")}

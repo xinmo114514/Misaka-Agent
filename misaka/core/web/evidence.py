@@ -102,16 +102,40 @@ def frontmatter_line_count(provenance: dict[str, Any]) -> int:
     return _frontmatter(provenance).count("\n")
 
 
+def is_credential_store(path: str) -> bool:
+    """Whether ``path`` is MISAKA's own credentials: the home's ``credentials/`` (auth.json, the
+    vault, MCP tokens), the snapshots ``misaka update`` takes of them and of the ``.env`` files
+    (``state/backups/``), or a ``.env`` the home loads -- its own, or a role's under ``profiles/``.
+    A project's ``.env`` copied into a sub-agent's worktree is the project's, not MISAKA's. Hermes'
+    file tools refuse their credential stores the same way (agent/file_safety.py)."""
+    from misaka.config import home
+    resolved = home.folded(path)
+    stores = (home.folded(home.path("credentials")), home.folded(home.path("backups")))
+    roles = home.folded(home.path("roles_root"))
+    return (any(resolved == store or store in resolved.parents for store in stores)
+            or (resolved.name == ".env" and (resolved.parent == home.folded(home.home())
+                                             or roles in resolved.parents)))
+
+
+CREDENTIALS_REFUSED = ("MISAKA's credentials (credentials/, .env and their backups in its home) are not read through file tools. "
+                       "(Defense in depth, not a security boundary: a shell command can still reach them.)")
+
+
 def check_material_read(path: str) -> None:
-    """Keep vault key/ciphertext and restricted originals out of ordinary readers.
+    """Keep vault key/ciphertext, restricted originals and MISAKA's credentials out of ordinary
+    readers (issue #10 audit, M1: read and grep reached credentials/auth.json).
 
     Resolved paths also cover symlinks. This is a tool/corpus boundary, not an OS
     sandbox for an independently approved terminal command.
     """
+    from misaka.config import home
+    if is_credential_store(path):
+        raise ValueError(CREDENTIALS_REFUSED)
     resolved = Path(path).resolve()
     for directory in (resolved, *resolved.parents):
-        if (directory.name == "originals" and directory.parent.name == "web-evidence") or (
-                directory.name == "vault" and any((directory / name).exists()
+        here, above = home.fold(directory.name), home.fold(directory.parent.name)   # Web-Evidence is it on macOS
+        if (here == "originals" and above == "web-evidence") or (
+                here == "vault" and any((directory / name).exists()
                     for name in ("vault.key", "vault.json.enc"))):
             raise ValueError("Private Web material is not available through file readers; use the vault tools or the redacted saved_path.")
 

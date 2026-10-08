@@ -1,4 +1,11 @@
-"""Persistent token budgets and the Beast Mode cutoff."""
+"""The token ledger: what was spent, what is in flight, and ``research.token_cap``.
+
+Every model request a metered session makes (``misaka.core.platform.metering``) leases its worst
+case here before it is sent and, when it ends, records what it used and gives the lease back in
+one transaction. So at any moment ``spent + in flight <= cap`` for the research run the request
+belongs to, across processes. Spending is recorded per request, as it happens; outside a
+research run it is recorded and never capped.
+"""
 import contextvars
 import hashlib
 import json
@@ -8,14 +15,19 @@ import sqlite3
 import time
 from contextlib import contextmanager, nullcontext
 
-SUBAGENT_RESERVATION = int(os.environ.get("MISAKA_SUBAGENT_TOKEN_RESERVATION", "32768"))   # a parent's hand-off
+# How long a lease outlives its last renewal. A request renews it while it streams; a process that
+# died mid-request leaves it to expire, and it is then charged in full.
+LEASE_TTL_SECONDS = 900
+# Said when a request does not fit under the cap. Every supervisor matches this text to stop work
+# as "reached the cap" (resumable) rather than failed, and the retry classifier never matches it.
+EXHAUSTED_MESSAGE = "research.token_cap reached"
 
 
 def default_cap():
-    """The run-wide token cap (0 = none): settings.json ``research.token_cap``."""
+    """The token cap of one research run (0 = none): settings.json ``research.token_cap``."""
     from misaka.config.product import setting
 
-    return setting("research", "token_cap", 0, int)
+    return max(0, setting("research", "token_cap", 0, int))      # a negative cap is none, as 0 is
 
 
 def beast_at():
@@ -61,7 +73,8 @@ def spent(con, *, task_ids=None):
     scope = None if task_ids is None else set(task_ids)
     for task_id, kind, payload in con.execute(
             "SELECT task_id,kind,payload FROM events "
-            "WHERE kind IN ('harn_event','budget_usage') AND payload LIKE '%totalTokens%'"):
+            "WHERE (kind='budget_usage' OR kind='harn_event' AND payload LIKE '%\"agent_end\"%') "
+            "AND payload LIKE '%totalTokens%'"):
         if scope is not None and task_id not in scope:
             continue
         try:
@@ -115,8 +128,35 @@ def _charge_expired_reservations(con, now):
         )
 
 
-def reserved(con):
-    """Return capacity reserved by active agent turns."""
+def scope(con, task_id):
+    """The ledger rows ``task_id`` is capped with: its research run and every card of that run, or
+    None when it belongs to no run (an ordinary card, a contact session) and is never capped."""
+    if not task_id or not con.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='research_runs'").fetchone():
+        return None
+    run = con.execute("SELECT id FROM research_runs WHERE id=?", (str(task_id),)).fetchone()
+    if run is None:
+        run = con.execute("SELECT run_id FROM research_run_tasks WHERE task_id=?", (str(task_id),)).fetchone()
+    if run is None:
+        return None
+    run_id = run[0]
+    return {run_id, *(row[0] for row in con.execute(
+        "SELECT task_id FROM research_run_tasks WHERE run_id=?", (run_id,)))}
+
+
+def _held(con, ids, now):
+    if ids is None:
+        rows = con.execute("SELECT COALESCE(SUM(tokens),0) FROM budget_reservations WHERE expires_at>=?", (now,))
+    else:
+        ids = sorted(ids)
+        rows = con.execute(
+            f"SELECT COALESCE(SUM(tokens),0) FROM budget_reservations WHERE expires_at>=? "
+            f"AND task_id IN ({','.join('?' * len(ids))})", (now, *ids))
+    return int(rows.fetchone()[0] or 0)
+
+
+def reserved(con, *, task_id=None):
+    """Tokens in flight: the whole board's, or the research run ``task_id`` belongs to."""
 
     now = int(time.time())
     with _locked(con):
@@ -130,10 +170,7 @@ def reserved(con):
             else:
                 con.execute("BEGIN IMMEDIATE")
             _charge_expired_reservations(con, now)
-            row = con.execute(
-                "SELECT COALESCE(SUM(tokens),0) FROM budget_reservations WHERE expires_at>=?",
-                (now,),
-            ).fetchone()
+            held = _held(con, scope(con, task_id) if task_id else None, now)
             if nested:
                 con.execute("RELEASE SAVEPOINT misaka_budget_expiry")
             else:
@@ -148,23 +185,61 @@ def reserved(con):
             except Exception:  # noqa: BLE001, S110 - preserve the original database error
                 pass
             raise
-    return int(row[0] or 0)
+    return held
 
 
-def exhausted(con, cap=None):
-    """Whether running work must stop. Reserved capacity only blocks NEW admissions."""
+def _cap_refused(con, ids, cap):
+    """Whether a request of these tasks was refused under a cap no higher than ``cap``: the run has
+    reached it even though ``spent`` is short of it -- its next request did not fit. Raising the
+    cap clears it."""
+    if not ids:
+        return False
+    ids = sorted(ids)
+    for (payload,) in con.execute(
+            f"SELECT payload FROM events WHERE kind='token_cap_reached' AND task_id IN ({','.join('?' * len(ids))})", ids):
+        try:
+            if int(json.loads(payload).get("cap") or 0) >= int(cap):
+                return True
+        except (ValueError, TypeError, AttributeError):
+            continue
+    return False
+
+
+def cap_reached(con, task_id, cap):
+    """Record that a request of ``task_id`` did not fit under ``cap``: every driver and card of its
+    research run stops as reached-the-cap from here (``exhausted``), until the cap is raised."""
+    with _locked(con):
+        con.execute("INSERT INTO events (task_id,kind,payload,generation,created_at) VALUES (?,?,?,?,?)",
+                    (str(task_id), "token_cap_reached", json.dumps({"cap": int(cap)}), 0, int(time.time())))
+
+
+def exhausted(con, cap=None, *, task_id=None):
+    """Whether the research run ``task_id`` belongs to has reached its cap: spent it, or had a request
+    refused under it. Without ``task_id``: whether the board has spent it (a status reading, never
+    a reason to stop a run)."""
     cap = default_cap() if cap is None else cap
-    return bool(cap) and spent(con) >= cap
-
-
-def status(con, cap=None):
-    cap = default_cap() if cap is None else cap
-    held = reserved(con)
-    used = spent(con)
     if not cap:
+        return False
+    ids = scope(con, task_id) if task_id else None
+    if task_id and ids is None:
+        return False
+    return spent(con, task_ids=ids) >= cap or _cap_refused(con, ids, cap)
+
+
+def status(con, cap=None, *, task_id=None):
+    """Spent, in flight and the cap, for the research run ``task_id`` belongs to (``mode`` normal,
+    beast past ``beast_at`` of the cap, stop at the cap); a task outside a run is never capped.
+    The mode follows what is spent, as ``exhausted`` does: a lease is a request's worst case and
+    mostly comes back, and one large request can hold all the room left (0.18.9 counted leases
+    in, so a busy run read "stop" with nothing spent and its planner failed)."""
+    cap = default_cap() if cap is None else cap
+    ids = scope(con, task_id) if task_id else None
+    held = reserved(con, task_id=task_id)
+    used = spent(con, task_ids=ids)
+    if not cap or (task_id and ids is None):
         return {"mode": "normal", "used": used, "reserved": held, "cap": 0, "ratio": 0.0}
-    ratio = (used + held) / cap
-    mode = "stop" if ratio >= 1.0 else ("beast" if ratio >= beast_at() else "normal")
+    ratio = used / cap
+    mode = "stop" if ratio >= 1.0 or _cap_refused(con, ids, cap) else ("beast" if ratio >= beast_at() else "normal")
     return {
         "mode": mode,
         "used": used,
@@ -174,113 +249,79 @@ def status(con, cap=None):
     }
 
 
-def reserve_agent(con, cap, task_id, generation, ttl_seconds=1800):
-    """Atomically reserve capacity before a nested Agent starts.
+def _usage_row(con, task_id, generation, tokens, now, **facts):
+    con.execute(
+        "INSERT INTO events (task_id,kind,payload,generation,created_at) VALUES (?,?,?,?,?)",
+        (str(task_id), "budget_usage", json.dumps({"totalTokens": int(tokens), **facts}, separators=(",", ":")),
+         int(generation) if str(generation).isdigit() else 0, int(now)))
 
-    Reservations let parallel and recursive launches share one ledger. In Beast
-    Mode the whole remaining budget goes to a single reservation. The final usage
-    event is written before the reservation is released.
-    """
 
-    cap = default_cap() if cap is None else int(cap or 0)
-    if not cap:
-        return {"allowed": True, "token": None, "tokens": 0, "mode": "normal"}
+def lease_request(con, cap, task_id, generation, need, want, ttl_seconds=LEASE_TTL_SECONDS):
+    """Lease room for one model request: ``need`` is the least it can run with, ``want`` its whole
+    worst case. Returns ``{"status": "granted", "lease", "tokens", "used", "held", "cap"}``;
+    ``"wait"`` when only other requests in flight stand in the way (they end, or expire);
+    ``"exhausted"`` when what is already spent does. Outside a research run, or with no cap, the
+    whole ``want`` is granted with no lease (``lease`` None): it is only recorded."""
+    cap = int(cap or 0)
     now = int(time.time())
-    token = f"br_{secrets.token_hex(12)}"
-    with _locked(con):                     # the whole transaction, not just its statements
+    with _locked(con):
         con.execute("BEGIN IMMEDIATE")
         try:
             _charge_expired_reservations(con, now)
-            used = spent(con)
-            held = int(
-                con.execute(
-                    "SELECT COALESCE(SUM(tokens),0) FROM budget_reservations"
-                ).fetchone()[0]
-                or 0
-            )
-            remaining = cap - used - held
-            if remaining <= 0:
+            ids = scope(con, task_id) if cap else None
+            if ids is None:
+                con.commit()
+                return {"status": "granted", "lease": None, "tokens": int(want), "used": 0, "held": 0, "cap": 0}
+            used = spent(con, task_ids=ids)
+            held = _held(con, ids, now)
+            reading = {"used": used, "held": held, "cap": cap}
+            if cap - used < need:
                 con.rollback()
-                return {
-                    "allowed": False,
-                    "token": None,
-                    "tokens": 0,
-                    "mode": "stop",
-                    "used": used,
-                    "reserved": held,
-                    "cap": cap,
-                }
-            ratio = (used + held) / cap
-            if ratio >= beast_at():
-                amount = remaining
-                mode = "beast"
-            else:
-                # Keep normal-mode reservations useful for small caps too, while
-                # never allowing concurrent reservations to exceed the hard cap.
-                normal_slice = max(1, SUBAGENT_RESERVATION)
-                amount = min(normal_slice, remaining)
-                mode = "normal"
+                return {"status": "exhausted", **reading}
+            room = cap - used - held
+            if room < need:
+                con.rollback()
+                return {"status": "wait", **reading}
+            granted = int(min(want, room))
+            lease = f"bl_{secrets.token_hex(12)}"
             con.execute(
-                "INSERT INTO budget_reservations "
-                "(id,task_id,generation,tokens,expires_at,created_at) VALUES (?,?,?,?,?,?)",
-                (token, str(task_id), int(generation), amount, now + max(60, int(ttl_seconds)), now),
-            )
+                "INSERT INTO budget_reservations (id,task_id,generation,tokens,expires_at,created_at) "
+                "VALUES (?,?,?,?,?,?)",
+                (lease, str(task_id), int(generation) if str(generation).isdigit() else 0, granted,
+                 now + max(60, int(ttl_seconds)), now))
             con.commit()
-            return {
-                "allowed": True,
-                "token": token,
-                "tokens": amount,
-                "mode": mode,
-                "used": used,
-                "reserved": held + amount,
-                "cap": cap,
-            }
+            return {"status": "granted", "lease": lease, "tokens": granted, **reading, "held": held + granted}
         except BaseException:
             con.rollback()
             raise
 
 
-def release_agent(con, token):
-    if not token:
-        return False
-    return con.execute("DELETE FROM budget_reservations WHERE id=?", (token,)).rowcount == 1
-
-
-def touch_agent(con, token, ttl_seconds=1800):
-    if not token:
-        return False
-    return con.execute(
-        "UPDATE budget_reservations SET expires_at=? WHERE id=?",
-        (int(time.time()) + max(60, int(ttl_seconds)), token),
-    ).rowcount == 1
-
-
-def commit_agent_usage(con, token, task_id, generation, total_tokens):
-    """Record the turn's token usage and release its reservation in one transaction."""
-
-    with _locked(con):                     # the whole transaction, not just its statements
+def settle_request(con, lease, task_id, generation, tokens):
+    """Record what one request used and give its lease back, in one transaction. A lease that has
+    already expired was charged in full when it did: nothing more is recorded (False)."""
+    now = int(time.time())
+    with _locked(con):
         con.execute("BEGIN IMMEDIATE")
         try:
-            total = max(0, int(total_tokens or 0))
-            if total:
-                con.execute(
-                    "INSERT INTO events (task_id,kind,payload,generation,created_at) "
-                    "VALUES (?,?,?,?,?)",
-                    (
-                        str(task_id),
-                        "budget_usage",
-                        json.dumps({"totalTokens": total}, separators=(",", ":")),
-                        int(generation),
-                        int(time.time()),
-                    ),
-                )
-            if token:
-                con.execute("DELETE FROM budget_reservations WHERE id=?", (token,))
+            if lease and con.execute("DELETE FROM budget_reservations WHERE id=?", (lease,)).rowcount != 1:
+                con.commit()
+                return False
+            if int(tokens or 0) > 0:
+                _usage_row(con, task_id, generation, tokens, now)
             con.commit()
             return True
         except BaseException:
             con.rollback()
             raise
+
+
+def renew_request(con, lease, ttl_seconds=LEASE_TTL_SECONDS):
+    """Keep a streaming request's lease alive; False once it has expired."""
+    if not lease:
+        return False
+    with _locked(con):
+        return con.execute("UPDATE budget_reservations SET expires_at=? WHERE id=?",
+                           (int(time.time()) + max(60, int(ttl_seconds)), lease)).rowcount == 1
 
 
 # Characters of the sha256 kept for the URL or query one external call was made
@@ -294,13 +335,33 @@ _USAGE_CONTEXT = contextvars.ContextVar("misaka_usage_context", default=None)
 
 
 @contextmanager
-def usage_context(path, task_id, generation):
-    """Bill a window turn's tools without changing other sessions' process environment."""
-    token = _USAGE_CONTEXT.set((path, task_id, str(generation)))
+def usage_context(path, task_id, generation, cap=None):
+    """Bill a window turn's model requests and tools to ``task_id`` without changing other
+    sessions' process environment; ``cap`` None means ``research.token_cap``."""
+    token = _USAGE_CONTEXT.set((path, task_id, str(generation), cap))
     try:
         yield
     finally:
         _USAGE_CONTEXT.reset(token)
+
+
+def ledger():
+    """``(path, task_id, generation, cap)`` this turn is billed to, or None: a window research turn
+    supplies an async-local ``usage_context``; other metered processes the ``MISAKA_USAGE_*``
+    environment a worker exports for its card. A session with neither (an interactive chat) has
+    nothing to bill. No cap given (an empty ``MISAKA_USAGE_TOKEN_CAP``, the drivers' choice) is
+    ``research.token_cap`` as settings.json reads at this request: a driver and its cards that each
+    kept the value they started with disagreed once it was edited, and the driver relaunched cards
+    the cap refused, for ever (0.18.9 sweep)."""
+    context = _USAGE_CONTEXT.get()
+    if context is None:
+        raw_cap = os.environ.get("MISAKA_USAGE_TOKEN_CAP", "")
+        context = (os.environ.get("MISAKA_USAGE_DB"), os.environ.get("MISAKA_USAGE_TASK_ID"),
+                   os.environ.get("MISAKA_USAGE_GENERATION", ""), int(raw_cap) if raw_cap.isdigit() else None)
+    path, task_id, generation, cap = context
+    if not path or not task_id:
+        return None
+    return path, task_id, str(generation or ""), default_cap() if cap is None else int(cap or 0)
 
 
 def record_external_call(service, *, subject="", **facts):
@@ -328,11 +389,10 @@ def record_external_call(service, *, subject="", **facts):
     Never raises: bookkeeping that can fail a tool call is worse than no bookkeeping.
     """
 
-    path, task_id, generation = _USAGE_CONTEXT.get() or (
-        os.environ.get("MISAKA_USAGE_DB"), os.environ.get("MISAKA_USAGE_TASK_ID"),
-        os.environ.get("MISAKA_USAGE_GENERATION", ""))
-    if not path or not task_id:
+    current = ledger()
+    if current is None:
         return False
+    path, task_id, generation, _cap = current
     payload = {"service": str(service), **facts}
     if subject:
         payload["subject_sha256"] = hashlib.sha256(
@@ -344,7 +404,7 @@ def record_external_call(service, *, subject="", **facts):
         con = tasks.connect(path)
         try:
             # Written straight rather than through ``tasks.add_event``, for the same
-            # reason ``commit_agent_usage`` is: that helper drops any event whose
+            # reason ``settle_request`` is: that helper drops any event whose
             # ``task_id`` has no row in ``tasks``, and a research run charges its usage
             # to a run id that lives in another database.
             con.execute(
@@ -365,41 +425,31 @@ def record_external_call(service, *, subject="", **facts):
     return True
 
 
-def reserve_agent_path(path, cap, task_id, generation, ttl_seconds=1800):
+def _on(path, fn, *args, **kwargs):
     from misaka.core.platform import tasks
 
     con = tasks.connect(path)
     try:
-        return reserve_agent(con, cap, task_id, generation, ttl_seconds)
+        return fn(con, *args, **kwargs)
     finally:
         con.close()
 
 
-def release_agent_path(path, token):
-    from misaka.core.platform import tasks
-
-    con = tasks.connect(path)
-    try:
-        return release_agent(con, token)
-    finally:
-        con.close()
+def lease_request_path(path, *args, **kwargs):
+    return _on(path, lease_request, *args, **kwargs)
 
 
-def touch_agent_path(path, token, ttl_seconds=1800):
-    from misaka.core.platform import tasks
-
-    con = tasks.connect(path)
-    try:
-        return touch_agent(con, token, ttl_seconds)
-    finally:
-        con.close()
+def settle_request_path(path, *args, **kwargs):
+    return _on(path, settle_request, *args, **kwargs)
 
 
-def commit_agent_usage_path(path, token, task_id, generation, total_tokens):
-    from misaka.core.platform import tasks
+def renew_request_path(path, *args, **kwargs):
+    return _on(path, renew_request, *args, **kwargs)
 
-    con = tasks.connect(path)
-    try:
-        return commit_agent_usage(con, token, task_id, generation, total_tokens)
-    finally:
-        con.close()
+
+def cap_reached_path(path, *args, **kwargs):
+    return _on(path, cap_reached, *args, **kwargs)
+
+
+def status_path(path, *args, **kwargs):
+    return _on(path, status, *args, **kwargs)

@@ -133,7 +133,9 @@ def launch(who, model=None, cont=False, pick=False, session=None, read_only=Fals
         "MISAKA_CODING_AGENT": "true"})
 
     from misaka.cli.engine import main as engine_main
-    sys.exit(asyncio.run(engine_main(flags, session_assembly.engine_options())))
+    from misaka.utils import loop_watchdog
+    loop_watchdog.configure("chat", exit_on_stall=False)      # a person is there: the stack, not an exit
+    sys.exit(asyncio.run(loop_watchdog.watched(engine_main(flags, session_assembly.engine_options()))))
 
 
 def _display_value(value):

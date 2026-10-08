@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import os
 
+from misaka.core.platform import prompt_guard
 from misaka.core.research import graph, ledger, runs
 from misaka.utils.paths import posix_relpath
 
@@ -55,7 +56,8 @@ def build(con, run, *, node):
     findings = []
     for finding in ledger.findings(con, run["id"]):
         evidence = [{"source_file": claim["source_file"], "quote": claim["quote"],
-                     "evidence_sha": claim["evidence_sha"]}
+                     "evidence_sha": claim["evidence_sha"],
+                     **({"located": where} if (where := ledger.locate(claim, run["workspace"])) else {})}
                     for claim in ledger.claims(con, finding["id"])]
         findings.append({"id": finding["id"], "text": finding["text"],
                          "task_id": finding["task_id"],
@@ -146,16 +148,21 @@ def render(packet):
                 outcome = ("this node" if option["leads_here"] else f"node {option['node']}" if option["node"]
                            else f"not pursued: {option['reason']}" if option["reason"] else "pending")
                 lines.append(f"  - {option['label']} -- {option['premise']} → {outcome}")
-    lines += ["", '## Declared findings (not machine-reviewed)']
+    # Findings are Sisters' words and their sources' quotations: data, fenced as planner's
+    # evidence block fences the same ledger (issue #10 audit, M3).
+    declared = []
     for finding in packet["declared_findings"]:
-        lines.append(f"- `{finding['id']}` {finding['text']}")
+        declared.append(f"- `{finding['id']}` {finding['text']}")
         for claim in finding["claims"]:
-            lines.append(f"  - {claim['source_file']}: {claim['quote']}")
+            declared.append(f"  - {claim['source_file']}: {claim['quote']}")
+    lines += ["", '## Declared findings (not machine-reviewed)']
+    if declared:
+        lines.append(prompt_guard.untrusted("context-findings", "\n".join(declared)))
     lines += ["", '## Artifact map']
     for artifact in packet["artifact_map"]:
         lines.append(f"- `{artifact['id']}` [{artifact['kind']}] {artifact['title']} — `{artifact['path']}`")
-    lines += ["", '## Inheritance discipline', packet["notice"], "", '## Machine-readable packet', "```json",
-              json.dumps(packet, ensure_ascii=False, indent=2), "```", ""]
+    lines += ["", '## Inheritance discipline', packet["notice"], "", '## Machine-readable packet',
+              prompt_guard.untrusted("context-packet", json.dumps(packet, ensure_ascii=False, indent=2)), ""]
     return "\n".join(lines)
 
 

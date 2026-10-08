@@ -30,28 +30,65 @@ What reading them needs:
 |---|---|
 | PDF | `pdftotext` from poppler (`brew install poppler`); a built-in reader is the fallback |
 | scanned PDF | `ocrmypdf` with the language data: `brew install ocrmypdf tesseract-lang`, or `ocrmypdf` and `tesseract-ocr` with your language packs on Linux |
-| DjVu | DjVuLibre (`djvutxt`); scanned DjVu goes through OCR as well |
+| DjVu | DjVuLibre (`djvused`, and `ddjvu` for pages that need OCR); scanned DjVu goes through OCR as well |
 | old `.doc`, `.xls`, `.ppt` | LibreOffice |
 
-- **Scanned PDFs.** A PDF where fewer than a fifth of the pages carry text goes through OCR, which
-  leaves the pages that do have text alone. `documents.ocr_langs` in `settings.json` sets the
-  languages (default `eng+chi_sim+jpn`); each needs its language data installed, or OCR fails and
-  the message says why.
-- **Outlines.** With the `pageindex` extra installed, long PDFs get an outline (chapters and
+- **Scanned PDFs.** Each page is checked on its own, and a page goes through OCR when it has no
+  text of its own (a download stamp or a running head repeated on most pages does not count), when
+  its text is garbled (a broken font encoding), or when it is mostly a picture with little text on
+  it. A page that has a text layer keeps it, and what OCR reads on it is added after it, so a
+  scanned facsimile under a typeset heading loses neither. Pages that needed OCR and did not get
+  it -- no `ocrmypdf`, or a failed run -- are marked unread: `doc_list` counts them, and
+  `doc_read` names each one with the reason. Pages OCR read and found no text on (blank scans,
+  pictures, maps) are named by `doc_read` too, but not counted as unread. A document is turned
+  away only when, after OCR, fewer than a fifth of its pages carry text. `documents.ocr_langs` in
+  `settings.json` sets the languages (default `eng+chi_sim+jpn`); each needs its language data
+  installed, or OCR fails and the message says why.
+- **Documents indexed by an older version.** Running `misaka doc add` or `scan` again on a PDF or
+  DjVu indexed before per-page OCR re-reads it when its stored pages show it may need it: pages
+  that printed something the old version did not read get OCR, and a document whose pages were
+  numbered out of step with the file is renumbered. An EPUB with pictures whose text has no
+  `![...]` markers is read again too, so its pictures are named. Only the pages whose text changed are
+  rewritten, and the command lists how many; `doc_read` and `doc_verify` say so on those pages,
+  because a quotation located there earlier may have pointed at different text.
+- **Outlines.** Long PDFs get an outline (chapters and
   sections with their page ranges), so an agent can go straight to a chapter. Plain-text and Markdown documents get theirs from their own headings (`CHAPTER XII`,
   `LIVRE III`, a title set in capitals, `#` in Markdown), with no extra needed. Outlines are made
   for documents of 20 pages or more. Running `misaka doc add` or `scan` again on a document
   indexed earlier fills its outline in. `--no-tree` skips the outline.
-- **Pages.** In a PDF or DjVu file a page is a printed page. EPUB, HTML, text and Office files
+- **Figures.** A map, a chart or a plate is not in a page's text, so `doc_read` names the figures
+  on the pages it returns: an image on a PDF page (covering more than 8% of it, and wider than a
+  logo), a drawing of more than 100 strokes (a chart, a map or a ruled table), and, in a scanned
+  book, a page with far less text than the book's pages usually carry. `doc_outline` lists the
+  pages that have them. `doc_page_image(doc_id, page, figure=N)` shows one figure alone, at the
+  resolution its labels need; without `figure` it shows the whole page, of a PDF or a DjVu.
+  In a deck, the slides whose meaning is in a picture or a drawing are named, and
+  `doc_page_image(doc_id, page)` shows the slide (LibreOffice renders it; hidden slides have no
+  image). A Word document or an EPUB marks each picture where it stands, `![alt]`, and
+  `doc_page_image(doc_id, page, figure=N)` shows the N-th picture on that page as the file
+  stores it (a Word chart pasted as EMF or WMF needs LibreOffice). A
+  model without vision cannot be shown an image at all, so for it the page or the figure is read
+  in words by the team's vision model (`vision.model`, see [Models](models.md)).
+  A value read off a figure is a reading, not a quotation: `doc_verify` cannot locate it.
+- **Pages.** In a PDF or DjVu file a page is a page of the file, counted from 1 -- not always the
+  number printed on it (front matter in Roman numerals, a scanned cover, an article whose journal
+  pagination starts at 1361). Where the printed number is known, `doc_read`, `doc_find` and
+  `doc_verify` show it beside the file's page (`p351 (printed p. 338)`): from the PDF's own page
+  labels, or else read off the page heads and feet, but only where many pages in a row agree on
+  it. The file's page stays the locator a citation records. EPUB, HTML, text and Office files
   have none, so MISAKA cuts them into pages of about 3,000 characters at paragraph breaks, and
   a citation such as `p12` points into that cut.
 
 Agents use the same index through their tools: `doc_list`, `doc_outline`, `doc_read` (by outline
-node or page range), `doc_find` (literal text), `doc_page_image` (a PDF page as an image, for
-figures, tables, maps and scans) and `doc_add`. `doc_verify` finds the page and character offset
-where a quotation occurs and returns a hash for it. It shows where the words are; whether they
+node or page range), `doc_find` (literal text), `doc_page_image` (a page of a PDF, a DjVu or a deck,
+or one figure or embedded picture, as an image, for figures, tables, maps, slides and scans) and `doc_add`. `doc_verify` finds the page and character offset
+where a quotation occurs and returns a hash for it; given the page it is cited on, it says when
+the quotation is on another page instead. It shows where the words are; whether they
 support the claim is for the red team and Last Order to judge. On an OCR page, a
-match means the quotation matches what OCR read.
+match means the quotation matches what OCR read. In a research run, every quotation a finding
+cites from a document is looked for on its page whenever Last Order, the red team or the
+bundle reads it: one on another page, or not in the indexed text at all, is marked there (and
+listed in `SOURCES.md` under "Quotations not where they are cited"), never refused.
 
 What joins the index by itself:
 

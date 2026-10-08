@@ -213,7 +213,7 @@ def test_cli_keeps_approval_policy_and_prints_progress(root_run, monkeypatch, ca
         return {"reason": "waiting_input", "questions": ["Fixture scope question?"]}
 
     monkeypatch.setattr(workflow, "run", drive)
-    app._cmd_research(SimpleNamespace(node=None, resume=run["id"]))
+    app._cmd_research(SimpleNamespace(node=None, tell=None, limits=None, resume=run["id"]))
     output = capsys.readouterr().out
     assert "Fixture attach instructions" in output
     assert "Fixture scope question?" in output

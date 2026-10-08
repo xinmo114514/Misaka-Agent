@@ -123,10 +123,20 @@ def get_powershell_config() -> ShellConfig:
     return ShellConfig(shell=shell, args=list(POWERSHELL_ARGS))
 
 
+# What a release archive's launcher sets for MISAKA's own Python (scripts/build_release.py): kept
+# for the processes MISAKA starts of itself, never for the user's commands -- under PYTHONSAFEPATH a
+# skill's `python scripts/fetch.py` could not import the `_common.py` beside it (0.18.9 sweep).
+_ARCHIVE_PYTHON_FLAGS = ("PYTHONSAFEPATH", "PYTHONNOUSERSITE")
+
+
 def get_shell_env() -> dict[str, str]:
     from misaka.config import get_bin_dir
+    from misaka.config.engine import bundle_root
 
     env = dict(os.environ)
+    if bundle_root() is not None:
+        for name in _ARCHIVE_PYTHON_FLAGS:
+            env.pop(name, None)
     bin_dir = get_bin_dir()
     path_key = next((key for key in env if key.lower() == "path"), "PATH")
     current_path = env.get(path_key, "")

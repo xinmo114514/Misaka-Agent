@@ -18,7 +18,7 @@
 | poppler | 读取 PDF | `brew install poppler` | `sudo apt install poppler-utils` | `winget install oschwartz10612.Poppler` |
 | ocrmypdf（可选） | 扫描版 PDF | `brew install ocrmypdf tesseract-lang` | `sudo apt install ocrmypdf tesseract-ocr-chi-sim tesseract-ocr-jpn` | 见 [OCRmyPDF 的 Windows 安装说明](https://ocrmypdf.readthedocs.io/en/latest/installation.html#installing-on-windows) |
 | DjVuLibre（可选） | DjVu 文件 | `brew install djvulibre` | `sudo apt install djvulibre-bin` | `winget install DjVuLibre.DjView` |
-| LibreOffice（可选） | 旧版 `.doc`、`.xls`、`.ppt` 文件 | `brew install --cask libreoffice` | `sudo apt install libreoffice` | `winget install TheDocumentFoundation.LibreOffice` |
+| LibreOffice（可选） | 旧版 `.doc`、`.xls`、`.ppt` 文件；显示幻灯片，或以 EMF/WMF 保存的 Word 图表 | `brew install --cask libreoffice` | `sudo apt install libreoffice` | `winget install TheDocumentFoundation.LibreOffice` |
 
 OCR 那一行会装好英文、中文和日文，这是 MISAKA 默认识别扫描件时用的语言。必需的工具如果缺了，设置向导会告诉你缺哪个、怎么装。Windows 上 `winget install` 之后要新开一个终端，新装的工具才找得到。
 
@@ -40,11 +40,10 @@ Homebrew 与 winget 见 [release/README.md](../release/README.md)。
 | 可选组件 | 增加的功能 |
 |---|---|
 | `providers` | 所有模型服务商的 SDK。只想装一家，就写 `anthropic`、`openai`、`google`、`bedrock` 或 `mistral`（OpenRouter 和其他兼容 OpenAI 的服务用 `openai`）。 |
-| `pageindex` | 长 PDF 的章节目录 |
 | `browser` | 操控网页浏览器的工具 |
 | `lcm-semantic` | 按意思检索过去的对话 |
 
-同时装几个：`"misaka[providers,pageindex] @ git+https://..."`。
+同时装几个：`"misaka[providers,browser] @ git+https://..."`。
 
 ## 3. 运行设置向导
 

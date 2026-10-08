@@ -213,7 +213,7 @@ async def test_research_tools_lists_only_what_is_waiting(board, tmp_path):
     assert listed["tools"] == []
 
 
-def test_the_action_map_names_only_session_gated_phase_tools():
+async def test_the_action_map_names_only_session_gated_phase_tools():
     """An action belongs here only if recording it is what the ownership gate exists to restrict.
 
     stop / resume / retry are deliberately absent -- the engine guards none of them with session

@@ -18,7 +18,7 @@
 | poppler | PDF の読み取り | `brew install poppler` | `sudo apt install poppler-utils` | `winget install oschwartz10612.Poppler` |
 | ocrmypdf（任意） | スキャンした PDF | `brew install ocrmypdf tesseract-lang` | `sudo apt install ocrmypdf tesseract-ocr-chi-sim tesseract-ocr-jpn` | [OCRmyPDF の Windows 向け手順](https://ocrmypdf.readthedocs.io/en/latest/installation.html#installing-on-windows)を参照 |
 | DjVuLibre（任意） | DjVu ファイル | `brew install djvulibre` | `sudo apt install djvulibre-bin` | `winget install DjVuLibre.DjView` |
-| LibreOffice（任意） | 古い `.doc`、`.xls`、`.ppt` ファイル | `brew install --cask libreoffice` | `sudo apt install libreoffice` | `winget install TheDocumentFoundation.LibreOffice` |
+| LibreOffice（任意） | 古い `.doc`、`.xls`、`.ppt` ファイル、スライドの表示、EMF/WMF で保存された Word の図表 | `brew install --cask libreoffice` | `sudo apt install libreoffice` | `winget install TheDocumentFoundation.LibreOffice` |
 
 OCR の行では英語・中国語・日本語が入ります。MISAKA がスキャン画像を読むときの既定の言語です。必須のツールが足りないときは、どれが足りず、どう入れればよいかをセットアップウィザードが教えてくれます。Windows では `winget install` のあと、新しいターミナルを開くと入れたツールが見つかります。
 
@@ -40,11 +40,10 @@ Homebrew と winget は [release/README.md](../release/README.md) を見てく�
 | 追加機能 | 加わるもの |
 |---|---|
 | `providers` | すべてのモデルプロバイダの SDK。一社だけなら `anthropic`、`openai`、`google`、`bedrock`、`mistral` のいずれかを指定します（OpenRouter や OpenAI 互換のサービスは `openai`）。 |
-| `pageindex` | 長い PDF の章立て |
 | `browser` | ウェブブラウザを操作するツール |
 | `lcm-semantic` | 過去の会話を意味で検索する機能 |
 
-複数まとめて：`"misaka[providers,pageindex] @ git+https://..."`。
+複数まとめて：`"misaka[providers,browser] @ git+https://..."`。
 
 ## 3. セットアップウィザードを実行する
 

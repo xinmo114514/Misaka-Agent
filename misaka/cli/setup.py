@@ -506,11 +506,9 @@ class Wizard:
         ui.print_check(office, "office documents", "python-docx / openpyxl / python-pptx" if office else
                        "python-docx, openpyxl, python-pptx missing: reinstall misaka (they are dependencies)")
         has_outline = pageindex_available()
-        ui.print_check(has_outline, "PDF outlines", "PageIndex extra installed" if has_outline else
-                       "PageIndex extra not installed: PDFs are indexed page by page, without an outline")
-        if not has_outline and prompt_yes_no("Install the PDF outline extra now? (recommended for PDF-heavy research)", True):
-            self._add_extras(["pageindex"])
-            has_outline = pageindex_available()
+        ui.print_check(has_outline, "PDF outlines", "PageIndex" if has_outline else
+                       "PyPDF2 or sortedcontainers missing, so PDFs have no outline: reinstall misaka "
+                       "(they are dependencies)")
         ocr = shutil.which("ocrmypdf") is not None
         ui.print_check(True if ocr else None, "OCR", "ocrmypdf present" if ocr else
                        f"scanned PDFs need ocrmypdf: {_install_command('ocrmypdf')}")
@@ -651,7 +649,7 @@ class Wizard:
         for binary in ("git", "rg", "fd", "pdftotext"):
             present = find_tool(binary) is not None
             ui.print_check(present, binary, "" if present else _install_command(binary))
-        ui.print_check(state.get("pageindex", None), "PDF outlines", "" if state.get("pageindex") else "optional")
+        ui.print_check(state.get("pageindex", None), "PDF outlines", "" if state.get("pageindex") else "missing: reinstall misaka")
         ui.print_check(None, "web tools", str(state.get("web") or "not checked: misaka web status"))
         ui.print_check(None, "skills", "coverage-maps built in; more: `misaka skills optional-list`")
         ui.print_check(True if state.get("openalex") else None, "literature scan",
@@ -688,6 +686,11 @@ class Wizard:
         process is theirs to do after it exits, so their command is printed, not run."""
         from misaka.cli import update
         install = update.describe()
+        if install.kind == "bundle":
+            # A release archive carries what it was built with (misaka[providers]) and no pip.
+            ui.print_info(f"This MISAKA is a release archive, built without {', '.join(extras)}. To add it,",
+                          "install MISAKA from the repository instead (README: Install).")
+            return
         command = update.adding_extras(install, extras)
         if command is None:
             ui.print_info("Install it with:", f"  pip install 'misaka[{','.join(extras)}] @ git+{update.REPO_URL}'")

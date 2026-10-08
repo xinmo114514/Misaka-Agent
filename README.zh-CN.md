@@ -94,7 +94,7 @@ irm https://raw.githubusercontent.com/Luciole-Studio/Misaka-Agent/main/scripts/i
 | 压缩阈值 | 对话压缩的触发比例，仅作用于本次研究 |
 | 输出上限 | 模型单次回复的最大长度，仅作用于本次研究 |
 
-也可以在一行中同时给出参数与问题，例如 `/research --depth 2 --max-nodes 12 问题`。未指定的参数取默认值：深度 3，节点与任务卡各并行 4，追加 2 轮，修订 2 次，节点上限 30。在终端中，`misaka research` 接受相同的参数。
+也可以在一行中同时给出参数与问题，例如 `/research --depth 2 --max-nodes 12 问题`。未指定的参数取默认值：深度 3，节点与任务卡各并行 4，追加 2 轮，修订 2 次，节点上限 30。在终端中，`misaka research` 接受相同的参数。研究进行中也可以改参数，例如 `/research limits --sister-parallel 2`。
 
 ### 节点内部
 
@@ -147,8 +147,10 @@ irm https://raw.githubusercontent.com/Luciole-Studio/Misaka-Agent/main/scripts/i
 
 - 每个项目维护独立的文档索引。页数不少于 20 页的文档生成章节层级目录，并标注各章节的页码区间。
 - agent 先检视目录（`doc_outline`），再依章节节点或页码区间读取正文（`doc_read`），仅将所需内容载入上下文。
-- 页码的界定：PDF 与 DjVu 采用印刷页码；其他格式在段落边界处按约 3000 字符切分，引用页码即指向该切分。
-- `doc_find` 执行字面检索；`doc_verify` 返回引文所在的页码、字符偏移及校验值；`doc_page_image` 以图像形式读取指定页面，适用于图表、地图与扫描页。
+- 页码的界定：PDF 与 DjVu 采用文件自身的页序，从 1 起计，不一定等于纸面上印的页码（PDF 自带页码标签、或页眉页脚印有页码时，会在旁边注明印刷页码）；其他格式在段落边界处按约 3000 字符切分，引用页码即指向该切分。
+- `doc_find` 执行字面检索；`doc_verify` 返回引文所在的页码、字符偏移及校验值。
+- 扫描页逐页识别并经 OCR 读取，排印页与扫描页混排的书两者都不丢失。
+- `doc_read` 会指明正文未承载的插图：PDF 页面上的图片与线条图、可能是地图或插图的扫描页、内容在图中的幻灯片、Word 文档与 EPUB 内嵌的图片；`doc_page_image` 显示该页、该幻灯片或单张插图。对不支持视觉的模型，所有图像由统一的视觉模型（`vision.model`）转写为文字后提供。
 - 研究过程中生成的文本在完成时自动纳入索引。撰写最终报告时按文档检索各节点结论，无须将全部内容同时载入上下文。
 
 ### LCM：可回溯的层级压缩
@@ -187,6 +189,9 @@ MISAKA 仅在你要求时提交。若项目为 git 仓库，可使用 `/commit` 
 | 启动 MISAKA | `misaka` |
 | 开始研究 | `/research`，随后输入问题 |
 | 查看、中止或恢复研究 | `/research status`、`/research stop`、`/research resume` |
+| 对进行中的节点说话 | `/research tell [--to 节点ID] 消息` |
+| 修改进行中研究的参数 | `/research limits --sister-parallel 2` |
+| 查看一次研究的花费 | `misaka usage --run RUN_ID` |
 | 与单个 Sister 对话 | `/sister 10032` |
 | 创建 Sister | `misaka create 10036 --desc "实证计量与因果识别"` |
 | 为文档建立索引 | `misaka doc scan sources/` |
@@ -208,6 +213,7 @@ MISAKA 仅在你要求时提交。若项目为 git 仓库，可使用 `/commit` 
 | 登录、选择模型、接入本地模型 | [模型指南](docs/guide/models.md) |
 | 文档与网络资源的使用 | [文档与网络](docs/guide/sources.md) |
 | 故障排查 | [排障](docs/guide/troubleshooting.md) |
+| MISAKA 能防住什么、防不住什么 | [安全使用（英文）](docs/guide/security.md) |
 | 命令与配置参考 | [命令](docs/reference/commands.md)、[配置](docs/reference/configuration.md) |
 
 [docs/README.md](docs/README.md) 提供全部文档的索引及术语说明。除入门指南外，上述文档目前仅提供英文版。
@@ -216,7 +222,7 @@ MISAKA 仅在你要求时提交。若项目为 git 仓库，可使用 `/commit` 
 
 MISAKA 的全部数据均保存在本地：设置、凭据与历史位于 `~/.misaka/`，研究产出位于项目文件夹。提示词仅发送至你配置的模型服务商。网页搜索发送至你配置的搜索服务；未配置或服务出错时，改用 Exa、Parallel、Firecrawl 与 Keenable 的免费公共接口（可通过 `misaka web set keyless_fallback false` 关闭）。文献扫描会将检索词发送至 OpenAlex。MISAKA 不发送任何遥测数据。
 
-一次研究的调用规模可能相当可观：默认最多同时运行四个分支，每个分支最多四位 Sister 并行工作（以机器内存为限），深度研究因此会产生大量模型调用。如需控制成本，可选择较小的研究深度；如需为所有研究设定硬性上限，可在 `~/.misaka/settings.json` 中设置 `research.token_cap`。
+一次研究的调用规模可能相当可观：默认最多同时运行四个分支，每个分支最多四位 Sister 并行工作（以机器内存为限），深度研究因此会产生大量模型调用。如需控制成本，可选择较小的研究深度；如需为每次研究设定硬性的 token 上限，可在 `~/.misaka/settings.json` 中设置 `research.token_cap`。
 
 ## 名字的由来
 

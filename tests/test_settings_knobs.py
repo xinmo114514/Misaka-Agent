@@ -70,3 +70,11 @@ def test_the_entry_refuses_to_start_and_names_every_bad_value():
         bootstrap.install()
     assert "mcp.call_timeout" in str(refused.value) and "subagents.simple" in str(refused.value)
     bootstrap.install(check_settings=False)
+
+
+def test_a_negative_token_cap_is_refused_and_read_as_none():
+    """A negative cap stopped every research run at its start."""
+    from misaka.core.platform import budget
+    _write({"research": {"token_cap": -1}})
+    assert product.validate_settings() == ["research.token_cap=-1 is negative (0 is none)"]
+    assert budget.default_cap() == 0

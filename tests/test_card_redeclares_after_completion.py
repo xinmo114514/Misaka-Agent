@@ -148,3 +148,20 @@ async def test_a_session_that_no_longer_holds_the_card_still_cannot_record_evide
     con.execute("UPDATE tasks SET generation=2 WHERE id=?", (tid,))    # a newer attempt owns the card
     with pytest.raises(ValueError, match="ownership changed"):
         await _note(part, findings=[{"text": "late", "claim_type": "fact"}])
+
+
+async def test_a_red_team_revising_its_critique_after_completion_redeclares_it(card):
+    """Its critique carries the claim of the attempt that recorded it; read against the done card
+    (no claim left) it was not found, and the revised critique was never declared (0.18.10 sweep)."""
+    from misaka.core.platform import tasks
+    con, tid, out, part = card
+    con.execute("CREATE TABLE IF NOT EXISTS research_run_tasks (task_id TEXT PRIMARY KEY, run_id TEXT, branch_id TEXT, "
+                "kind TEXT, round INT, local_id TEXT, depends_json TEXT, created_at INT)")
+    con.execute("INSERT INTO research_run_tasks VALUES (?,?,?,?,?,?,?,?)", (tid, "r", "b", "red_team", 1, None, "[]", 0))
+    con.commit()
+    tasks.add_event(con, tid, "research_critique", {"issues": [], "claim_lock": "lock1"}, generation=1, claim_lock="lock1")
+    await _complete(con, tid, out, part)
+    (out / "report.md").write_bytes(b"revised critique after Last Order's note\n")
+    await _end_turn(part, "revised as asked")
+    assert len(_submissions(con, tid)) == 2
+    assert tasks.latest_payload(con, tid, "redeclare_failed", generation=1) is None

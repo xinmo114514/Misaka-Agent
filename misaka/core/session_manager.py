@@ -1038,6 +1038,10 @@ class SessionManager:
     def getEntries(self) -> list[SessionEntry]:
         return [entry for entry in self.fileEntries if entry.get("type") != "session"]
 
+    def getEntryCount(self) -> int:
+        """Number of session entries (excludes header), without copying them like ``getEntries()``."""
+        return len(self.byId)
+
     def getTree(self) -> list[SessionTreeNode]:
         entries = self.getEntries()
         node_map: dict[str, SessionTreeNode] = {}

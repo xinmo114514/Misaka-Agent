@@ -65,6 +65,73 @@ def test_the_owning_tool_is_read_from_its_receipt(tmp_path, monkeypatch):
     assert update._manager("uv") == "uv tool"
 
 
+def _archive(tmp_path):
+    """The layout of a release archive (scripts/build_release.py): its own CPython beside bin/."""
+    root = tmp_path / "misaka-0.18.6-darwin-arm64"
+    (root / "python" / "bin").mkdir(parents=True)
+    (root / "bin").mkdir()
+    (root / "BUNDLED.txt").write_text("uv git rg fd pdftotext\n", encoding="utf-8")
+    return root
+
+
+def test_a_release_archive_is_known_for_what_it_is(tmp_path, monkeypatch):
+    """2026-10-07: an archive read as "a built package" and was told to pip install, which would
+    have installed into whatever Python was on PATH and left the archive as it was."""
+    root = _archive(tmp_path)
+    monkeypatch.setattr(sys, "prefix", str(root / "python"))
+    install = update.describe()
+    assert install.kind == "bundle" and install.path == root
+    assert update._install_commands(install) is None and update.adding_extras(install, ["browser"]) is None
+
+
+@pytest.mark.parametrize("latest, says", [("v0.18.6", "is the latest release"), ("v0.18.7", "v0.18.7 is out"),
+                                          ("v0.18.5", "newer than the latest release (v0.18.5)")])
+def test_a_release_archive_is_updated_by_the_installer(tmp_path, monkeypatch, capsys, latest, says):
+    monkeypatch.setattr(sys, "prefix", str(_archive(tmp_path) / "python"))
+    monkeypatch.setattr(update, "describe", lambda: update.Install("bundle", False, "", tmp_path, None, "0.18.6"))
+    monkeypatch.setattr(update, "_api", lambda path: ({"tag_name": latest}, None))
+    monkeypatch.setattr(update, "_run_all", lambda *a: pytest.fail("an archive is not updated in place"))
+    assert update.run(apply=True) == 0
+    out = capsys.readouterr().out
+    assert says in out
+    installer = "install.ps1 | iex" if os.name == "nt" else "install.sh | sh"
+    assert (installer in out) == (latest == "v0.18.7") and "pip install" not in out
+    assert "Tracking the main branch" not in out and "could not be compared" not in out
+
+
+@pytest.mark.parametrize("parents, installer, upgrade, remove", [
+    (("opt", "homebrew", "Cellar", "misaka", "0.18.6", "libexec"), "Homebrew", "brew upgrade misaka",
+     ["brew", "uninstall", "misaka"]),
+    (("AppData", "Local", "Microsoft", "WinGet", "Packages", "Luciole-Studio.Misaka_Microsoft.Winget.Source"),
+     "winget", "winget upgrade Luciole-Studio.Misaka", ["winget", "uninstall", "Luciole-Studio.Misaka"]),
+])
+def test_an_archive_homebrew_or_winget_put_in_place_is_theirs_to_update(tmp_path, monkeypatch, capsys, parents,
+                                                                          installer, upgrade, remove):
+    """The installer script would have put a second copy beside it (first on PATH, on Windows)."""
+    from misaka.cli import uninstall
+    root = _archive(tmp_path.joinpath(*parents))
+    monkeypatch.setattr(sys, "prefix", str(root / "python"))
+    install = update.describe()
+    assert (install.kind, install.installer) == ("bundle", installer)
+    monkeypatch.setattr(update, "_api", lambda path: ({"tag_name": "v99.0.0"}, None))
+    assert update.run(apply=True) == 0
+    out = capsys.readouterr().out
+    assert upgrade in out and "install.sh" not in out and "install.ps1" not in out
+    assert uninstall._program_command(install) == remove
+
+
+def test_the_users_commands_do_not_inherit_the_archives_python_flags(tmp_path, monkeypatch):
+    """The launcher sets them for MISAKA's own Python; under PYTHONSAFEPATH a skill's script could
+    not import the module beside it."""
+    from misaka.utils.shell import get_shell_env
+    monkeypatch.setenv("PYTHONSAFEPATH", "1")
+    monkeypatch.setenv("PYTHONNOUSERSITE", "1")
+    assert get_shell_env()["PYTHONSAFEPATH"] == "1", "outside an archive the user's own setting stands"
+    monkeypatch.setattr(sys, "prefix", str(_archive(tmp_path) / "python"))
+    env = get_shell_env()
+    assert "PYTHONSAFEPATH" not in env and "PYTHONNOUSERSITE" not in env
+
+
 def test_installed_extras_are_named_the_widest_way(monkeypatch):
     import importlib.metadata
     requires = ["anthropic>=0.45; extra == 'anthropic'", "openai>=1.60; extra == 'openai'",
@@ -251,3 +318,30 @@ def test_a_source_checkout_is_never_removed(fresh_home, tmp_path, monkeypatch):
     monkeypatch.setattr(update, "describe", lambda: _install("checkout", "uv", tmp_path))
     assert uninstall.run(mode="full", assume_yes=True) == 0
     assert ran == [] and tmp_path.exists() and not fresh_home.exists()
+
+
+def test_an_archive_unpacked_in_a_folder_named_cellar_is_ours(tmp_path, monkeypatch):
+    """Any path part "Cellar" read as Homebrew: uninstall would have run `brew uninstall misaka`."""
+    monkeypatch.setattr(sys, "prefix", str(_archive(tmp_path / "Cellar" / "downloads") / "python"))
+    assert update.describe().installer == ""
+
+
+def test_a_run_whose_driver_died_does_not_hold_up_an_update(tmp_path, monkeypatch):
+    """Killed mid-run, its driver's lease ran out; stopping it from a window leaves it "stopping"
+    with nobody to finish the stop, and every update refused until it was resumed."""
+    import time
+    from contextlib import closing
+
+    from misaka.core.platform import repo, tasks
+    from misaka.core.research import runs
+    monkeypatch.setattr(repo, "enabled", lambda *a, **k: False)
+    with closing(tasks.connect(str(home.path("db")))) as con:
+        runs.init(con)
+        live = runs.create(con, workspace=str(tmp_path), question="Live")
+        dead = runs.create(con, workspace=str(tmp_path), question="Dead")
+        con.execute("UPDATE research_runs SET driver_lock='d1', driver_expires=? WHERE id=?",
+                    (int(time.time()) + 600, live["id"]))
+        con.execute("UPDATE research_runs SET driver_lock='d2', driver_expires=? WHERE id=?",
+                    (int(time.time()) - 600, dead["id"]))
+    found = update.active_runs()
+    assert [line.split()[0] for line in found] == [live["id"]]

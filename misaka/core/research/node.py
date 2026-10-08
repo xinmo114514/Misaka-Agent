@@ -22,16 +22,23 @@ from misaka.config import CFG, current_config, home
 from misaka.core.platform import processes
 from misaka.core.platform import tasks as task_store
 from misaka.core.research import runs
+from misaka.utils import loop_watchdog
 
 
 class ProcessSpawner:
-    """Managed research children, independent of visible panes and their terminals."""
+    """Managed research children, independent of visible panes and their terminals.
+
+    ``show_output`` is for a driver that is itself plain text in a terminal (``misaka research``),
+    whose children print beside it even when that terminal is a pane's shell."""
+
+    def __init__(self, *, show_output=False):
+        self.show_output = show_output
 
     def spawn(self, argv, *, cwd, new_session=False):
         env = os.environ.copy()
         # A child of a pane is not the pane: neither it nor its model sessions may report as
-        # the foreground LO, and its output must not land on the pane's screen.
-        quiet = env.pop("MISAKA_NET_PANE", None) is not None
+        # the foreground LO, and its output must not land on a pane's TUI screen.
+        quiet = env.pop("MISAKA_NET_PANE", None) is not None and not self.show_output
         return subprocess.Popen(
             argv, cwd=cwd, env=env, stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL if quiet else None,
@@ -352,7 +359,7 @@ def _run(label, routine, *, row_id, runner_key):
             return 1
         cfg = current_config()
         runner = HeadlessRunner(con, cfg)
-        result = asyncio.run(routine(con, cfg, runner, progress))
+        result = asyncio.run(loop_watchdog.watched(routine(con, cfg, runner, progress)))
     except Exception as error:  # noqa: BLE001 - the persisted attempt names the actual cause
         failed(error)
         failure = error
@@ -399,7 +406,11 @@ def main(run_id, node_id, *, runner_key):
     its pane id and a terminal of its own) the node is an interactive window; anywhere else --
     a command-line run, a test, a redirected stdin -- it runs headless in the background."""
     if os.environ.get("MISAKA_NET_PANE") and sys.stdin.isatty():
+        # A window a person reads and answers in, and keeps open after the routine: a stall
+        # leaves its stack, but the window stays, as a chat window's does.
+        loop_watchdog.configure(f"node-{node_id}", exit_on_stall=False)
         return run_interactive(run_id, node_id, runner_key=runner_key)
+    loop_watchdog.configure(f"node-{node_id}", exit_on_stall=True)
     return run_headless(run_id, node_id, runner_key=runner_key)
 
 
@@ -446,10 +457,10 @@ def run_interactive(run_id, node_id, *, runner_key):
         "MISAKA_CODING_AGENT": "true",
         # Her tools' spending counts against the run, as a card's counts against its card.
         "MISAKA_USAGE_DB": str(cfg["db"]), "MISAKA_USAGE_TASK_ID": run_id,
-        "MISAKA_USAGE_GENERATION": "1", "MISAKA_USAGE_TOKEN_CAP": str(cfg.get("token_cap") or 0)})
+        "MISAKA_USAGE_GENERATION": "1", "MISAKA_USAGE_TOKEN_CAP": ""})
     from misaka.cli.engine import main as engine_main
     try:
-        return asyncio.run(engine_main(flags, assembly.engine_options()))
+        return asyncio.run(loop_watchdog.watched(engine_main(flags, assembly.engine_options())))
     except Exception as error:  # noqa: BLE001 - a window that never opened is the node's failure to report
         traceback.print_exc()
         con = task_store.connect(os.path.expanduser(CFG["db"]))

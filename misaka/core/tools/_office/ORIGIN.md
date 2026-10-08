@@ -22,6 +22,12 @@ mandatory Python dependencies instead of runtime pip installs; no global pivot-p
 VBA variants are read-only. LibreOffice remains optional; full formula calculation, legacy
 conversion and PDF export require a working installation, not merely a PATH wrapper.
 
+Readers add two things upstream does not have, for `doc_page_image`: `docx.images()` lists the
+picture behind each `![...]` marker, from the same traversal that writes the markers, so a
+Word document's pictures can be shown as stored; `pptx.hidden_slides()` maps a slide to its
+page in a LibreOffice PDF export, which leaves hidden slides out (upstream's route to a vision
+reader for a "needs VLM" slide).
+
 The public `read` API retains MISAKA's line offsets and byte/line limits, and has no `save_to`.
 Office formatting extraction is not visual-layout verification. Upstream PDF OCR/VLM and image
 batch/gateway/sandbox facilities belong to separate MISAKA stacks and are not claimed here.

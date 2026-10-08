@@ -222,7 +222,9 @@ def _inline(container, notes, rels, state, *, plain=False):
             text = _run_text(child)
             if any(_local(node) == "drawing" for node in child.iter()):
                 alt = _image_alt(child)
-                text += f"![{alt or f'image {state.next_image()}'}]"
+                marker = f"![{alt or f'image {state.next_image()}'}]"
+                text += marker
+                state.figures.append({"marker": marker, "alt": alt, "member": state.media.get(_embedded(child))})
             if text:
                 if pieces and pieces[-1][0] == marks:
                     pieces[-1][1] += text
@@ -270,11 +272,16 @@ def _inline(container, notes, rels, state, *, plain=False):
 
 
 class _State:
-    """Counters that run the length of one document: unnamed images, list numbering."""
+    """Counters that run the length of one document: unnamed images, list numbering -- and the
+    pictures behind the ``![...]`` markers, in the order the markers are written, with the part
+    of the package each one is stored in (``media``: the current part's image relationships)."""
 
     def __init__(self):
         self.images = 0
         self.counters = {}
+        self.figures = []
+        self.media = {}
+        self.note_media = {}
 
     def next_image(self):
         self.images += 1
@@ -479,6 +486,32 @@ def _styles(archive):
     return out
 
 
+def _embedded(run):
+    """The relationship id of the picture a drawing in ``run`` shows, or None (a chart, a shape)."""
+    for node in run.iter():
+        if _local(node) == "blip":
+            return node.get(f"{R}embed")
+    return None
+
+
+def _media(archive, part="document"):
+    """Images stored in the package for one Word part: ``{relationship id: zip member}``."""
+    import posixpath
+    import xml.etree.ElementTree as ET
+    try:
+        root = ET.fromstring(archive.read(f"word/_rels/{part}.xml.rels"))
+    except (KeyError, ET.ParseError):
+        return {}
+    package = "{http://schemas.openxmlformats.org/package/2006/relationships}"
+    out = {}
+    for rel in root.findall(f"{package}Relationship"):
+        rid, target = rel.get("Id"), rel.get("Target") or ""
+        if rid and target and rel.get("TargetMode") != "External" and rel.get("Type", "").endswith("/image"):
+            out[rid] = posixpath.normpath(target.lstrip("/") if target.startswith("/")
+                                          else posixpath.join("word", target))
+    return out
+
+
 def _rels(archive, part="document"):
     """External links for one Word part; relationship IDs are local to that part."""
     import xml.etree.ElementTree as ET
@@ -529,6 +562,7 @@ def _note_lines(notes, note_rels, state, styles):
         if not used:
             continue
         rels = note_rels[kind]
+        state.media = state.note_media.get(kind, {})
         lines.extend(["", heading, ""])
         for raw_id in used:
             ordinal = notes.order[kind][raw_id]
@@ -565,6 +599,17 @@ def render(path):
     Raises ``ValueError`` naming the file when python-docx cannot open it -- that string is
     what ``doc_add`` hands the model.
     """
+    return _render(path)[0]
+
+
+def images(path):
+    """The pictures behind the rendering's ``![...]`` markers, in the order the markers appear:
+    ``[{"marker", "alt", "member"}]``, ``member`` the zip member holding the image, or None for a
+    drawing Word makes itself (a chart, a shape). One traversal makes both, so they agree."""
+    return _render(path)[1]
+
+
+def _render(path):
     import xml.etree.ElementTree as ET
     try:
         with zipfile.ZipFile(str(path)) as archive:
@@ -575,6 +620,8 @@ def render(path):
             rels = _rels(archive)
             notes = _Notes(_note_bodies(archive))
             note_rels = {kind: _rels(archive, kind + "s") for kind in _MARKER}
+            media = _media(archive)
+            note_media = {kind: _media(archive, kind + "s") for kind in _MARKER}
     except (OSError, KeyError, ValueError, ET.ParseError, zipfile.BadZipFile) as error:
         raise ValueError(
             f"Cannot read {os.path.basename(str(path))}: {type(error).__name__}: {error}"
@@ -588,6 +635,7 @@ def render(path):
                 yield child
 
     state = _State()
+    state.media, state.note_media = media, note_media
     lines = [
         ("<!-- docx readout: body order, so a table sits where the document puts it. "
          "A backtick span is parser-added, not file content. Table rows are tab-separated. "
@@ -615,4 +663,4 @@ def render(path):
     lines.extend(_note_lines(notes, note_rels, state, styles))
     while lines and not lines[-1].strip():
         lines.pop()
-    return "\n".join(lines) + "\n"
+    return "\n".join(lines) + "\n", state.figures

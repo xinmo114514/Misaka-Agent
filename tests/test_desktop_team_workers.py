@@ -73,3 +73,52 @@ def test_native_worker_requests_selected_team_pair_and_keeps_native_validators(l
             process.stdout.close()
             process.stderr.close()
         con.close()
+
+
+@pytest.mark.parametrize("lane,owner,label,flags", [
+    ("agent", None, "subagent", []),
+    ("agent", "t_owned", "card-t_owned", []),
+    ("card", None, "card-t_fixture", ["--run-card", "t_fixture"]),
+    ("node", None, "node-n_fixture", ["--node", "r_fixture", "n_fixture", "--runner-key", "key"]),
+])
+def test_desktop_worker_preserves_native_stall_watchdog(tmp_path, monkeypatch, lane, owner, label, flags):
+    from types import SimpleNamespace
+
+    from misaka.ai import api_registry
+    from misaka.core import wiring
+    from misaka.desktop_research import worker_entry
+    from misaka.desktop_research.model_policy import atomic_json
+    from misaka.desktop_research.team import DesktopResearchTeam
+    from misaka.utils import loop_watchdog
+
+    team = DesktopResearchTeam(tmp_path / "team", tmp_path / "shared", "fixture", "model")
+    atomic_json(team.directory / "runtime-config.json", {"profiles_root": str(tmp_path / "shared")})
+    monkeypatch.setattr(api_registry, "_request_meter", None)
+    monkeypatch.setattr(wiring, "bundled", wiring.bundled)
+    monkeypatch.setattr(loop_watchdog, "_settings", None)
+    # Keep the real watched coroutine; only its process-exiting timer is isolated.
+    armed = []
+    monkeypatch.setattr(loop_watchdog, "_arm", lambda seconds: armed.append(seconds))
+    if owner:
+        monkeypatch.setenv("MISAKA_SISTER_OWNER_TASK_ID", owner)
+    else:
+        monkeypatch.delenv("MISAKA_SISTER_OWNER_TASK_ID", raising=False)
+
+    observed = []
+    def observe(*args, **kwargs):
+        observed.append(loop_watchdog._settings)
+        return 0
+    async def amain():
+        observe()
+        assert loop_watchdog._depth == 1, "agent execution must run inside watched()"
+        return 0
+    native = SimpleNamespace(module=lambda name: SimpleNamespace(
+        amain=amain, main_card=observe, run_headless=observe))
+    monkeypatch.setattr(worker_entry, "DesktopExecutionScope", lambda *args: SimpleNamespace(native=native))
+    monkeypatch.setattr(sys, "argv", list(sys.argv))
+    args = ["--policy", str(team.model_policy.path), "--epoch", "0", "--provider", "fixture",
+            "--model", "model", "--lane", lane, "--", *flags]
+    assert worker_entry.main(args) == 0
+    assert observed == [{"label": label, "exit": True}]
+    if lane == "agent":
+        assert armed

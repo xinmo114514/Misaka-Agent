@@ -97,8 +97,9 @@ def register(harn):
                 + f": {r['question']} — {r['rationale']}" + (f" | Last Order: {r['reason']}" if r["reason"] else "")
                 for r in rows) or "(empty)"))
         rows = ledger.findings(con, run["id"], limit=params.limit + 1, offset=params.offset)
-        result = _text("\n".join(
-            f"{r['id']} [{r['claim_type']}] {r['text']}" for r in rows[:params.limit]) or "(empty)")
+        # A finding is a Sister's words about her sources: data, fenced as the other views are.
+        listed = "\n".join(f"{r['id']} [{r['claim_type']}] {r['text']}" for r in rows[:params.limit])
+        result = _text(untrusted("research-findings", listed) if listed else "(empty)")
         next_offset = params.offset + params.limit if len(rows) > params.limit else None
         result["details"] = {"offset": params.offset, "next_offset": next_offset}
         if next_offset is not None:

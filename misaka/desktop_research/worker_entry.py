@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import re
 import sys
 import time
@@ -57,6 +58,7 @@ def validate_worker_binding(args, policy):
 def main(argv=None):
     args = parse_worker_args(argv)
     from misaka.cli import bootstrap
+    from misaka.utils import loop_watchdog
     from misaka.windows_bootstrap import apply_windows_utf8_bootstrap
     apply_windows_utf8_bootstrap()
     bootstrap.install()
@@ -68,16 +70,22 @@ def main(argv=None):
     scope = DesktopExecutionScope(team, config)
     if args.lane == 'agent':
         sys.argv = [sys.argv[0], *pinned_flags(args.flags, binding)]
-        return asyncio.run(scope.native.module('misaka.core.subagent.child').amain())
+        owner = os.environ.get('MISAKA_SISTER_OWNER_TASK_ID')
+        loop_watchdog.configure(f'card-{owner}' if owner else 'subagent', exit_on_stall=True)
+        return asyncio.run(loop_watchdog.watched(scope.native.module('misaka.core.subagent.child').amain()))
     node = scope.native.module('misaka.core.research.node')
     if args.lane == 'card':
         if len(args.flags) not in {2,4} or args.flags[0] != '--run-card' or (len(args.flags) == 4 and args.flags[2] != '--say'):
             raise ValueError('Expected --run-card TASK_ID [--say TEXT]')
+        loop_watchdog.configure(f'card-{args.flags[1]}', exit_on_stall=True)
+        from misaka.config import env as env_file
+        env_file.load()
         return node.main_card(args.flags[1], say=args.flags[3] if len(args.flags) == 4 else None)
     parser = argparse.ArgumentParser()
     parser.add_argument('--node', required=True, nargs=2)
     parser.add_argument('--runner-key', required=True)
     flags = parser.parse_args(args.flags)
+    loop_watchdog.configure(f'node-{flags.node[1]}', exit_on_stall=True)
     return node.run_headless(*flags.node, runner_key=flags.runner_key)
 
 

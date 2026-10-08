@@ -292,6 +292,8 @@ class TUI(Container):
         self._loop_thread: int | None = None
         self._capture_loop()
         self.lastRenderAt = 0.0
+        self.lastRenderCostMs = 0.0
+        self.lastRenderWallMs = 0.0
         self._renderLock = threading.Lock()
         self.cursorRow = 0
         self.hardwareCursorRow = 0
@@ -597,7 +599,18 @@ class TUI(Container):
         if self.stopped or self.renderTimer is not None or not self.renderRequested:
             return
         elapsed = (time.perf_counter() * 1000) - self.lastRenderAt
-        delay_ms = max(0.0, self.MIN_RENDER_INTERVAL_MS - elapsed)
+        # PORT-NOTE: pi waits MIN_RENDER_INTERVAL_MS from the start of the last frame, and in
+        # Node that is enough: a network chunk's promise continuations all run before the next
+        # timer. asyncio has no such priority; every await is a loop callback queued alongside
+        # the render timer. A frame slower than the interval (a long reply is laid out whole
+        # every frame) then made frames run back to back, a streaming reply advanced about one
+        # event per frame, fell minutes behind the provider and was cut off ("Connection
+        # error.", GitHub issue #6). So a frame also waits as long as the last one took: painting
+        # gets at most half the loop. ``elapsed`` runs from the frame's start, and the wait is
+        # counted from its end: a frame that took longer than its CPU (a write held up, threads
+        # contending for the GIL) still leaves the loop as long as its CPU took.
+        delay_ms = max(0.0, self.MIN_RENDER_INTERVAL_MS - elapsed,
+                       self.lastRenderWallMs + self.lastRenderCostMs - elapsed)
         callback = lambda: self._run_scheduled_render(timer)
         if self._loop is not None:
             if self._loop.is_closed():
@@ -1026,9 +1039,15 @@ class TUI(Container):
             self._schedule_next_tick(self._scheduleRender)
             return
 
+        # The frame's cost is the CPU this thread spent laying it out: a terminal write held up for
+        # seconds (a Windows console with text selected, a stalled ssh link) is not work the loop
+        # must be left time for, and counted it held the next frame back as long again.
+        started, wall = time.thread_time(), time.perf_counter()
         try:
             self._doRenderInner()
         finally:
+            self.lastRenderCostMs = (time.thread_time() - started) * 1000
+            self.lastRenderWallMs = (time.perf_counter() - wall) * 1000
             self._renderLock.release()
 
     def _doRenderInner(self) -> None:

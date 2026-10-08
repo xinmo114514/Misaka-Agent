@@ -539,4 +539,7 @@ def launch(task_id, say=None):
         sys.exit(f"Card {task_id}: its folder {workspace} no longer exists.")
     task["_attachments"] = card_files.attachment_list(workspace, task_id, workspace=workspace)
     os.chdir(workspace)
-    asyncio.run(run_attempt(task, generation, claim_lock, db_path=CFG["db"], say=say, out=sys.stdout))
+    from misaka.utils import loop_watchdog
+    loop_watchdog.configure(f"card-{task_id}", exit_on_stall=True)
+    asyncio.run(loop_watchdog.watched(
+        run_attempt(task, generation, claim_lock, db_path=CFG["db"], say=say, out=sys.stdout)))

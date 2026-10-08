@@ -1791,7 +1791,7 @@ async def run_desktop_bridge(runtime_host: Any, options: Any = None) -> int:
 
                     try:
                         detail["root_context"] = await session_control.request(owner.record, "stats")
-                    except Exception:  # noqa: BLE001 - a closed owner should not block graph reading
+                    except Exception:  # noqa: BLE001, S110 - a closed owner should not block graph reading
                         pass
                 elif owner.kind == "desktop":
                     detail["root_context"] = {
@@ -1836,8 +1836,8 @@ async def run_desktop_bridge(runtime_host: Any, options: Any = None) -> int:
                 con.close()
 
         elif cmd in ("control_research", "controlresearch"):
-            from misaka.core.research import desktop_intervene, runs
             from misaka.core import session_control
+            from misaka.core.research import desktop_intervene, runs
 
             con = _open_research_write()
             if con is None:
@@ -2819,6 +2819,8 @@ def main(args: Any = None) -> int:
     from misaka.windows_bootstrap import apply_windows_utf8_bootstrap
 
     apply_windows_utf8_bootstrap()
+    from misaka.cli import bootstrap
+    bootstrap.install()
     _clean_broken_local_proxies()
 
     cwd = getattr(args, "cwd", None) or os.getcwd()

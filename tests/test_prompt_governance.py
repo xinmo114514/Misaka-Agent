@@ -114,7 +114,7 @@ class PromptGovernanceTests(unittest.TestCase):
                             patch.object(planner, "_roster", return_value=[]), \
                             patch.object(planner, "_lo_session", return_value="/fixture"), \
                             patch.object(planner, "position", return_value="- fixture option"), \
-                            patch.object(planner.runs, "limits", return_value={"max_depth": 3}), \
+                            patch.object(planner.runs, "current_limits", return_value={"max_depth": 3}), \
                             patch.object(planner, "_command", return_value=(
                                 {"payload": {}, "session_file": "/fixture/session.jsonl"}, "raw")) as command:
                         self.assertEqual(planner.plan_approval_prompt(cfg), expected)
@@ -142,7 +142,7 @@ class PromptGovernanceTests(unittest.TestCase):
         with patch.object(planner, "_roster", return_value=[]), \
                 patch.object(planner, "_lo_session", return_value="/fixture"), \
                 patch.object(planner, "position", return_value="- fixture option"), \
-                patch.object(planner.runs, "limits", return_value={"max_depth": 3}), \
+                patch.object(planner.runs, "current_limits", return_value={"max_depth": 3}), \
                 patch.object(planner, "_command", return_value=(
                     {"payload": {}, "session_file": "/fixture/session.jsonl"}, "raw")) as command:
             planner.plan(run, {}, SimpleNamespace(session=None), node, con=object())

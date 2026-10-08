@@ -1253,7 +1253,7 @@ _FAILURE_KINDS = (
         r"|(?:error code|status(?: code)?)[: ]+40[13]\b|\(40[13]\)"
         r"|exceeded your (?:current )?quota|payment required|credit balance|insufficient[ _-]?credit"
         r"|gousagelimiterror|freeusagelimiterror|monthly usage limit reached|available balance"
-        r"|insufficient[ _-]?quota|out of budget|quota exceeded|billing")),
+        r"|insufficient[ _-]?quota|out of budget|quota exceeded|billing|token_cap reached")),
     ("rate_limit", re.compile(r"rate[ _-]?limit|too many requests|\b429\b")),
     ("context_overflow", re.compile(
         r"context[ _-]?(?:length|window)|maximum context|too many tokens|prompt is too long"

@@ -257,6 +257,8 @@ def create_find_tool_definition(
 
         parsed = FindToolInput.model_validate(params)
         search_path = resolve_to_cwd(parsed.path or ".", cwd)
+        from misaka.core.web.evidence import check_material_read
+        check_material_read(search_path)
         effective_limit = parsed.limit if parsed.limit is not None else DEFAULT_LIMIT
 
         if custom_ops is not None and callable(getattr(custom_ops, "glob", None)):

@@ -398,7 +398,11 @@ SETTLED_TASK_STATUSES = frozenset({"running", "review", "done", "failed", "stopp
 
 def node_dir(node_id):
     """The folder a node owns: ``nodes/<node id>``, the root included. Flat on purpose: a node
-    with several parents has no single place in a nested tree."""
+    with several parents has no single place in a nested tree. A node id is a name, as
+    ``session_dir`` and ``_artifact_name`` already insist."""
+    node_id = str(node_id or "")
+    if not node_id or Path(node_id).name != node_id or node_id in {".", ".."} or "\\" in node_id:
+        raise ValueError(f"A node id is a name, not a path: {node_id!r}")
     return os.path.join("nodes", node_id)
 
 
@@ -486,15 +490,23 @@ def prepare_runner(con, table, row_id):
     return key
 
 
+def _own_identity(pid):
+    """This process's identity, or ``host:pid`` where neither psutil nor ``ps`` can read its start
+    time (a restricted container: every node crashed at start there, issue #10 audit, H5). Only
+    for the process's own claim -- its PID cannot be reused while it runs. ``processes.identity``
+    itself keeps answering None for an unreadable process: everywhere else that None is what keeps
+    a reused PID from passing for the recorded one."""
+    from misaka.core.platform import processes
+    return processes.identity(pid) or f"{socket.gethostname()}:{pid}"
+
+
 def claim_runner(con, table, row_id, key):
     """Fence delayed/duplicate spawns, including a lost pane.create reply."""
     from misaka.core.platform import processes
     if not key:
         return False
     pid = os.getpid()
-    identity = processes.identity(pid)
-    if identity is None:
-        raise RuntimeError("Research runner process identity is unreadable")
+    identity = _own_identity(pid)
     # The parent recorded this process's identity from its own psutil, whose start times can
     # sit a whole second from what this process reads (processes.IDENTITY_TOLERANCE_SECONDS),
     # so the fence compares in Python and the row then carries this process's own reading.
@@ -523,7 +535,7 @@ def note_claim_failure(con, table, row_id, key):
     row = con.execute(f'SELECT runner_key, runner_pid, runner_identity FROM "{table}" WHERE id=?',
                       (row_id,)).fetchone()
     pid = os.getpid()
-    identity = processes.identity(pid)
+    identity = _own_identity(pid)
     if row is None:
         reason = f"row {row_id} no longer exists"
     elif not key:
@@ -709,6 +721,57 @@ def limits(run):
         return dict(DEFAULT_LIMITS)
 
 
+# What `/research limits` and `misaka research --limits` may change on a running run, and when each
+# change is first read. The workflow reads them from the database at those points (current_limits),
+# not from the run row it started with.
+ADJUSTABLE_LIMITS = {
+    "sister_parallel": "at once",
+    "parallel": "from the next level of nodes",
+    "max_depth": "at the next reconciliation",
+    "max_nodes": "at the next reconciliation",
+    "max_followups": "at each node's next follow-up decision",
+    "max_revisions": "at each node's next review",
+}
+
+
+def limits_changed(before, after):
+    """What a change of limits did, and when each changed limit is first read."""
+    changed = [key for key in ADJUSTABLE_LIMITS if before[key] != after[key]]
+    if not changed:
+        return "no limit changed"
+    return "; ".join(f"{key} {before[key]} → {after[key]} ({ADJUSTABLE_LIMITS[key]})" for key in changed)
+
+
+def current_limits(con, run):
+    """The run's limits as they stand now: a run's limits can change while it runs (update_limits)."""
+    return limits(get(con, run["id"]) or run)
+
+
+def update_limits(con, run_id, changes):
+    """Change a run's limits while it runs: ``(before, after)``. The same bounds as a new run's, and
+    never below what the run already holds -- a graph of 12 nodes cannot be limited to 10. Raises
+    ValueError saying what to change."""
+    unknown = sorted(set(changes) - set(ADJUSTABLE_LIMITS))
+    if unknown:
+        raise ValueError(f"not adjustable: {', '.join(unknown)} (adjustable: {', '.join(ADJUSTABLE_LIMITS)})")
+    with task_store.write_txn(con):
+        run = get(con, run_id)
+        if not run:
+            raise ValueError(f"Research run not found: {run_id}")
+        if run["status"] == "done":
+            raise ValueError(f"Research run {run_id} is done; its limits no longer matter.")
+        before = limits(run)
+        after = normalize_limits({**json.loads(run["limits_json"] or "{}"), **changes})
+        held, deepest = con.execute(
+            "SELECT COUNT(*), COALESCE(MAX(depth), 0) FROM research_branches WHERE run_id=?", (run_id,)).fetchone()
+        if after["max_nodes"] < held:
+            raise ValueError(f"max_nodes {after['max_nodes']} is below the {held} nodes the graph already holds")
+        if after["max_depth"] < deepest:
+            raise ValueError(f"max_depth {after['max_depth']} is below the depth {deepest} a node already has")
+        con.execute("UPDATE research_runs SET limits_json=? WHERE id=?", (json.dumps(after, sort_keys=True), run_id))
+    return before, after
+
+
 def set_state(con, run_id, *, phase=None, status=None, error=None,
               root_session=None, final_artifact=None, wave=None, driver_lock=None):
     """Update run state. With ``driver_lock`` the write lands only while that lease is held:
@@ -783,6 +846,26 @@ def _resume(con, run_id, *, driver_lock, clarification):
     return get(con, run_id)
 
 
+def help_waiting(con, row):
+    """True only for a card parked by its own current SendMessage help request."""
+    if row["status"] not in {"blocked", "triage"} or row["block_kind"] != "needs_input":
+        return False
+    try:
+        payload = json.loads(task_store.latest_payload(con, row["id"], row["status"], generation=row["generation"])
+                             or "{}")
+    except (TypeError, ValueError):
+        return False
+    return isinstance(payload, dict) and payload.get("message_id") is not None
+
+
+def parked(con, row):
+    """A card blocked or in triage with no help request of its own waiting on an answer (dispatch's
+    "blocked:" verdict, a missing project folder): nothing moves it on by itself. A node used to
+    fail on it with no decision of Last Order's -- or as "a dependency cycle" -- and no resume
+    reopened it (0.18.10 sweep); it is now a lost card like a failed one."""
+    return row["status"] in {"blocked", "triage"} and not help_waiting(con, row)
+
+
 def reopen_cards(con, run_id, node_id=None):
     """Send the run's (or one node's) stopped, failed and unusable cards back to their Sisters.
     A failed card is retried like a stopped one: without this the node it killed replays the
@@ -795,7 +878,7 @@ def reopen_cards(con, run_id, node_id=None):
         unusable = row["status"] == "done" and (
             task_store.latest_payload(con, row["id"], "research_review_missing", generation=row["generation"])
             or _drift_after_declaration(con, row["id"], int(row["generation"])))
-        if row["status"] not in ("stopped", "failed") and not unusable:
+        if row["status"] not in ("stopped", "failed") and not unusable and not parked(con, row):
             continue
         target = "todo" if task_store.parent_ids(con, row["id"]) else "ready"
         if task_store.reopen_task(
@@ -1360,6 +1443,18 @@ def cards_failed_key(cards):
     return "cards_failed:" + ",".join(f"{card['id']}@{card['generation']}" for card in cards)
 
 
+def plan_change_key(round):
+    """The action-key prefix of the changes Last Order made to a round's cards while they ran."""
+    return f"cards:{int(round)}"
+
+
+def plan_changes(con, run_id, node_id, round):
+    """The changes Last Order made to a round's cards while they ran, oldest first."""
+    return [json.loads(row["payload_json"]) for row in con.execute(
+        "SELECT payload_json FROM research_actions WHERE run_id=? AND branch_id=? AND action_key LIKE ? "
+        "ORDER BY created_at,rowid", (run_id, node_id, plan_change_key(round) + ":%"))]
+
+
 def failed_card_decisions(con, run_id, node_id=None):
     """What node Last Orders decided about cards that failed for good, oldest first: each names
     its ``decision`` and the ``cards`` it covers."""
@@ -1568,17 +1663,19 @@ def frozen_refusal(target):
     draft. A hand edit fails the integrity check of the phase that reads it next; a draft edited
     during its final review failed a whole run that way (B126). A card's deliverable is registered
     with its card and stays its Sister's to change, and a finished run's files are anyone's."""
-    from misaka.config import CFG
+    from misaka.config import CFG, home
 
     try:
         con = task_store.connect(os.path.expanduser(CFG["db"]))
     except (OSError, sqlite3.Error):
         return None
     try:
-        row = con.execute(
-            "SELECT a.kind, a.run_id FROM research_artifacts a JOIN research_runs r ON r.id=a.run_id "
-            "WHERE a.path=? AND a.task_id IS NULL AND r.status!='done' LIMIT 1",
-            (str(Path(target).resolve()),)).fetchone()
+        # Compared as the file system compares names (home.fold): a case variant, or on macOS a
+        # decomposed Unicode spelling, is the same file there and edited it past this check.
+        wanted = home.fold(str(Path(target).resolve()))
+        row = next((found for found in con.execute(
+            "SELECT a.kind, a.run_id, a.path FROM research_artifacts a JOIN research_runs r ON r.id=a.run_id "
+            "WHERE a.task_id IS NULL AND r.status!='done'") if home.fold(found["path"]) == wanted), None)
     except sqlite3.OperationalError:     # a board research has never touched has no such tables
         return None
     finally:

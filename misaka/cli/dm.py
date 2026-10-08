@@ -229,6 +229,11 @@ def _deliver_once(to, message=None, sender=None, model=None, timeout=600,
                 "MISAKA_PROFILE_DIR": prof,
                 "MISAKA_WORKSPACE": user_home,
                 "MISAKA_DM_CARD_ALLOWLIST": json.dumps(card_allowlist, separators=(",", ":")),
+                # Its model requests are recorded as they end (metering); a contact session is
+                # no research run's, so they are never capped.
+                "MISAKA_USAGE_DB": os.path.expanduser(CFG["db"]),
+                "MISAKA_USAGE_TASK_ID": f"dm:{to}",
+                "MISAKA_USAGE_GENERATION": "0",
             }
             from misaka.core.wiring import SessionSpec, assemble
             session_assembly = assemble(SessionSpec(
@@ -255,11 +260,6 @@ def _deliver_once(to, message=None, sender=None, model=None, timeout=600,
                 leased.clear()
                 if r["text"]:
                     messages.return_reply(con, to, r["text"], mine, since=started)
-            spent = int(r.get("budget_usage") or 0)
-            if spent:
-                from misaka.core.platform import budget
-                budget.commit_agent_usage_path(
-                    os.path.expanduser(CFG["db"]), None, f"dm:{to}", 0, spent)
         finally:
             try:
                 messages.unclaim(con, list(leased), token=token)

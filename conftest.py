@@ -43,6 +43,22 @@ def misaka_home(monkeypatch):
     assert not strays, f"written into the home without a row in misaka.config.home.LAYOUT: {strays}"
 
 
+@pytest.fixture(autouse=True)
+def unwatched_loops():
+    """A test that runs a command entry in this process (``app._cmd_research``) configures the
+    loop watchdog for it; the next test must not inherit that, nor have its stalls dumped into a
+    home that is gone (and ``faulthandler``'s one timer is pytest's too)."""
+    yield
+    from misaka.utils import loop_watchdog
+    if loop_watchdog._settings is not None:
+        import faulthandler
+        faulthandler.cancel_dump_traceback_later()
+        loop_watchdog._settings, loop_watchdog._depth = None, 0
+        if loop_watchdog._file is not None:
+            loop_watchdog._file.close()
+            loop_watchdog._file = None
+
+
 def pytest_sessionfinish(session, exitstatus):
     shutil.rmtree(_SESSION_HOME, ignore_errors=True)
 

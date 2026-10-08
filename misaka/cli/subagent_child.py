@@ -9,14 +9,19 @@ child needs (its parent's provider may be one of them) are composed in by
 from __future__ import annotations
 
 import asyncio
+import os
 
 from misaka.cli import bootstrap
 from misaka.core.subagent import child
+from misaka.utils import loop_watchdog
 
 
 def main() -> int:
     bootstrap.install()
-    return asyncio.run(child.amain())
+    # A durable Sister root is a card: its supervisor finds the stall under the card's name.
+    owner = os.environ.get("MISAKA_SISTER_OWNER_TASK_ID")
+    loop_watchdog.configure(f"card-{owner}" if owner else "subagent", exit_on_stall=True)
+    return asyncio.run(loop_watchdog.watched(child.amain()))
 
 
 if __name__ == "__main__":

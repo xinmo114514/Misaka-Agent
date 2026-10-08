@@ -280,7 +280,7 @@ async def test_a_red_team_card_given_to_an_ally_records_its_issues_through_the_b
     await ally.claim().run()
     assert ally.prompts()[0].startswith("[Research card]")      # ACP has no system prompt
     assert sum(bool(call["error"]) for call in ally.logged("tool")) == 1   # the first completion
-    assert json.loads(tasks.latest_payload(ally.con, ally.tid, "review_record_checked")) == {"items": 1}
+    assert json.loads(tasks.latest_payload(ally.con, ally.tid, "review_record_checked"))["items"] == 1
     assert ally.row["status"] == "done"
     assert ally.payload("submitted")["issues"][0]["question"] == "Does it follow?"
 

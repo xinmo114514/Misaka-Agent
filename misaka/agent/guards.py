@@ -269,10 +269,10 @@ class FinalizationReserve:
     """Two-tier wind-down driven by whatever allowance the caller can measure.
 
     ``remaining``/``total`` must share a unit; the guard only ever uses their
-    ratio. Both of misaka's readable allowances reduce to that shape:
-    ``TurnBudgetLimiter`` (``limit - accounted`` over ``limit``, see
-    ``misaka.agent.request_budget``) and a card lease (``claim_expires - now``
-    over its TTL, see ``misaka.core.platform.tasks``). Deliberately no lookup here:
+    ratio. Both of misaka's readable allowances reduce to that shape: the token
+    cap as the meter last read it (``misaka.core.platform.metering.allowance``)
+    and a card lease (``claim_expires - now`` over its TTL, see
+    ``misaka.core.platform.tasks``). Deliberately no lookup here:
     a guard that opened the board database would be untestable and would tie
     the loop to a store it may not have.
 
@@ -414,12 +414,12 @@ class _SessionGuards:
     def __init__(
         self,
         session: Any,
-        limiter: Any = None,
+        allowance: Any = None,
         wall_seconds: float | None = None,
         bookkeeping_tools: Any = (),
     ):
         self._session = session
-        self._limiter = limiter
+        self._allowance = allowance
         # The wall clock is the one allowance every headless run has: `run_session`
         # cuts the whole prompt off with `asyncio.wait_for`, and a run cut there has
         # no assistant text to return. A token cap only exists when one is configured.
@@ -437,8 +437,9 @@ class _SessionGuards:
     def _scarcest_allowance(self) -> tuple[float, float] | None:
         """Whichever of the token budget and the wall clock is closer to running out."""
         pairs: list[tuple[float, float]] = []
-        if self._limiter is not None:
-            pairs.append((self._limiter.limit - self._limiter.accounted, self._limiter.limit))
+        tokens = self._allowance() if self._allowance is not None else None
+        if tokens is not None:
+            pairs.append(tokens)
         if self._wall_total > 0:
             pairs.append((self._wall_total - (time.monotonic() - self._wall_start), self._wall_total))
         if not pairs:
@@ -578,7 +579,7 @@ class _SessionGuards:
 
 def install_guards(
     session: Any,
-    limiter: Any = None,
+    allowance: Any = None,
     wall_seconds: float | None = None,
     bookkeeping_tools: Any = (),
 ) -> _SessionGuards | None:
@@ -599,7 +600,7 @@ def install_guards(
     if isinstance(existing_guards, _SessionGuards):
         return existing_guards
 
-    guards = _SessionGuards(session, limiter, wall_seconds, bookkeeping_tools)
+    guards = _SessionGuards(session, allowance, wall_seconds, bookkeeping_tools)
     original_prepare = getattr(agent, "prepareNextTurn", None)
     original_prepare_with_context = getattr(agent, "prepareNextTurnWithContext", None)
     finish_turn = finish_turn_from_stop_predicate(guards.after_turn, getattr(agent, "finishTurn", None))

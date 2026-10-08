@@ -226,6 +226,8 @@ def create_grep_tool_definition(
             raise RuntimeError(missing_tool_message("rg"))
 
         search_path = resolve_to_cwd(parsed.path or ".", cwd)
+        from misaka.core.web.evidence import check_material_read, is_credential_store
+        check_material_read(search_path)
         try:
             is_directory = await maybe_await(operations.isDirectory(search_path))
         except Exception:  # noqa: BLE001 - any lookup failure reads as 'path not found'
@@ -332,10 +334,12 @@ def create_grep_tool_definition(
                 if event.get("type") != "match":
                     continue
 
-                match_count += 1
                 data = event.get("data") or {}
                 path_data = data.get("path") or {}
                 file_path = path_data.get("text")
+                if isinstance(file_path, str) and is_credential_store(file_path):
+                    continue                    # a search over the home passes its credentials by
+                match_count += 1
                 line_number = data.get("line_number")
                 line_text = ((data.get("lines") or {}).get("text")) if isinstance(data.get("lines"), dict) else None
                 if isinstance(file_path, str) and isinstance(line_number, int):

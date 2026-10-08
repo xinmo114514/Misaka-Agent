@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 
+from misaka.ai.types import Model, ModelCost
 from misaka.config import profiles
 from misaka.core.agent_session import AgentSession
 from misaka.core.settings_manager import InMemorySettingsStorage, SettingsManager
@@ -15,7 +16,10 @@ from misaka.core.settings_manager import InMemorySettingsStorage, SettingsManage
 @pytest.fixture
 def registry():
     models = [
-        SimpleNamespace(provider=provider, id=model_id, reasoning=False)
+        Model(provider=provider, id=model_id, name=model_id, reasoning=False,
+              api="openai-completions", baseUrl="http://fixture.invalid/v1", input=["text"],
+              cost=ModelCost(input=0, output=0, cacheRead=0, cacheWrite=0),
+              contextWindow=8000, maxTokens=1000)
         for provider, model_id in [
             ("global-provider", "base"),
             ("vendor-a", "shared"),

@@ -966,8 +966,12 @@ class DefaultResourceLoader:
         return conflicts
 
 
+# The files a session in a folder loads as instructions, from that folder and every one above it.
+CONTEXT_FILE_NAMES = ("PROJECT.md", "AGENTS.override.md", "AGENTS.md", "AGENTS.MD", "CLAUDE.md", "CLAUDE.MD")  # pi 8ecf8a9 + the project brief
+
+
 def _load_context_file_from_dir(dir_path: str) -> dict[str, str] | None:
-    for filename in ("PROJECT.md", "AGENTS.override.md", "AGENTS.md", "AGENTS.MD", "CLAUDE.md", "CLAUDE.MD"):  # pi 8ecf8a9 + the project brief
+    for filename in CONTEXT_FILE_NAMES:
         file_path = os.path.join(dir_path, filename)
         # `isfile` rather than `exists`: pi's resource-loader.ts:71-90 stats and skips
         # anything that is not a regular file before reading, and the port dropped that

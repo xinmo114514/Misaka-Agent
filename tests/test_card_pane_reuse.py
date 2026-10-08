@@ -473,3 +473,16 @@ async def test_a_card_answers_a_message_while_its_parent_is_running(panel, home)
 
     await panel.continue_card(b, "A's answer to your question", consult=True)
     assert tasks.get(con, b)["status"] == "running"
+
+
+async def test_a_card_for_a_sister_no_longer_in_the_roster_fails_for_good(panel, home):
+    """Left ready, the panel asked for it on every poll and the research never ended; headless
+    dispatch already failed it as a configuration fault (0.18.10 sweep)."""
+    from misaka.core.platform import tasks
+    workspace = home / "proj"
+    workspace.mkdir()
+    tid, _ = _card(panel, workspace, status="ready", assignee="10099")
+    with pytest.raises(ValueError, match="not in the roster"):
+        await panel.run_card(tid)
+    row = tasks.get(panel._board(), tid)
+    assert row["status"] == "failed" and "not in the roster" in row["last_failure_error"]

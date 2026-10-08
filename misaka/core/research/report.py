@@ -306,16 +306,22 @@ def _intact(con, run, row):
     try:
         runs.artifact_text(row)
         return
-    except ValueError:
+    except (ValueError, FileNotFoundError):
+        # Moved or deleted is rebuilt the same way: a missing draft failed the final review and
+        # every resume after it, until the file was put back by hand (0.18.10 sweep).
         text = _recorded_text(con, run, row["kind"])
         if text is None or hashlib.sha256(text.encode("utf-8")).hexdigest() != row["sha256"]:
             raise
     path = Path(row["path"])
-    kept = path.with_name(f"{path.stem}.edited-{int(time.time())}{path.suffix}")
-    os.replace(path, kept)
+    if path.exists():
+        kept = path.with_name(f"{path.stem}.edited-{int(time.time())}{path.suffix}")
+        os.replace(path, kept)
+        _LOG.warning("Research %s: %s was changed after it was saved; restored it, the changed file is %s",
+                     run["id"], path, kept)
+    else:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _LOG.warning("Research %s: %s was missing; restored it from the run's record", run["id"], path)
     atomic.write_text(str(path), text)
-    _LOG.warning("Research %s: %s was changed after it was saved; restored it, the changed file is %s",
-                 run["id"], path, kept)
 
 
 def _save(con, run, kind, text, **metadata):

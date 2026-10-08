@@ -8,13 +8,12 @@ from __future__ import annotations
 import json
 import os
 import re
-import time
 from pathlib import Path
 
 from misaka.ai.utils.overflow import hit_output_limit
 from misaka.config import home
 from misaka.core.network.card_contract import format_deliverable, split_deliverable
-from misaka.core.platform import budget, prompt_guard
+from misaka.core.platform import prompt_guard
 from misaka.core.platform import tasks as task_store
 from misaka.core.research import commands, ledger, runs
 from misaka.core.session_manager import find_most_recent_session, read_session_header
@@ -93,7 +92,8 @@ Rules:
 
 OPTIONAL_MATERIAL_TOOLS = ("x_search", "browser_navigate", "browser_snapshot", "browser_get_images", "browser_vision")
 MATERIAL_TOOLS = ("read", "misaka_research_view", "web_search", "web_fetch", "web_extract", "download_file",
-                  "doc_list", "doc_outline", "doc_read", "doc_find", "doc_page_image", "doc_add", *OPTIONAL_MATERIAL_TOOLS)
+                  "doc_list", "doc_outline", "doc_read", "doc_find", "doc_verify", "doc_page_image", "doc_add",
+                  *OPTIONAL_MATERIAL_TOOLS)
 RESEARCH_TOOLS = (*MATERIAL_TOOLS, "skills_list", "skill_view")
 
 # A research Sister's working rules, appended once to her system prompt (worker.card_session_setup)
@@ -577,19 +577,12 @@ def _call(worker, cfg, prompt, *, cwd, session_dir, continue_session=False,
         kwargs["sister_catalog"] = sister_catalog
     if model:
         kwargs["model"] = model
-    while True:
-        result = worker.run_llm_json(
-            os.path.join(cfg["roles_root"], profile), prompt,
-            cfg["provider"], cfg["default_model"], **kwargs,
-        )
-        if (result[2] != "shared token budget exhausted" or con is None
-                or budget.exhausted(con, cfg.get("token_cap"))):
-            return result
-        if runs.stop_requested(con, task_id):
-            return None, "", "Research stopped while waiting for token capacity"
-        # Other node LOs share this ledger. A reservation is
-        # backpressure, not a failed model call; no tokens were spent on this refusal.
-        time.sleep(2)
+    # Waiting for room under the cap happens per request, in the meter; a run whose cap is
+    # spent comes back with budget.EXHAUSTED_MESSAGE and stops there.
+    return worker.run_llm_json(
+        os.path.join(cfg["roles_root"], profile), prompt,
+        cfg["provider"], cfg["default_model"], **kwargs,
+    )
 
 
 def publish_project_brief(workspace, plan, *, round=1):
@@ -725,9 +718,9 @@ def validate_plan(obj, roster, *, decisions_allowed=False, root=False, red_team_
     }
 
 
-def decisions_allowed(run, node, round):
+def decisions_allowed(con, run, node, round):
     """A node forks in its first plan, and only where a child could still open."""
-    return int(round) <= 1 and int(node["depth"]) < runs.limits(run)["max_depth"]
+    return int(round) <= 1 and int(node["depth"]) < runs.current_limits(con, run)["max_depth"]
 
 
 def _roster(cfg):
@@ -807,12 +800,12 @@ def plan(run, cfg, worker, node, *, con, context_path=None):
     """Open or continue the node's Last Order session and return its research plan."""
     session_dir = _lo_session(run, node)
     roster = _roster({**cfg, "workspace": run["workspace"]})
-    forks = decisions_allowed(run, node, 1)
+    forks = decisions_allowed(con, run, node, 1)
     prompt = ROOT_CONTRACT + "\n# Artifact layout\nWithin the current workspace, every node's files live under " \
         "nodes/<node>/ and each of its cards under nodes/<node>/cards/<card>/; run-level products go to final/. " \
         "The runtime assigns these paths. Put one deliverable filename on the first line, not a directory; " \
         "use backticks for spaces. Put requirements on following lines.\n" \
-        + f"\n# Current node depth\n{node['depth']} (root = 0; max_depth = {runs.limits(run)['max_depth']})" \
+        + f"\n# Current node depth\n{node['depth']} (root = 0; max_depth = {runs.current_limits(con, run)['max_depth']})" \
         + ("" if forks else " -- this node cannot fork: no `decisions` here.") + "\n"
     if runs.is_root(node):
         brief = Path(run["workspace"]) / "PROJECT.md"
@@ -935,7 +928,7 @@ def task_sources(con, run, rows):
         finds = []
         for finding in ledger.findings(con, run["id"], task_id=row["id"]):
             finds.append({"text": finding["text"], "claim_type": finding["claim_type"],
-                          "claims": [dict(claim) for claim in ledger.claims(con, finding["id"])]})
+                          "claims": [_located(claim, run) for claim in ledger.claims(con, finding["id"])]})
         # The ledger already holds what it accepted; only a submitted finding it does not hold
         # (rejected, or never ingested) is worth a second listing.
         recorded = {item["text"] for item in finds}
@@ -949,12 +942,21 @@ def task_sources(con, run, rows):
     return parts
 
 
+def _located(claim, run):
+    """A claim as Last Order and the red team read it: where its quotation actually is, if anywhere."""
+    out = dict(claim)
+    where = ledger.locate(claim, run["workspace"])
+    if where:
+        out["located"] = where
+    return out
+
+
 def evidence_block(con, run, node):
     """The node's declarations and source locators, wrapped as untrusted data."""
     findings = []
     for finding in ledger.findings(con, run["id"], branch_id=node["id"]):
         findings.append({**dict(finding),
-                         "claims": [dict(row) for row in ledger.claims(con, finding["id"])]})
+                         "claims": [_located(row, run) for row in ledger.claims(con, finding["id"])]})
     return prompt_guard.untrusted("evidence-ledger", json.dumps(findings, ensure_ascii=False, indent=2))
 
 
@@ -1171,7 +1173,7 @@ def dispose(con, run, cfg, worker, node, red, issues, *, round, revisions_left):
     if accepted:
         return accepted["payload"]["dispositions"]
     expected = {item["id"] for item in issues}
-    forks = int(node["depth"]) < runs.limits(run)["max_depth"]
+    forks = int(node["depth"]) < runs.current_limits(con, run)["max_depth"]
     known = {row["id"] for row in runs.nodes(con, run["id"])}
 
     def validate(value):
@@ -1336,7 +1338,7 @@ def decide(con, run, cfg, worker, node, *, divergence, proposals, branches):
                      "decision": row["decision_question"]}
                     for row in runs.pending_options(con, run["id"]) if row["decided_at"] == node["id"]]}
     prompt = (DECIDE_CONTRACT + f"\n# Node\n{node['id']}: {node['question']}\nThe paths list: `{graph.paths_path(run)}`\nThe graph: `{graph.graph_path(run)}`\n"
-              + f"Depth {node['depth']} of {runs.limits(run)['max_depth']}.\n"
+              + f"Depth {node['depth']} of {runs.current_limits(con, run)['max_depth']}.\n"
               + prompt_guard.untrusted("divergence", _catalog_text(material)) + navigation(run["id"]))
     action, _raw = _command(
         con, run, cfg, worker, node, prompt, key=runs.DECIDE_KEY, name="misaka_research_decide",

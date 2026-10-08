@@ -1,4 +1,5 @@
 """Create and remove durable Sister profiles."""
+import json
 import os
 import re
 import shutil
@@ -117,8 +118,17 @@ def create_sister(sid, root=None, specialty=None, model=None, thinking=None):
     with open(os.path.join(prof, "SOUL.md"), "w", encoding="utf-8") as f:
         f.write(SOUL_TEMPLATE.format(sid=sid))
     with open(os.path.join(prof, "DESCRIBE.md"), "w", encoding="utf-8") as f:
+        # Quoted as a JSON string, which YAML reads as a double-quoted scalar: a plain one ends
+        # at the first ": ", so "Economic history: late imperial China" wrote a profile nobody
+        # could read, and the Sister dropped out of every plan while create reported success.
         f.write(DESCRIBE_TEMPLATE.format(
-            sid=sid, specialty=specialty, specialty_line=specialty or "Not specified yet."))
+            sid=sid, specialty=json.dumps(specialty, ensure_ascii=False),
+            specialty_line=specialty or "Not specified yet."))
+    written, _body = describe(sid, root=os.path.dirname(prof))
+    if (written or "") != specialty:
+        shutil.rmtree(prof, ignore_errors=True)
+        return False, (f"Sister {sid} was not created: her DESCRIBE.md did not read back "
+                       f"({written or 'no description'}).")
     pinned = ""
     if pin:
         profiles.persist_role_default_model(prof, pin, strict=True)
@@ -177,21 +187,48 @@ def ensure_research_sisters(root=None):
         return usable()
 
 
+def _read_by_hand(path):
+    """``(description, body)`` of a DESCRIBE.md whose frontmatter YAML could not parse, read as
+    plain text: the ``description:`` line, and everything after the closing ``---``. 0.18.7 kept
+    the description and dropped the body, so Last Order routed the Sister without her profile."""
+    try:
+        with open(path, encoding="utf-8-sig") as f:
+            lines = f.read().split("\n")
+    except OSError:
+        return None, None
+    if not lines or lines[0].strip() != "---":
+        return None, None
+    description = None
+    for number, line in enumerate(lines[1:], start=1):
+        if line.strip() == "---":
+            return description, "\n".join(lines[number + 1:]).strip() or None
+        if description is None and line.startswith("description:"):
+            value = line[len("description:"):].strip()
+            if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+                value = value[1:-1]
+            description = value or None
+    return None, None
+
+
 def describe(sid, root=None):
     """Return the short description and body from DESCRIBE.md."""
     from misaka.utils.frontmatter import parse_frontmatter
+    path = os.path.join(root or ROOT, sid, "DESCRIBE.md")
     try:
-        with open(os.path.join(root or ROOT, sid, "DESCRIBE.md"), encoding="utf-8-sig") as f:
+        with open(path, encoding="utf-8-sig") as f:
             parsed = parse_frontmatter(f.read())
     except OSError:
         return None, None
     except ValueError as error:
         # DESCRIBE.md is a file people are told to edit by hand, and parse_frontmatter raises
         # FrontmatterError (a ValueError) on malformed YAML. Every caller here walks the *whole*
-        # roster -- the /sister menu, the misaka_sisters tool, the chat banner -- so letting one
-        # member's typo out would take down the entire list. Name the file instead: whoever sees
-        # the roster is the person who can fix it.
-        return f"DESCRIBE.md could not be read ({' '.join(str(error).split())})", None
+        # roster -- the /sister menu, misaka_board's roster line, the chat banner -- so letting
+        # one member's typo out would take down the entire list. The description line alone is
+        # read as written first: `misaka create --desc` wrote it unquoted before 0.18.7, so any
+        # description with a colon in it is in exactly this state. Only when that line is not
+        # there either is the file named: whoever sees the roster is the person who can fix it.
+        description, body = _read_by_hand(path)
+        return description or f"DESCRIBE.md could not be read ({' '.join(str(error).split())})", body
     desc = str(parsed.frontmatter.get("description") or "").strip()
     return desc or None, parsed.body.strip() or None
 

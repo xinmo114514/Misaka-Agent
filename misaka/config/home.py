@@ -100,6 +100,7 @@ LAYOUT: dict[str, Entry] = {
     "web_cache": Entry("cache/web", "cache"),
     "web_tools": Entry("cache/web-tools", "cache"),
     "office_cache": Entry("cache/office", "cache"),
+    "vision_cache": Entry("cache/vision", "cache"),
     "skill_blobs": Entry("cache/skill-blobs", "cache"),
     "skills_index": Entry("cache/skills", "cache"),
     "mcp_schema_cache": Entry("cache/mcp-schema.json", "cache"),
@@ -109,6 +110,7 @@ LAYOUT: dict[str, Entry] = {
     "crash_log": Entry("logs/misaka-crash.log", "logs"),
     "warnings_log": Entry("logs/misaka-warnings.log", "logs"),
     "panel_crash_log": Entry("logs/panel-crash.log", "logs"),
+    "stall_logs": Entry("logs/stalls", "logs"),
     "mcp_logs": Entry("logs/mcp", "logs"),
     "web_logs": Entry("logs/web", "logs"),
     "moa_traces": Entry("logs/moa-traces", "logs"),
@@ -216,6 +218,27 @@ def strays() -> list[str]:
                   and not any(name.endswith(tail) and name[:-len(tail)] in known for tail in sidecars))
 
 
+# The file systems MISAKA's users run fold case (APFS, NTFS): ``~/.MISAKA/Credentials`` is
+# ``~/.misaka/credentials`` there, and a check that compared names exactly let the variant through
+# (0.18.9 sweep). Linux's do not, and there a variant is another file.
+FOLDS_CASE = sys.platform in ("darwin", "win32")
+FOLDS_UNICODE = sys.platform == "darwin"     # APFS: one name for its NFC and NFD spellings; NTFS: two
+
+
+def fold(text: str) -> str:
+    """``text`` as this platform's file system compares names: APFS also takes a name's composed
+    and decomposed Unicode spellings (NFC, NFD) for one, NTFS does not."""
+    if FOLDS_UNICODE:
+        import unicodedata
+        text = unicodedata.normalize("NFC", text)
+    return text.casefold() if FOLDS_CASE else text
+
+
+def folded(target: str | os.PathLike[str]) -> Path:
+    """``target`` resolved and folded as the file system folds it, for a refusal to compare."""
+    return Path(fold(os.path.realpath(Path(target).expanduser())))
+
+
 def agent_may_write(target: str | os.PathLike[str], granted: tuple[str | None, ...] = ()) -> bool:
     """Whether an agent's file tools may create or change ``target``.
 
@@ -224,14 +247,14 @@ def agent_may_write(target: str | os.PathLike[str], granted: tuple[str | None, .
     when those lie inside the home. A workspace that merely *contains* the home, such as the
     user's home directory, grants nothing in it: the rest belongs to the program and the user.
     """
-    resolved = Path(os.path.realpath(Path(target).expanduser()))
-    root = home()
+    resolved = folded(target)
+    root = folded(home())
     if resolved != root and not resolved.is_relative_to(root):
         return True
-    allowed = [path("shared")]
+    allowed = [folded(path("shared"))]
     for directory in granted:
         if directory:
-            candidate = Path(os.path.realpath(Path(directory).expanduser()))
+            candidate = folded(directory)
             if candidate != root and candidate.is_relative_to(root):
                 allowed.append(candidate)
     return any(resolved == directory or resolved.is_relative_to(directory) for directory in allowed)

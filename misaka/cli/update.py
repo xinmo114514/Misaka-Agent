@@ -46,9 +46,9 @@ TIMEOUT = 10
 class Install:
     """Where this install's code comes from, and what would update it."""
 
-    kind: str                 # "checkout" | "git" | "wheel"
+    kind: str                 # "checkout" | "git" | "wheel" | "bundle" (a release archive)
     editable: bool
-    installer: str            # "uv tool" | "pipx" | "uv" (uv pip) | "pip" | ""
+    installer: str            # "uv tool" | "pipx" | "uv" (uv pip) | "pip" | "Homebrew" | "winget" | ""
     path: Path | None         # the checkout, when there is one
     commit: str | None        # the commit a git install pinned
     version: str
@@ -66,10 +66,25 @@ def _manager(installer: str) -> str:
     return installer
 
 
+# What a release archive's installer is run with; a new one is the way to update it.
+INSTALL_SH = f"curl -fsSL https://raw.githubusercontent.com/{REPO}/main/scripts/install.sh | sh"
+INSTALL_PS1 = f"irm https://raw.githubusercontent.com/{REPO}/main/scripts/install.ps1 | iex"
+
+
+# A release archive Homebrew or winget put in place is theirs to replace (the installer script
+# would add a second copy beside it).
+PACKAGE_UPGRADE = {"Homebrew": "brew upgrade misaka", "winget": "winget upgrade Luciole-Studio.Misaka"}
+
+
 def describe() -> Install:
     from importlib.metadata import PackageNotFoundError, distribution
 
     from misaka.config import VERSION
+    from misaka.config.engine import bundle_installer, bundle_root
+    bundle = bundle_root()
+    if bundle is not None:
+        # pip and git have nothing to do with an archive: a new archive is how it is updated.
+        return Install("bundle", False, bundle_installer(bundle), bundle, None, VERSION)
     try:
         dist = distribution("misaka")
     except PackageNotFoundError:
@@ -127,9 +142,13 @@ def installed_extras() -> list[str]:
 
 
 def active_runs() -> list[str]:
-    """Research runs in flight, as ``<run id>  <project>``, read without taking a write lock.
-    A board that cannot be read reports none: this is a courtesy check, not the board's guard."""
+    """Research runs in flight, as ``<run id>  <project>``, read without taking a write lock: a run
+    whose driver holds a live lease. One whose driver died is paused, not in flight -- it resumes
+    as well after the update -- and it used to block every update until resumed, since stopping
+    it from a window leaves it "stopping" with no driver to finish the stop. A board that cannot
+    be read reports none: this is a courtesy check, not the board's guard."""
     import sqlite3
+    import time
     from contextlib import closing
 
     from misaka.config import home
@@ -139,8 +158,9 @@ def active_runs() -> list[str]:
         return []
     try:
         with closing(sqlite3.connect(board.resolve().as_uri() + "?mode=ro", uri=True)) as con:
-            rows = con.execute(f"SELECT id, workspace FROM research_runs WHERE status IN ({','.join('?' * len(ACTIVE))})",
-                               ACTIVE).fetchall()
+            rows = con.execute(f"SELECT id, workspace FROM research_runs WHERE status IN ({','.join('?' * len(ACTIVE))}) "
+                               "AND driver_lock IS NOT NULL AND (driver_expires IS NULL OR driver_expires>=?)",
+                               (*ACTIVE, int(time.time()))).fetchall()
     except sqlite3.Error:
         return []
     return [f"{run_id}  {home.display(workspace)}" for run_id, workspace in rows]
@@ -249,6 +269,40 @@ def _api(path: str) -> tuple[dict | None, str | None]:
         # Offline or the host is unreachable. An update check is never a reason to fail the
         # command that asked for it.
         return None, "the network is unreachable"
+
+
+def _bundle_update(install: Install) -> int:
+    """A release archive is not on the branch: it is a release, replaced by the next one.
+
+    Running pip here, as the advice for a built package says, would install into whatever
+    Python is on PATH and leave this archive exactly as it was."""
+    import re
+    _report(install, None, None)
+    latest, failure = _api("/releases/latest")
+    tag = str((latest or {}).get("tag_name") or "").lstrip("v")
+
+    def order(version):
+        return tuple(int(part) for part in re.findall(r"\d+", version)[:3])
+    if failure or not tag:
+        ui.print_info("", f"Could not ask GitHub for the latest release ({failure or 'no tag'}).")
+    elif order(tag) == order(install.version):
+        ui.print_success(f"v{install.version} is the latest release.")
+        return 0
+    elif order(tag) < order(install.version):
+        # A pre-release is not "latest" on GitHub until it is published.
+        ui.print_success(f"v{install.version} is newer than the latest release (v{tag}).")
+        return 0
+    else:
+        ui.print_info("", f"v{tag} is out; this is v{install.version}.")
+    if install.installer in PACKAGE_UPGRADE:
+        ui.print_info("", f"{install.installer} installed this release; it updates it:",
+                      f"  {PACKAGE_UPGRADE[install.installer]}",
+                      "Settings, credentials and research stay where they are.")
+        return 0
+    ui.print_info("", "A release archive is updated by installing the new one -- the installer replaces it:",
+                  f"  {INSTALL_PS1 if os.name == 'nt' else INSTALL_SH}",
+                  "Settings, credentials and research stay where they are.")
+    return 0
 
 
 def _behind(base: str) -> tuple[int | None, str | None]:
@@ -446,7 +500,8 @@ def _restore_command(install: Install) -> str:
 def _report(install: Install, state: dict | None, behind: int | None) -> None:
     shape = {"checkout": "a git checkout" + (" (editable)" if install.editable else ""),
              "git": f"installed from {REPO_URL}",
-             "wheel": "installed from a built package"}[install.kind]
+             "wheel": "installed from a built package",
+             "bundle": "installed from a release archive"}[install.kind]
     ui.print_check(True, "installed", f"v{install.version}   {shape}"
                    + (f", by {install.installer}" if install.installer else ""))
     if install.path:
@@ -460,6 +515,8 @@ def _report(install: Install, state: dict | None, behind: int | None) -> None:
         _token, source = github_token()
         ui.print_check(bool(_token) or None, "github token",
                        f"from {source}" if source else "none found; only a public repository can be checked")
+    if install.kind == "bundle":
+        return                              # a release, compared with releases (_bundle_update)
     if behind is None:
         ui.print_check(None, BRANCH, "could not be compared" + (f": {state['reason']}" if state and state.get("reason") else ""))
     elif behind == 0:
@@ -471,6 +528,8 @@ def _report(install: Install, state: dict | None, behind: int | None) -> None:
 def run(*, apply: bool = False) -> int:
     ui.print_header("Update")
     install = describe()
+    if install.kind == "bundle":
+        return _bundle_update(install)
     ui.print_info(f"Tracking the {BRANCH} branch of {REPO}, the way Hermes tracks its own:",
                   "a fast-forward or nothing. Releases are cut rarely; the branch is the product.", "")
 

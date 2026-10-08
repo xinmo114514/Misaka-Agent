@@ -3,7 +3,7 @@
 # A user install picks its provider: `pip install 'misaka[anthropic]'` (or `misaka[providers]` for all).
 [project]
 name = "misaka"
-version = "0.18.5"
+version = "0.18.11"
 description = "A research team of AI agents for the humanities and social sciences"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -46,8 +46,14 @@ dependencies = [
     "pygments>=2.18",
     # MISAKA's own (mcp.py reads config.yaml)
     "pyyaml>=6.0",
-    # documents: PDF page text (the pageindex extra pins the same package)
-    "pypdfium2>=4.30",
+    # documents: PDF page text, and PageIndex's chapter outlines for long PDFs (regex comes with
+    # tiktoken). The outline packages were the `pageindex` extra until 2026-10-07 (GitHub issue
+    # #9): a release archive cannot add an extra, so no archive install ever had an outline. The
+    # pins are PageIndex's.
+    "pypdfium2==4.30.0",
+    "PyPDF2==3.0.1",
+    "regex>=2024.0.0",
+    "sortedcontainers==2.4.0",
     # utils/image_resize, clipboard_image (was only transitively present through term-image)
     "pillow>=10",
     # tools/office: the .docx / .xlsx / .pptx readers and writers
@@ -67,12 +73,8 @@ mistral = ["mistralai>=1.5"]
 providers = ["misaka[anthropic,openai,google,bedrock,mistral]"]
 browser = ["websockets>=15,<17", "cryptography>=43"]
 lcm-semantic = ["fastembed"]
-pageindex = [
-    "PyPDF2==3.0.1",
-    "pypdfium2==4.30.0",
-    "regex>=2024.0.0",
-    "sortedcontainers==2.4.0",
-]
+# Outlines come with every install now; the name stays so `misaka[...,pageindex]` still installs.
+pageindex = []
 
 [project.scripts]
 misaka = "misaka.__main__:main"

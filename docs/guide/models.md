@@ -51,6 +51,12 @@ There is one default model for the whole team, and each agent can have her own i
 A team can mix providers. A common arrangement is a strong model for Last Order, who plans and
 writes the conclusions, and cheaper ones for Sisters who do the reading.
 
+A model without vision cannot be shown an image: a scanned page, a map from `doc_page_image`, a
+screenshot, a picture you paste. Set one vision model for the whole team, `"vision": {"model":
+"provider/model"}` in `settings.json`, and every image a request carries is read to such a model
+in words, by that vision model; each image is read once and kept. A model that can see is sent
+the image itself and the vision model is not used.
+
 ## Thinking levels
 
 Models that reason before answering take a thinking level: `off`, `minimal`, `low`, `medium`,

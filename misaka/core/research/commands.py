@@ -84,17 +84,30 @@ class Plan(Params):
         "never shrink it to fit one call."))
 
 
+def _refuse_repeated_ids(tasks):
+    """One call naming a local_id twice: keyed by id, the second used to replace the first unseen."""
+    seen, twice = set(), set()
+    for task in tasks:
+        (twice if task["local_id"] in seen else seen).add(task["local_id"])
+    if twice:
+        raise ValueError(f"local_id {', '.join(sorted(twice))} is given to more than one task in this call.")
+
+
 def merge_plan(recorded, incoming):
     """An append call folded onto the plan recorded for its round: recorded tasks stay in order, an
     incoming task replaces the recorded one with its local_id, new ones follow, decisions add to the
     recorded ones, and every other field keeps its recorded value unless the call gives one. The result is validated as one whole plan, so
     dependencies across the two halves are checked together."""
     merged = dict(recorded)
+    _refuse_repeated_ids(incoming.get("tasks") or [])
     tasks = {task["local_id"]: task for task in recorded.get("tasks") or []}
     for task in incoming.get("tasks") or []:
         tasks[task["local_id"]] = task      # a replacement keeps its recorded position
     merged["tasks"] = list(tasks.values())
-    merged["decisions"] = [*(recorded.get("decisions") or []), *(incoming.get("decisions") or [])]
+    # A decision sent again (a retried call, a full re-send with append to fix one field) is the
+    # same fork, not a second one: both used to open as pending options (0.18.10 sweep).
+    decisions = list(recorded.get("decisions") or [])
+    merged["decisions"] = decisions + [item for item in incoming.get("decisions") or [] if item not in decisions]
     merged["status"] = incoming["status"]
     for key in ("plan_markdown", "reframed_question", "clarifying_questions", "methods", "extensions"):
         if incoming.get(key):
@@ -208,6 +221,26 @@ class CardsFailed(Params):
     reason: str = Field(min_length=1, description="Why, in a sentence or two.")
 
 
+class Reassign(Params):
+    card: str = Field(min_length=1, description="The card's local_id in your plan, or its card id (t_...).")
+    assignee: str = Field(min_length=1, description="A roster Sister, the Sisters added since the plan included.")
+    assignee_reason: str = Field(min_length=1)
+
+
+class Cancel(Params):
+    card: str = Field(min_length=1, description="The card's local_id in your plan, or its card id (t_...).")
+    reason: str = Field(min_length=1)
+
+
+class PlanChange(Params):
+    reason: str = Field(min_length=1, description="Why the plan changes: what the user asked, for the record.")
+    add: list[Task] = Field(default_factory=list, description=(
+        "New cards, written as a plan's tasks; their dependencies may name this round's other cards."))
+    reassign: list[Reassign] = Field(default_factory=list, description="Cards not started yet, given to another Sister.")
+    cancel: list[Cancel] = Field(default_factory=list, description=(
+        "Cards not started yet that are no longer wanted; a card that depends on one is changed in the same call."))
+
+
 class Erratum(Params):
     node: str = Field(min_length=1, description="The id of the earlier node whose conclusion states it.")
     claim: str = Field(min_length=1, description="What that conclusion says, quoted as written.")
@@ -299,8 +332,14 @@ def tool(con, run, node, *, key, name, description, model, validate, session_dir
             raise ValueError("Research command must come from this phase's Last Order session.")
         if session_file and os.path.realpath(path) != os.path.realpath(session_file):
             raise ValueError("Research command must come from the owning Last Order conversation.")
-        record = runs.replace_action if supersede or prior else runs.record_action
-        accepted = record(con, run, node, key, payload, session_file=path, tool_call_id=call_id)
+        # A plan phase (``merge``) takes a full plan sent again as the plan, as Plan.append says
+        # ("instead of replacing it"): refused, it read "already accepted with different
+        # arguments" and the first plan ran as it was (0.18.10 sweep).
+        record = runs.replace_action if supersede or prior or merge is not None else runs.record_action
+        try:
+            accepted = record(con, run, node, key, payload, session_file=path, tool_call_id=call_id)
+        except ValueError as error:
+            raise ValueError(f"{error} Nothing from this call was recorded.") from error
         text = reply(payload) if reply else f"Accepted {name}. The recorded command is queued for execution."
         return {"content": [{"type": "text", "text": text}],
                 "details": {"run_id": run["id"], "node_id": node["id"], "action_key": key,
@@ -399,6 +438,39 @@ def review_tools(con, run, node, *, validate, session_file, round=1, forks=False
                           parameters=Skip, execute=skip, promptSnippet=skip_description)]
           if round == 1 and not runs.is_root(node) else []),
     ]
+
+
+PLAN_CHANGE_DESCRIPTION = (
+    "While this node's research cards run: add cards, give a card that has not started to another Sister, or "
+    "cancel one that has not started -- when the user asks for it, or agrees to your proposal. Checked as a plan's "
+    "tasks are; the run applies it at once and the cards already working go on.")
+
+
+def plan_change_tool(con, run, node, *, round, session_file, validate):
+    """What the node's Last Order can change while her cards run (GitHub issue #9: once accepted, a
+    plan could not be changed, and Sisters created mid-run were never given work). She records the
+    change; the driver applies it between two looks at the cards, so the board has one writer."""
+    async def execute(call_id, raw, _signal, _on_update, ctx):
+        payload = PlanChange.model_validate(raw).model_dump()
+        if not (payload["add"] or payload["reassign"] or payload["cancel"]):
+            raise ValueError("Name at least one card to add, reassign or cancel.")
+        path = _run_owner(session_file, ctx)
+        with runs.task_store.write_txn(con):
+            runs._owned(con, run, node)
+            if runs.node(con, node["id"])["status"] != "executing":
+                raise ValueError("This node's cards are not running now; its plan is changed in its next round.")
+            payload = validate(payload)
+            runs.record_action(con, run, node, f"{runs.plan_change_key(round)}:{call_id}", payload,
+                               session_file=path, tool_call_id=call_id)
+        said = ", ".join(part for part in (
+            f"{len(payload['add'])} card(s) to add" if payload["add"] else "",
+            f"{len(payload['reassign'])} to reassign" if payload["reassign"] else "",
+            f"{len(payload['cancel'])} to cancel" if payload["cancel"] else "") if part)
+        return {"content": [{"type": "text", "text": f"Recorded: {said}. The run applies it at its next look at the cards."}],
+                "details": {"run_id": run["id"], "node_id": node["id"]}}
+
+    return ToolDefinition(name="misaka_research_cards", label=PLAN_CHANGE_DESCRIPTION, description=PLAN_CHANGE_DESCRIPTION,
+                          parameters=PlanChange, execute=execute, promptSnippet=PLAN_CHANGE_DESCRIPTION)
 
 
 RECONCILE_DESCRIPTION = ("Root Last Order: record this level's reconciliation -- which pending options open as nodes "

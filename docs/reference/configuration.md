@@ -64,6 +64,7 @@ setting; `misaka setup`, `update` and `uninstall` still run so you can fix it.
 | `defaultProvider` / `defaultModel` | none | the model every role uses unless she has her own; `misaka setup model` writes these. Without them, a chat takes a signed-in provider's own default model, and Sisters' cards fall back to `anthropic` / `claude-sonnet-4-5`. |
 | `defaultThinkingLevel` | `medium` | the thinking level a new session starts at, for every role without her own |
 | `modelThinkingLevels` | none | a thinking level per `provider/model` |
+| `vision.model` | `browser.vision_model`, if set | one vision model (`provider/model`) for the whole home, not per role: it reads every image a request carries to a model that cannot see, and a model that can see is sent the image itself |
 
 In a role's own `settings.json`, `defaultProvider` / `defaultModel` pin that role's model and
 `defaultThinkingLevel` sets her thinking level. In her window, `/model` with Ctrl+S and
@@ -80,7 +81,7 @@ the model supports.
 | Setting | Default | Meaning |
 |---|---|---|
 | `research.plan_approval` | `true` | every research plan waits for your go-ahead; `false` for unattended runs (a plan that changes the question still waits) |
-| `research.token_cap` | `0` (no cap) | token budget for everything on the board, all runs together; a run that reaches it stops with a partial report |
+| `research.token_cap` | `0` (no cap) | token budget of one research run, its cards and sub-agents included; a run that reaches it stops with a partial report and goes on when resumed under a higher cap |
 | `research.beast_at` | `0.85` | share of the cap at which a card is told to wrap up |
 | `network.max_concurrent_sisters` | free memory ÷ 256 MiB, between 4 and 12 | cards running at once on this machine |
 | `network.max_concurrent_per_sister` | the machine limit | cards one Sister runs at once |

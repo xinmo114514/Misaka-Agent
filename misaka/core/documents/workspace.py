@@ -19,6 +19,12 @@ def ingest_artifacts(con, task, artifacts=None):
         path = os.path.join(root, relative)
         if not root or os.path.isabs(relative) or not corpus.under(path, root) or not os.path.isfile(path):
             continue
+        if os.path.splitext(path)[1].lower() not in corpus.READABLE_SUFFIXES:
+            # A helper script or a data dump a card wrote: the corpus never reads the format,
+            # and the board's index_skipped event already names the file. Warning on each one
+            # buried the refusals that do matter.
+            logger.debug("Card %s deliverable %s is a format the corpus does not read", task["id"], relative)
+            continue
         try:
             doc_id, _pages = corpus.ingest(path, title=f"[{task['id']}] {relative}",
                                            task_id=task["id"], workspace=root)

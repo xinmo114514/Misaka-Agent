@@ -217,8 +217,8 @@ class Usage(SchemaModel):
     cacheWrite1h: int | None = None
     # Reasoning tokens, when the provider reports them. A *subset* of `output`, not an
     # addition to it: adding the two would double-count. Optional rather than zero because
-    # providers that expose no breakdown leave it unset -- and no misaka adapter fills it
-    # in yet either, so it is currently always unset.
+    # providers that expose no breakdown leave it unset. The OpenAI-compatible adapter fills
+    # it from completion_tokens_details.reasoning_tokens, as pi's parseChunkUsage does.
     reasoning: int | None = None
     totalTokens: int
     cost: UsageCost

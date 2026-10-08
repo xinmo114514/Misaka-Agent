@@ -47,6 +47,9 @@ NON_RETRYABLE_PROVIDER_LIMIT_ERROR_PATTERN = _build_provider_error_pattern(
         "out of budget",
         "quota exceeded",
         "billing",
+        # MISAKA fork: a research run's own token cap. Its message carries numbers ("has 429,000
+        # of its 5,000,000 left") that the status codes below would otherwise read as a 429.
+        "token_cap reached",
     )
 )
 
@@ -107,6 +110,14 @@ RETRYABLE_PROVIDER_ERROR_PATTERN = _build_provider_error_pattern(
         "stream.?disconnected",
         "unexpected EOF",
         "stream_read_error",
+        # MISAKA fork: a reply dropped mid-stream, in httpx's and the OS's words (GitHub issue #6:
+        # the provider gave up on a slow reader, and the turn ended with no retry). LCM's error
+        # classifier already counts these as disconnects.
+        "peer closed connection",
+        "incomplete chunked read",
+        "connection.?reset",
+        "connection.?aborted",
+        "WinError 1005[34]",
         # Provider-requested retry delay cap failures should flow through the outer
         # retry policy so callers can surface/abort the backoff (#1123).
         "retry delay",

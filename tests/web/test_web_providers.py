@@ -787,7 +787,58 @@ async def test_the_ring_reports_when_every_vendor_is_throttled(monkeypatch):
     result = await keyless.search_with_failover("exa", "q")
 
     assert result["success"] is False
-    assert "all keyless vendors throttled" in result["error"]
+    assert result["error"].startswith("Web search is unavailable right now: every free search service failed (exa throttled")
+
+
+async def test_a_vendor_refusing_this_client_is_walked_past_and_the_rest_said_in_one_line(monkeypatch, caplog):
+    """GitHub issue #9: Firecrawl's keyless tier answered 403, the walk stopped there, and its
+    paragraph of setup advice was the tool's answer."""
+    import logging
+
+    refusals = {"exa": "Keyless Exa search failed: HTTP 503: upstream down. Set EXA_API_KEY ...",
+                "firecrawl": "Keyless Firecrawl search failed: Client error '403 Forbidden' for url "
+                             "'https://api.firecrawl.dev/v2/search'. Set FIRECRAWL_API_KEY ...",
+                "parallel": "rate limit", "keenable": "Keyless Keenable search failed: HTTP 401: no"}
+    for vendor in keyless.KEYLESS_RING:
+        async def refused(_query, _limit, vendor=vendor):
+            return {"success": False, "error": refusals[vendor]}
+        monkeypatch.setitem(keyless._KEYLESS_SEARCHERS, vendor, refused)
+
+    with caplog.at_level(logging.WARNING, logger=keyless.logger.name):
+        result = await keyless.search_with_failover("firecrawl", "q")
+
+    assert "firecrawl HTTP 403" in result["error"] and "exa HTTP 503" in result["error"]
+    assert "FIRECRAWL_API_KEY" not in result["error"] and "\n" not in result["error"]
+    assert "FIRECRAWL_API_KEY" in caplog.text, "the vendors' own messages go to the log"
+
+
+async def test_the_real_searchers_word_a_refusal_as_the_walk_reads_it(monkeypatch):
+    """The test above wrote Keenable's error as "HTTP 401: no", a shape the searcher never produced:
+    Firecrawl's 5xx read "Server error '503 ...'" and Keenable put the body where the status goes,
+    so both stopped the walk. A vendor this machine cannot reach is walked past too."""
+    import httpx
+
+    def answer(request):
+        if "firecrawl" in request.url.host:
+            return httpx.Response(503, text="upstream unavailable")
+        if "keenable" in request.url.host:
+            return httpx.Response(403, json={"detail": "Forbidden: anonymous access disabled"})
+        raise httpx.ConnectError("[Errno 54] Connection reset by peer", request=request)
+
+    real = httpx.AsyncClient
+    monkeypatch.setattr(httpx, "AsyncClient",
+                        lambda **kw: real(**{**kw, "transport": httpx.MockTransport(answer), "proxy": None}))
+    for name, searcher in (("firecrawl", keyless.firecrawl_search_keyless),
+                           ("keenable", keyless.keenable_search_keyless),
+                           ("exa", keyless._KEYLESS_SEARCHERS["exa"])):
+        error = (await searcher("q", 5))["error"]
+        assert keyless.is_search_failover_eligible(error), (name, error)
+    assert keyless._short_reason("Keyless Exa search failed: request failed: [Errno 54] reset") == "unreachable"
+
+
+def test_a_query_echoed_in_an_error_is_not_a_refusal():
+    assert keyless.is_search_failover_eligible("Keyless Exa search failed: HTTP 403: forbidden")
+    assert not keyless.is_search_failover_eligible("HTTP 400: invalid query 'http 503'")
 
 
 async def test_a_paid_pin_removes_a_vendor_from_the_ring(monkeypatch, web_home):

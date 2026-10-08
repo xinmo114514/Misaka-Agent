@@ -28,6 +28,9 @@ lists them all.
 |---|---|
 | `misaka research "QUESTION"` | start a research run in this folder |
 | `misaka research --resume RUN_ID` | resume a run |
+| `misaka research --tell RUN_ID [--to NODE_ID] "MESSAGE"` | say something to a running node's Last Order, the root's by default |
+| `misaka research --limits RUN_ID --sister-parallel 2 …` | change a running run's limits, with the options below |
+| `misaka usage [--run RUN_ID]` | what recent runs spent, or one run by conversation and model |
 | `--depth N` | how many levels below the question (default 3) |
 | `--parallel N` | nodes running at once (default 4) |
 | `--sister-parallel N` | Sister cards per node at once (default 4) |
@@ -44,6 +47,8 @@ lists them all.
 | `misaka allies` | list the enabled allies and whether each can start |
 | `misaka moa list` / `configure` / `delete` | Mixture-of-Agents presets |
 | `misaka board` | show the task board |
+| `misaka task add TITLE --to SISTER --body-file FILE` | add a card by hand (`--body TEXT`, `--reviewer`, `--priority`, `--model`, `--needs ID`); the body needs `## acceptance criteria` |
+| `misaka task start ID` | run a ready card in this terminal |
 | `misaka task ID --delete` | delete a card and its history |
 
 ### Documents and the web
@@ -121,6 +126,8 @@ Available in Last Order's window.
 | `/research status [RUN_ID]` | the state of the latest run in this folder, or the one you name |
 | `/research stop [RUN_ID]` | stop a run; it writes a partial report |
 | `/research resume [RUN_ID] [ANSWER]` | resume a paused run, answering its questions if it asked any |
+| `/research tell [RUN_ID] [--to NODE_ID] MESSAGE` | say something to a running node's Last Order, the root's by default |
+| `/research limits [RUN_ID] --sister-parallel 2 …` | change a running run's limits |
 | `/research resume RUN_ID --here` | continue the run in this window (this Last Order will not remember the run's earlier conversation) |
 | `/research help` | the full usage |
 

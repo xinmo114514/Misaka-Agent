@@ -88,7 +88,10 @@ def _claimer_alive(lock: Any) -> bool:
     """Conservatively determine whether the process that owns a claim is alive."""
     parts = str(lock or "").split(":")
     try:
-        if len(parts) >= 4 and parts[0] == "lo":
+        # The panel daemon's claim (``net:<host>:<pid>:...``): its live leases are its own to watch
+        # (``_watch_cards`` never interrupts a pane for taking long). Unrecognised, an idle card
+        # pane was taken for wedged by any reconcile and its group killed (0.18.10 sweep).
+        if len(parts) >= 4 and parts[0] in {"lo", "net"}:
             if parts[1] != socket.gethostname():
                 return True
             return psutil.pid_exists(int(parts[2]))
@@ -247,7 +250,6 @@ class _SisterManager(SubagentManager):
             self.skill_root_base,
             f"g{int(row['generation'])}-{self.skill_scope}",
         )
-        self.records_usage = True
         self.beast = False
         self.research = dict(row).get("_research")
         self.session_overrides = dict(row).get("_session_overrides") or {}
@@ -589,7 +591,7 @@ class SisterRuntime:
         task["_attachments"] = cards.attachment_list(base, row["id"], workspace=row["workspace"])
         task["_handoffs"] = worker.card_handoffs(self.con, row)
         task.update(worker.card_extras(self.con, row, self.cfg))
-        reading = budget.status(self.con, self.cfg.get("token_cap"))
+        reading = budget.status(self.con, self.cfg.get("token_cap"), task_id=row["id"])
         if reading["mode"] == "stop":
             if db.back_to_ready(
                 self.con,
@@ -961,53 +963,6 @@ class SisterRuntime:
         await asyncio.gather(runner, return_exceptions=True)
         return False
 
-    def _record_usage(self, handle: SisterHandle, claim_lock: str) -> None:
-        agent = handle.agent
-        if not agent or bool(getattr(handle.manager, "records_usage", False)):
-            return
-
-        def field(value: Any, name: str, default: Any = None) -> Any:
-            return value.get(name, default) if isinstance(value, Mapping) else getattr(value, name, default)
-
-        messages: list[dict[str, Any]] = []
-        for item in getattr(agent, "messages", []) or []:
-            message = field(item, "message", item)
-            if field(message, "role") != "assistant":
-                continue
-            usage = field(message, "usage")
-            if isinstance(usage, Mapping):
-                normalized = dict(usage)
-                if not isinstance(normalized.get("totalTokens"), int):
-                    normalized["totalTokens"] = sum(
-                        int(normalized.get(key) or 0)
-                        for key in (
-                            "input",
-                            "output",
-                            "cacheRead",
-                            "cacheWrite",
-                            "input_tokens",
-                            "output_tokens",
-                            "cache_read_input_tokens",
-                            "cache_creation_input_tokens",
-                        )
-                    )
-                messages.append({"role": "assistant", "usage": normalized})
-        if not messages:
-            result = agent.result
-            usage = result.get("usage") if isinstance(result, dict) else None
-            if isinstance(usage, dict):
-                messages.append({"role": "assistant", "usage": usage})
-        if messages:
-            self._owned_event(
-                handle,
-                claim_lock,
-                "harn_event",
-                json.dumps(
-                    {"type": "agent_end", "messages": messages},
-                    ensure_ascii=False,
-                ),
-            )
-
     def _record_result(self, handle: SisterHandle, claim_lock: str) -> None:
         if not handle.agent:
             return
@@ -1107,7 +1062,6 @@ class SisterRuntime:
                             self._event(handle, "stop_after_ownership_loss", {})
                         return
                     owner_lock = str(handle.claim_lock)
-                    self._record_usage(handle, owner_lock)
                     self._record_result(handle, owner_lock)
                     if self._closing:
                         db.back_to_ready(
@@ -1122,7 +1076,7 @@ class SisterRuntime:
                         return
                     if handle.agent.status != "completed":
                         reason = handle.agent.error or "Sister runtime failed"
-                        if "Shared token budget exhausted" in reason:
+                        if worker.stopped_at_cap(reason):
                             if db.back_to_ready(
                                 self.con,
                                 handle.board_id,
@@ -1132,7 +1086,7 @@ class SisterRuntime:
                                 self._event(
                                     handle,
                                     "budget_stop",
-                                    budget.status(self.con, self.cfg.get("token_cap")),
+                                    budget.status(self.con, self.cfg.get("token_cap"), task_id=handle.board_id),
                                 )
                             return
                         changed = self._owned_event(
@@ -1614,7 +1568,7 @@ class SisterRuntime:
                 raise ValueError(f"Card {task_id} is {row['status']}; its session cannot be continued yet.")
             if not confirmed:
                 raise ValueError("User confirmation is required to continue a completed Sister session with a new model turn.")
-            reading = budget.status(self.con, self.cfg.get("token_cap"))
+            reading = budget.status(self.con, self.cfg.get("token_cap"), task_id=task_id)
             if reading["mode"] == "stop":
                 raise RuntimeError("The token budget limit has been reached; no new turn was started.")
 

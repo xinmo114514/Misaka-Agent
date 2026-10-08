@@ -13,7 +13,7 @@ from misaka.core.moments import CoreCommand
 from misaka.core.platform import budget
 from misaka.core.platform import tasks as task_store
 from misaka.core.research import node as research_node
-from misaka.core.research import planner, runs, workflow
+from misaka.core.research import planner, runs, usage, window, workflow
 from misaka.ui.tui.interactive.components.ask_user_question import (
     AskUserQuestionComponent,
 )
@@ -93,8 +93,16 @@ USAGE = (
     f"       --max-nodes N: how many nodes the research graph may hold, the root included (1-{runs.MAX_NODES_CEILING}).\n"
     "       /research status [RUN_ID]          show the latest run of this folder, or the run you name\n"
     "       /research stop [RUN_ID]            ask the latest active run (or RUN_ID) to stop\n"
+    "       /research tell [RUN_ID] [--to NODE_ID] MESSAGE  say MESSAGE to a running node's Last Order (the root's\n"
+    "                                          when no node is named), as if typed in her window\n"
+    "       /research limits [RUN_ID] --sister-parallel N ...  change a running run's limits (the options above);\n"
+    "                                          Sister parallelism at once, LO parallelism from the next level,\n"
+    "                                          depth and nodes at the next reconciliation, follow-ups and revisions\n"
+    "                                          at each node's next decision\n"
     "       /research resume [RUN_ID] [ANSWER] resume a paused run, optionally answering its clarification questions\n"
-    "       /research resume RUN_ID --here     adopt this window as the run's Last Order (it will not remember earlier turns)"
+    "       /research resume RUN_ID --here     adopt this window as the run's Last Order (it will not remember earlier turns)\n"
+    "       /research start QUESTION           start research on a question that begins with one of these words\n"
+    "                                          (\"/research start tell me why the Song dynasty fell\")"
 )
 
 
@@ -147,11 +155,15 @@ def parse_command(raw):
         if here:
             rest = rest[len("--here"):].strip()
         return {"action": "resume", "run_id": run_id, "clarification": rest, "here": here}
-    if head in {"help", "-h", "--help", "status", "stop"}:
+    if head == "tell":
+        return _parse_tell(line[len("tell"):].strip())
+    if head in {"help", "-h", "--help", "status", "stop", "limits"}:
         try:
             tokens = shlex.split(line)
-        except ValueError as error:
-            raise ValueError(f"Unclosed quote in arguments: {error}") from error
+        except ValueError:
+            tokens = []                 # an apostrophe: "status of women's ..." is a question
+        if not _fits_subcommand(tokens):
+            tokens = []                 # "/research limits of state capacity ..." is a question too
     if tokens and tokens[0] in {"help", "-h", "--help"}:
         return {"action": "help"}
     if tokens and tokens[0] == "status":
@@ -162,6 +174,8 @@ def parse_command(raw):
         if len(tokens) > 2:
             raise ValueError(USAGE)
         return {"action": "stop", "run_id": tokens[1] if len(tokens) == 2 else None}
+    if tokens and tokens[0] == "limits":
+        return _parse_limits(tokens[1:])
     # Activation: [start] [DEPTH (alone or before an option)] [--depth N] [--parallel N] [--sister-parallel N] [QUESTION...]. Use the raw
     # line, not the shlex tokens: an apostrophe in "Stalin's constitution" is not an open quote.
     line = (raw or "").strip()
@@ -203,6 +217,56 @@ def parse_command(raw):
             "explicit": explicit, "question": line}
 
 
+def _parse_tell(rest):
+    """`tell [RUN_ID] [--to NODE_ID] MESSAGE`: the message is free text, taken from the raw line."""
+    run_id = node_id = None
+    words = rest.split(None, 1)
+    if words and words[0].startswith("r_"):
+        run_id, rest = words[0], (words[1] if len(words) > 1 else "")
+        words = rest.split(None, 1)
+    if words and words[0] == "--to":
+        words = (words[1] if len(words) > 1 else "").split(None, 1)
+        if not words:
+            raise ValueError(f"--to requires a node id.\n{USAGE}")
+        node_id, rest = words[0], (words[1] if len(words) > 1 else "")
+    if not rest.strip():
+        raise ValueError(f"Say what to tell the run.\n{USAGE}")
+    return {"action": "tell", "run_id": run_id, "node_id": node_id, "text": rest.strip()}
+
+
+def _fits_subcommand(tokens):
+    """Whether these words are the subcommand their first word names, not a question that starts
+    with it: help alone; status, stop and limits alone or naming a run (a run id is ``r_...``;
+    words after it are a mistake USAGE answers); limits with its options. 0.18.7 took
+    "/research limits of state capacity in Qing China" for a limits change and refused it."""
+    if not tokens:
+        return False
+    head, rest = tokens[0], tokens[1:]
+    if head in {"help", "-h", "--help"}:
+        return not rest
+    if head in {"status", "stop"}:
+        return not rest or rest[0].startswith("r_")
+    return not rest or rest[0].startswith(("r_", "--"))
+
+
+def _parse_limits(tokens):
+    """`limits [RUN_ID] --opt N ...`: the limits to change on a run that is running."""
+    run_id = tokens.pop(0) if tokens and not tokens[0].startswith("--") else None
+    changes = {}
+    while tokens:
+        option, separator, value = tokens.pop(0).partition("=")
+        if option not in _OPTIONS or _OPTIONS[option] == "plan_approval":
+            raise ValueError(f"Unknown option {option}.\n{USAGE}")
+        if not separator:
+            value = tokens.pop(0) if tokens else ""
+        if _OPTIONS[option] in changes:
+            raise ValueError(f"{option} was supplied more than once.")
+        changes[_OPTIONS[option]] = value
+    if not changes:
+        raise ValueError(f"Name at least one limit to change.\n{USAGE}")
+    return {"action": "limits", "run_id": run_id, "changes": changes}
+
+
 def _workspace(ctx):
     return task_store.canonical_workspace(getattr(ctx, "cwd", None) or os.getcwd())
 
@@ -218,11 +282,10 @@ def _status(con, target, workspace):
     if not run:
         return "No matching research run was found."
     value = runs.summary(con, run["id"])
-    reading = budget.status(con, _cfg().get("token_cap"))
-    scope = {run["id"], *(t["id"] for t in runs.tasks(con, run["id"]))}
-    token_text = f" | tokens added by this run {budget.spent(con, task_ids=scope):,}"
-    if reading["cap"]:
-        token_text += f" | global tokens {reading['used']:,}/{reading['cap']:,}"
+    reading = budget.status(con, _cfg().get("token_cap"), task_id=run["id"])
+    token_text = (f" | tokens used by this run {reading['used']:,}"
+                  + (f" of its cap {reading['cap']:,}" if reading["cap"] else "")
+                  + f" | spent {usage.money(usage.run_usage(con, run)['total'])} (misaka usage --run {run['id']})")
     return (
         f"{value['id']} | project {runs.project_name(run)!r} ({value['workspace']}) | "
         f"{value['status']}/{value['phase']} | depth {value['wave']}/{value['limits']['max_depth']} | "
@@ -447,6 +510,12 @@ class ResearchPart:
                             return
                         ctx.ui.notify("No active research run.", "info")
                         return
+                    if run["status"] not in runs.ACTIVE:
+                        # Named by id, an ended run was found too, and the driver started below
+                        # drove it again -- turns spent for a stop (0.18.10 sweep).
+                        ctx.ui.notify(f"Research run {run['id']} is already {run['status']}; there is nothing to stop.",
+                                      "info")
+                        return
                     runs.request_stop(con, run["id"])
                     # A waiting-input run or an unattended dead driver has no live process to
                     # observe this request. Re-enter the same persisted workflow to publish its
@@ -457,6 +526,27 @@ class ResearchPart:
                         f"Stop request recorded for {run['id']}. Running tasks will stop or drain.",
                         "info",
                     )
+                    return
+                if spec["action"] == "tell":
+                    run = _find_run(con, spec["run_id"], _workspace(ctx), active=True)
+                    if not run:
+                        raise ValueError("No active research run.")
+                    here = getattr(getattr(ctx, "sessionManager", None), "sessionFile", None)
+                    root = runs.root(con, run["id"])
+                    if (not spec["node_id"] or spec["node_id"] == root["id"]) and here and run["root_session"] \
+                            and os.path.realpath(here) == os.path.realpath(run["root_session"]):
+                        ctx.ui.notify("This window is the root's Last Order: say it here.", "info")
+                        return
+                    await window.tell(con, run, spec["text"], node_id=spec["node_id"])
+                    ctx.ui.notify(f"Told the Last Order of {spec['node_id'] or 'the root'} ({run['id']}); "
+                                  "her answer is in her window.", "info")
+                    return
+                if spec["action"] == "limits":
+                    run = _find_run(con, spec["run_id"], _workspace(ctx), active=True)
+                    if not run:
+                        raise ValueError("No active research run.")
+                    before, after = runs.update_limits(con, run["id"], spec["changes"])
+                    ctx.ui.notify(f"Research run {run['id']}: {runs.limits_changed(before, after)}", "info")
                     return
                 if spec["action"] == "resume":
                     run = _find_run(con, spec["run_id"], _workspace(ctx))

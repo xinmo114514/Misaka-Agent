@@ -60,6 +60,7 @@ KNOBS = {
     ("subagents", "task_max_output"): int,
     ("subagents", "verification_agent"): bool,
     ("tui", "esc_timeout_ms"): float,
+    ("vision", "model"): str,
 }
 
 _settings_cache: tuple[str, int, dict] | None = None     # (path, mtime_ns, document)
@@ -138,10 +139,17 @@ def validate_settings() -> list[str]:
         if not isinstance(block, dict) or key not in block:
             continue
         try:
-            _fit(block[key], cast)
+            value = _fit(block[key], cast)
         except _Unfit as error:
             errors.append(f"{section}.{key}={block[key]!r} {error}")
+            continue
+        if (section, key) in _NOT_NEGATIVE and value < 0:
+            errors.append(f"{section}.{key}={block[key]!r} is negative (0 is none)")
     return errors
+
+
+# A negative cap stopped every research run at its start.
+_NOT_NEGATIVE = {("research", "token_cap")}
 
 
 def _models():

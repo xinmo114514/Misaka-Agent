@@ -1,6 +1,8 @@
 """Document ingestion, PageIndex navigation, literal search, and quote verification."""
+import contextlib
 import functools
 import hashlib
+import itertools
 import json
 import os
 import posixpath
@@ -146,8 +148,9 @@ json.dump(pages, sys.stdout)
 
 
 def _form_feed_pages(text):
-    """Split page-separated output into pages. pdftotext and ocrmypdf's sidecar both end every
-    page with a form feed, so the tail after the last one is no page."""
+    """Split page-separated output into pages. pdftotext ends every page with a form feed, so the
+    tail after the last one is no page. (ocrmypdf's sidecar puts one between pages instead, and
+    stands one placeholder for a run of skipped pages: ``_sidecar_pages`` reads it.)"""
     pages = text.split("\f")
     if len(pages) > 1 and not pages[-1].strip():
         pages.pop()
@@ -162,8 +165,9 @@ def _solid(pages):
 def _has_text_layer(pages):
     """True when extraction found a real text layer rather than a scan's stray page numbers.
 
-    One rule, in one place: this is the check ``ingest`` refuses on, so a PDF is sent to OCR
-    exactly when it would otherwise be turned away -- the two can never disagree.
+    This is the check ``ingest`` refuses a document on, after OCR has had its turn. It used to be
+    the switch for OCR as well, and as a whole-document rule it was the wrong one: a fifth of the
+    pages carrying text sent none of the others to OCR (see ``_route``).
     """
     return bool(pages) and _solid(pages) >= max(1, len(pages) * 0.2)
 
@@ -172,6 +176,486 @@ def _note(meta, key, value):
     """Record one fact an extractor learned about the source, when the caller asked for them."""
     if meta is not None:
         meta[key] = value
+
+
+# -- which pages need OCR -------------------------------------------------------------------------
+#
+# Page by page, after the gate in FrontierAgent's PDF reader (plugins/tools/_reader_pdf.py at
+# 9e533db, the upstream of the Office port; THIRD_PARTY_NOTICES.md). The corpus used to ask one
+# question of a whole file -- do a fifth of its pages carry text? -- and OCR all of it or none on
+# the answer. A scanned book with a typeset introduction, a document collection whose facsimiles
+# follow the editor's pages, and a scan stamped "Downloaded from ..." on every page all answered
+# yes, and their scanned pages entered the corpus empty, without a word to anyone.
+#
+# Three of the upstream rules are taken: a page with no text, a page whose text layer is garbled,
+# and a page dominated by a raster image. The last is narrowed to pages that also carry little
+# text: upstream sends any image-dominated page to a layout-aware OCR service, and here the engine
+# is tesseract, whose reading would stand in for a publisher's text layer -- the layer doc_verify
+# locates quotations in. Its maths-font and vector-drawing rules route a page to vision, which in
+# the corpus is doc_page_image's job, and are not taken.
+EMPTY_PAGE_CHARS = 10    # fewer characters than this, running lines set aside: no text of its own
+GARBLE_RATIO = 0.15      # replacement and private-use characters above this share: a broken font encoding
+IMAGE_COVER = 1 / 6      # rasters covering more of the page than this ...
+SPARSE_TEXT = 200        # ... over less text than this: a scan under a typeset line, or a plate and its caption
+
+ROUTE_EMPTY = "no text layer"
+ROUTE_GARBLED = "a garbled text layer"
+ROUTE_IMAGE = "a scanned image with little text"
+
+
+def _norm_line(line):
+    return re.sub(r"\d+", "#", " ".join(line.split()))
+
+
+def _running_lines(pages):
+    """First and last lines the document repeats on half its pages or more -- a running head, a
+    folio, a "Downloaded from ... on <date>" stamp -- with digits read as ``#``. Upstream strips
+    these for display; here they only keep a stamp from passing for a page's own text. The stored
+    page keeps them."""
+    if len(pages) < 3:
+        return frozenset()
+    counts = {}
+    for text in pages:
+        lines = [line for line in text.splitlines() if line.strip()]
+        for line in ({_norm_line(lines[0]), _norm_line(lines[-1])} if lines else ()):
+            counts[line] = counts.get(line, 0) + 1
+    return frozenset(line for line, n in counts.items() if n >= max(3, len(pages) // 2))
+
+
+RUNNING_LINES_AT_MOST = 2   # a running head, a folio, a stamp: a line or two at either end
+
+
+def _own_text(text, running):
+    """A page's text without the running lines it shares with the rest of the document -- at most
+    ``RUNNING_LINES_AT_MOST`` at each end: a table's numeric rows all read "# # #", and stripping
+    while they matched took a whole statistical table for a running head (0.18.9 sweep)."""
+    lines = [line for line in text.splitlines() if line.strip()]
+    for _ in range(RUNNING_LINES_AT_MOST):
+        if lines and _norm_line(lines[0]) in running:
+            lines.pop(0)
+    for _ in range(RUNNING_LINES_AT_MOST):
+        if lines and _norm_line(lines[-1]) in running:
+            lines.pop()
+    return "\n".join(lines).strip()
+
+
+def _garble_ratio(text):
+    """The share of U+FFFD and private-use characters, over the characters that are not space:
+    ``pdftotext -layout`` pads lines with spaces, which would dilute a share of the whole."""
+    chars = [c for c in text if not c.isspace()]
+    bad = sum(1 for c in chars if c == "�" or 0xE000 <= ord(c) <= 0xF8FF)
+    return bad / len(chars) if chars else 0.0
+
+
+def _route(pages, visuals=None):
+    """``{page: reason}`` for the pages whose text layer does not carry what is printed on them.
+
+    ``visuals(numbers)`` answers ``{page: (image_cover, marked)}`` from the file's own objects, and
+    is asked only about pages short of ``SPARSE_TEXT``. Without an answer -- a DjVu, whose every
+    rendered page is one picture, or a PDF pdfium cannot open -- only the text decides, and a page
+    with none goes to OCR on the chance it holds some. A page that is known to print nothing at
+    all, no image and no drawing, is blank rather than unread.
+    """
+    running = _running_lines(pages)
+    own = [_own_text(text, running) for text in pages]
+    sparse = [number for number, text in enumerate(own, 1) if len(text) < SPARSE_TEXT]
+    seen = (visuals(sparse) if visuals and sparse else None) or {}
+    routed = {}
+    for number, text in enumerate(own, 1):
+        cover, marked = seen.get(number, (None, True))
+        if len(text) < EMPTY_PAGE_CHARS:
+            if marked:
+                routed[number] = ROUTE_EMPTY
+        elif _garble_ratio(text) > GARBLE_RATIO:
+            routed[number] = ROUTE_GARBLED
+        elif cover is not None and cover > IMAGE_COVER and len(text) < SPARSE_TEXT:
+            routed[number] = ROUTE_IMAGE
+    return routed
+
+
+# Top-level objects only: pdfium reports an object nested in a form XObject in the form's own
+# coordinates, so a scan or a chart wrapped in a form (a common producer habit) is measured by the
+# form's placement on the page instead. Boxes are counted from the crop box's lower-left corner,
+# where a render's crop is counted from. Run in a child for the reason ``_PDFIUM_TEXT_CHILD`` is.
+_PDFIUM_VISUALS_CHILD = """
+import json, sys
+import pypdfium2 as pdfium
+import pypdfium2.raw as raw
+IMAGE, PATH, FORM = raw.FPDF_PAGEOBJ_IMAGE, raw.FPDF_PAGEOBJ_PATH, raw.FPDF_PAGEOBJ_FORM
+pdf = pdfium.PdfDocument(sys.argv[1])
+out = {}
+try:
+    for number in json.loads(sys.argv[2]):
+        page = pdf[number - 1]
+        left, bottom, right, top = page.get_cropbox()
+        width, height = max(right - left, 1.0), max(top - bottom, 1.0)
+
+        def clip(box):
+            x0, y0, x1, y1 = max(box[0], left) - left, max(box[1], bottom) - bottom, min(box[2], right) - left, min(box[3], top) - bottom
+            return [x0, y0, x1, y1] if x1 > x0 and y1 > y0 else None
+
+        images, strokes, ink, marked, form, counted = [], 0, None, False, None, False
+        for obj in page.get_objects(max_depth=2):
+            if obj.level == 0:
+                form, counted, placed = (obj if obj.type == FORM else None), False, obj
+            elif form is None:
+                continue
+            else:
+                placed = form
+            if obj.type == IMAGE:
+                marked = True
+                if obj.level == 0 or not counted:            # a form holding images is one figure
+                    box = clip(placed.get_pos())
+                    if box:
+                        images.append(box)
+                    counted = obj.level > 0
+            elif obj.type == PATH:
+                marked = True
+                strokes += max(raw.FPDFPath_CountSegments(obj.raw), 0)
+                box = clip(placed.get_pos())
+                if box and (box[2] - box[0]) * (box[3] - box[1]) < 0.9 * width * height:   # not a frame round the page
+                    ink = box if ink is None else [min(ink[0], box[0]), min(ink[1], box[1]),
+                                                   max(ink[2], box[2]), max(ink[3], box[3])]
+        cover = sum((b[2] - b[0]) * (b[3] - b[1]) for b in images) / (width * height)
+        out[number] = {"cover": min(cover, 1.0), "marked": marked, "images": images, "strokes": strokes,
+                       "ink": ink, "size": [width, height], "rotation": page.get_rotation()}
+finally:
+    pdf.close()
+json.dump(out, sys.stdout)
+"""
+
+
+def _pdf_visuals(p, numbers):
+    """What pages ``numbers`` of a PDF print besides text, ``{page: signals}``, or None when the
+    file cannot be read: ``cover`` (the share of the page under rasters), ``marked`` (anything
+    printed at all), ``images`` (each raster's box), ``strokes`` (path segments drawn) and ``ink``
+    (the box round the drawing), with the page's ``size`` and ``rotation``."""
+    try:
+        out = subprocess.run([sys.executable, "-c", _PDFIUM_VISUALS_CHILD, p, json.dumps(numbers)],
+                             capture_output=True, text=True, encoding="utf-8", timeout=300, check=False)
+        if out.returncode == 0:
+            return {int(number): signals for number, signals in json.loads(out.stdout).items()}
+    except (OSError, subprocess.SubprocessError, ValueError, TypeError):
+        pass
+    return None
+
+
+def _cover_and_marked(p, learned=None):
+    """``_route``'s question about a PDF: ``{page: (image_cover, marked)}``. When pdfium cannot
+    answer, ``learned["visuals_unread"]`` says so: the routing then went by text alone."""
+    def ask(numbers):
+        seen = _pdf_visuals(p, numbers)
+        if seen is None:
+            if learned is not None:
+                learned["visuals_unread"] = True
+            return None
+        return {n: (s["cover"], s["marked"]) for n, s in seen.items()}
+    return ask
+
+
+# -- figures the text layer does not carry ----------------------------------------------------------
+#
+# FrontierAgent's reader marks, on every page it reads from the text layer, a picture the text
+# cannot carry -- "figure not read: embedded image (covers 35% of page)" -- and counts a page's
+# drawing operators without concluding anything from them, so the model knows where to look and
+# looks only there. Its thresholds are taken as they are. A box the document repeats on half its
+# pages or more (a page background, a letterhead) is set aside the way a running line is.
+#
+# A raster covering the whole page is the page itself: a scan, with a text layer OCR'd under it
+# (archive.org's books, most of a humanities corpus) -- often twice over, a background and a
+# foreground layer of the same scan. Upstream finds the figures inside such a page with a
+# layout-aware OCR service; tesseract does not, so here a scanned page is named instead when it
+# carries far less text than the book's scanned pages usually do -- which is what a map, a plate
+# or a table of figures looks like from its text layer.
+FIGURE_COVER = 0.08      # rasters over this share of a page: a figure ("_PDF_INLINE_IMG_COVER")
+FIGURE_WIDTH = 0.15      # a raster narrower than this share of the page is a logo or an icon ("_OCR_FIG_MIN_WPCT")
+FIGURE_STROKES = 100     # past this many path segments a page is drawn on, not only ruled ("_PDF_DRAW_OPS_FLOOR")
+FIGURE_PAGE = 0.9        # a raster over this share of the page is the page's own scan
+SCAN_SPARSE = 0.25       # a scanned page with under this share of the book's usual text
+SCAN_USUAL_MIN = 400     # ... in a book whose scanned pages usually carry this much
+FIGURES_VERSION = 1
+
+
+def _figure_inventory(signals, count, texts=None):
+    """``{page: {"cover", "images", "strokes", "boxes", "size", "rotation", "sparse"}}`` for the
+    pages that carry what their text does not. ``boxes`` lists the figures in the order
+    doc_page_image numbers them -- each image, then the drawing; ``sparse`` is a scanned page's
+    text as a share of the book's usual, when it is low enough to say so."""
+    def key(box):
+        return tuple(round(v) for v in box)
+
+    def area(box):
+        return (box[2] - box[0]) * (box[3] - box[1])
+
+    repeated = {}
+    for s in signals.values():
+        for box in {key(b) for b in s["images"]}:
+            repeated[box] = repeated.get(box, 0) + 1
+    scanned, out = {}, {}
+    for page, s in sorted(signals.items()):
+        width, height = s["size"]
+        unique = list({key(b): b for b in s["images"]}.values())
+        if any(area(b) >= FIGURE_PAGE * width * height for b in unique):
+            scanned[page] = s
+            continue
+        images = [b for b in unique
+                  if b[2] - b[0] >= FIGURE_WIDTH * width and repeated[key(b)] < max(3, count // 2)]
+        cover = min(sum(area(b) for b in images) / (width * height), 1.0)
+        pictured = cover > FIGURE_COVER
+        drawn = s["strokes"] > FIGURE_STROKES and s["ink"] is not None
+        if pictured or drawn:
+            out[page] = {"cover": round(cover, 3) if pictured else 0.0, "images": len(images) if pictured else 0,
+                         "strokes": s["strokes"] if drawn else 0,
+                         "boxes": (images if pictured else []) + ([s["ink"]] if drawn else []),
+                         "size": [width, height], "rotation": s["rotation"]}
+    if texts and scanned:
+        running = _running_lines(texts)
+        lengths = {page: len(_own_text(texts[page - 1], running)) for page in scanned if page <= len(texts)}
+        usual = sorted(lengths.values())[len(lengths) // 2] if lengths else 0
+        for page, length in lengths.items():
+            if usual >= SCAN_USUAL_MIN and length < SCAN_SPARSE * usual:
+                width, height = scanned[page]["size"]
+                out[page] = {"cover": 1.0, "images": 0, "strokes": 0, "boxes": [], "size": [width, height],
+                             "rotation": scanned[page]["rotation"], "sparse": round(length / usual, 2)}
+    return dict(sorted(out.items()))
+
+
+_SLIDE_HEADING = re.compile(r"^## Slide (\d+)\b", re.MULTILINE)
+
+
+def _slide_figures(pages):
+    """The pages of a deck holding a slide the reader marked ``needs_vlm: true`` -- a picture, a
+    grouped drawing, an arrow tied to nothing: meaning its text cannot carry (office/pptx.py,
+    after FrontierAgent's "needs VLM"). ``{page: {"slide": N}}``."""
+    out = {}
+    for number, text in enumerate(pages, 1):
+        heading = _SLIDE_HEADING.search(text)
+        if heading and "needs_vlm: true" in text:
+            out[number] = {"slide": int(heading.group(1))}
+    return out
+
+
+def _embedded_inventory(pages, listed):
+    """``{page: {"embedded": [{"alt", "member"}]}}``: each picture a Word document or an EPUB
+    embeds, put on the page its ``![...]`` marker is on, in marker order. Where the pages stop
+    agreeing with the list -- a marker cut in two by a page break -- the rest is left out rather
+    than put on the wrong page."""
+    out, page, position = {}, 0, 0
+    for image in listed:
+        while page < len(pages):
+            found = pages[page].find(image["marker"], position)
+            if found >= 0:
+                out.setdefault(page + 1, {"embedded": []})["embedded"].append(
+                    {"alt": image["alt"], "member": image["member"]})
+                position = found + len(image["marker"])
+                break
+            page, position = page + 1, 0
+        else:
+            break
+    return out
+
+
+def _stored_source(ddir):
+    """The original file ingest copied beside the pages (``source`` and its suffix), or None."""
+    for name in sorted(os.listdir(ddir)):
+        if name.startswith("source.") and _real_file(os.path.join(ddir, name), ddir):
+            return os.path.join(ddir, name)
+    return None
+
+
+def figures(doc_id, workspace=None):
+    """What a document holds that its text does not carry, by page: ``{page: record}``.
+
+    A PDF: its images and drawings (``_figure_inventory``), read once from the stored source --
+    so a document indexed before this existed has them too -- and kept in ``figures.json``;
+    pages read by OCR, or left unread, are left out when asked, since the whole page is the
+    picture there and doc_read already says so of them. A deck: its slides marked as needing a
+    vision model. A Word document or an EPUB: the pictures it embeds. Anything else: ``{}``.
+    """
+    ddir = resolve_doc(doc_id, workspace=workspace)
+    source = _stored_source(ddir) if ddir else None
+    if not source:
+        return {}
+    kind = os.path.splitext(source)[1].lower()
+    meta = _read_meta_at(ddir) or {}
+    count = int(meta.get("pages") or 0)
+    if kind in (".pptx", ".ppt"):
+        return _slide_figures(_stored_pages(ddir, count))
+    if kind not in (".pdf", ".docx", ".epub"):
+        return {}
+    path = os.path.join(ddir, "figures.json")
+    data = None
+    if _real_file(path, ddir):
+        try:
+            with open(path, encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, ValueError):
+            data = None
+    if not isinstance(data, dict) or data.get("version") != FIGURES_VERSION:
+        if kind == ".pdf":
+            signals = _pdf_visuals(source, list(range(1, count + 1)))
+            if signals is None:
+                return {}
+            found = _figure_inventory(signals, count, _stored_pages(ddir, count))
+        else:
+            try:
+                if kind == ".docx":
+                    from misaka.core.documents.office import docx
+                    listed = docx.images(source)
+                else:
+                    listed = _epub_images(source)
+                    if int(meta.get("extract_version") or 1) < 3:
+                        listed = _without_framed(listed)
+            except (OSError, ValueError, zipfile.BadZipFile):
+                return {}
+            found = _embedded_inventory(_stored_pages(ddir, count), listed)
+        data = {"version": FIGURES_VERSION, "pages": {str(page): v for page, v in found.items()}}
+        atomic.write_text(path, json.dumps(data, ensure_ascii=False))
+    pictured = set()
+    if kind == ".pdf":
+        pictured = _ocr_set(meta, count) | {int(n) for n in (meta.get("unread_pages") or {}) if str(n).isdigit()}
+    return {int(n): v for n, v in data.get("pages", {}).items() if str(n).isdigit() and int(n) not in pictured}
+
+
+def embedded_image(doc_id, page, figure, workspace=None):
+    """``(bytes, the archive member)`` of picture ``figure`` (1-based) on ``page`` of a Word
+    document or an EPUB, read out of the stored source; raises ValueError saying why not."""
+    ddir = resolve_doc(doc_id, workspace=workspace)
+    source = _stored_source(ddir) if ddir else None
+    record = figures(doc_id, workspace=workspace).get(page) or {}
+    listed = record.get("embedded") or []
+    if not 1 <= figure <= len(listed):
+        raise ValueError(f"Page {page} has {len(listed) or 'no'} picture{'' if len(listed) == 1 else 's'} "
+                         f"the document embeds{f' (1..{len(listed)})' if listed else ''}; doc_read lists them.")
+    member = listed[figure - 1]["member"]
+    if not member:
+        raise ValueError(f"Picture {figure} on page {page} is not stored as an image in the file "
+                         f"(a chart or a shape the program draws, or a picture linked from outside).")
+    try:
+        with zipfile.ZipFile(source) as archive:
+            data = _zip_read(archive, member, limit=64 * 1024 * 1024)
+    except (OSError, zipfile.BadZipFile) as error:
+        raise ValueError(f"Cannot read {member} from the stored file: {error}") from error
+    if data is None:
+        raise ValueError(f"{member} is missing from the stored file, or larger than 64 MiB.")
+    return data, member
+
+
+# -- the number printed on a page -------------------------------------------------------------------
+#
+# A page here is a page of the file, counted from 1, and that is the locator every tool and every
+# citation uses -- it never shifts. What a reader looks up in the book is the number printed on the
+# page, and the two part company at a cover, Roman-numbered front matter, an unnumbered plate, or a
+# journal article whose pages start at 1361 (GitHub issue #9: a scanned book thirteen pages out, a
+# delivered card citing the file's pages as the book's). So the printed number is found where it
+# can be, and shown beside the file's page -- never in place of it.
+#
+# Two sources, in this order. A PDF that says what each page is labelled (/PageLabels: 32 of the 98
+# PDFs in one real corpus, front matter and journal offsets alike). Otherwise the numbers at the top
+# or bottom of the pages themselves, believed only where many pages nearby agree on the same
+# distance from the file's page, so a year in a running head or a footnote number never passes.
+LABELS_VERSION = 1
+FOLIO_WINDOW = 12            # pages either side that are asked to agree
+FOLIO_SUPPORT = 4            # ... and how many of them must
+FOLIO_MIN_PAGES = 10         # fewer agreeing pages than this in a book: no printed numbers claimed
+FOLIO_GAP = 6                # an unnumbered page between two that agree takes their number
+
+_PDFIUM_LABELS_CHILD = """
+import json, sys
+import pypdfium2 as pdfium
+pdf = pdfium.PdfDocument(sys.argv[1])
+try:
+    json.dump([pdf.get_page_label(i) or "" for i in range(len(pdf))], sys.stdout)
+finally:
+    pdf.close()
+"""
+_FOLIO_ALONE = re.compile(r"^[\s\-–—·•.\[(（]*(?:第\s*)?(\d{1,4})(?:\s*[页頁])?[\s\-–—·•.\])）]*$")
+_FOLIO_LEADS = re.compile(r"^(\d{1,4})\s+\S")      # "338  EAST JIN": a head on a left-hand page
+_FOLIO_ENDS = re.compile(r"\S\s+(\d{1,4})$")       # "The Mind in the Machine  219"
+
+
+def _pdf_page_labels(p):
+    """A PDF's own page labels, one per page (``""`` for an unlabelled one), or None."""
+    try:
+        out = subprocess.run([sys.executable, "-c", _PDFIUM_LABELS_CHILD, p], capture_output=True,
+                             text=True, encoding="utf-8", timeout=120, check=False)
+        labels = json.loads(out.stdout) if out.returncode == 0 else None
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+    return labels if isinstance(labels, list) and all(isinstance(x, str) for x in labels) else None
+
+
+def _folios(text):
+    """The numbers a page prints at its top or bottom: alone on one of its first or last two
+    lines ("338", "- 338 -", "第338页"), at either end of a head ("338  East Jin", "East Jin
+    338"), or at the end of a foot. A foot line that *starts* with a number is a footnote
+    ("87 Zhuravsky, ..."): its numbers climb a page at a time often enough to pass for folios."""
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    found = set()
+    for line, head in [(line, True) for line in lines[:2]] + [(line, False) for line in lines[-2:]]:
+        match = _FOLIO_ALONE.match(line) or _FOLIO_ENDS.search(line) or (head and _FOLIO_LEADS.match(line))
+        if match:
+            found.add(int(match.group(1)))
+    return found
+
+
+def _inferred_labels(pages):
+    """``{page: printed number}`` read off the pages, where it can be believed (see above)."""
+    offsets = {n: {folio - n for folio in _folios(text)} for n, text in enumerate(pages, 1)}
+    chosen = {}
+    for n, candidates in offsets.items():
+        best = None
+        for d in candidates:
+            support = sum(1 for m in range(n - FOLIO_WINDOW, n + FOLIO_WINDOW + 1) if d in offsets.get(m, ()))
+            if support >= FOLIO_SUPPORT and (best is None or support > best[1]):
+                best = (d, support)
+        if best:
+            chosen[n] = best[0]
+    if len(chosen) < FOLIO_MIN_PAGES:
+        return {}
+    numbered = sorted(chosen)
+    for left, right in itertools.pairwise(numbered):
+        if chosen[left] == chosen[right] and 1 < right - left <= FOLIO_GAP:
+            for n in range(left + 1, right):
+                chosen[n] = chosen[left]
+    return {n: str(n + d) for n, d in chosen.items() if n + d >= 1}
+
+
+def page_labels(doc_id, workspace=None):
+    """``({page: printed number}, where it came from)`` for a PDF or a DjVu, only where the printed
+    number differs from the file's page; ``({}, None)`` when nothing is known. ``where`` is "the
+    PDF's page labels" or "the page headers and footers". Found once and kept in ``labels.json``."""
+    ddir = resolve_doc(doc_id, workspace=workspace)
+    source = _stored_source(ddir) if ddir else None
+    if not source or os.path.splitext(source)[1].lower() not in (".pdf", ".djvu"):
+        return {}, None
+    path = os.path.join(ddir, "labels.json")
+    data = None
+    if _real_file(path, ddir):
+        try:
+            with open(path, encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, ValueError):
+            data = None
+    if not isinstance(data, dict) or data.get("version") != LABELS_VERSION:
+        labels, where = {}, None
+        own = _pdf_page_labels(source) if source.lower().endswith(".pdf") else None
+        if own and any(label and label != str(n) for n, label in enumerate(own, 1)):
+            labels, where = {n: label for n, label in enumerate(own, 1) if label}, "the PDF's page labels"
+        else:
+            meta = _read_meta_at(ddir) or {}
+            labels = _inferred_labels(_stored_pages(ddir, int(meta.get("pages") or 0)))
+            where = "the page headers and footers" if labels else None
+        data = {"version": LABELS_VERSION, "where": where,
+                "labels": {str(n): label for n, label in labels.items() if label != str(n)}}
+        atomic.write_text(path, json.dumps(data, ensure_ascii=False))
+    return {int(n): label for n, label in data.get("labels", {}).items() if str(n).isdigit()}, data.get("where")
+
+
+def printed(doc_id, page, workspace=None):
+    """``"printed p. 338"`` for a page whose printed number differs from its file page, else ``""``."""
+    labels, _where = page_labels(doc_id, workspace=workspace)
+    return f"printed p. {labels[page]}" if page in labels else ""
 
 
 # -- OCR: an optional external binary, fail-closed ------------------------------------------------
@@ -183,37 +667,102 @@ def _note(meta, key, value):
 # air.
 OCR_BINARY = "ocrmypdf"
 OCR_LANGS_DEFAULT = "eng+chi_sim+jpn"
+OCR_MISSING = "ocrmypdf is not installed (brew install ocrmypdf)"
+OCR_FOUND_NOTHING = "OCR found no text on it"      # a blank scan, a photograph, a map without names
 # A book-length scan is minutes of work per hundred pages; the bound is what keeps one stuck OCR
 # from owning an ingest forever (pdftotext above is bounded the same way, smaller).
 OCR_TIMEOUT = 900
+# ocrmypdf accepts --sidecar together with --pages from 11.7 on; an older one OCRs every page.
+OCR_PAGES_SINCE = (11, 7)
+_SKIPPED = re.compile(r"\[OCR skipped on page\(s\) (\d+)(?:-(\d+))?\]")
 
 
-def _ocr_pages(p, meta=None):
-    """OCR a scanned PDF into pages, or None when that cannot be done.
+@functools.lru_cache(maxsize=1)
+def _ocr_version():
+    try:
+        out = subprocess.run([OCR_BINARY, "--version"], capture_output=True, text=True, encoding="utf-8",
+                             errors="replace", timeout=60, check=False)
+        found = re.match(r"\s*v?(\d+)\.(\d+)", out.stdout or "")
+        return (int(found.group(1)), int(found.group(2))) if found else None
+    except (OSError, subprocess.SubprocessError):
+        return None
 
-    ``--skip-text`` leaves any page that already carries text alone: OCR must never be written
-    over a real text layer. ``--sidecar`` is the only output kept -- the corpus stores the
-    original file, whose sha256 is the document's identity, so the OCR'd PDF is discarded.
 
-    A run that fails writes why into ``meta['ocr_error']``, and the refusal quotes it. The most
-    likely failure by far is a language pack that is not installed (``brew install tesseract-lang``
-    for the chi_sim and jpn defaults), and "OCR failed" without the reason would be the same
-    dead end this whole path exists to remove. The key never reaches meta.json: it is only ever
-    set on the way to a raise.
+def _page_spec(numbers):
+    """``[1, 2, 3, 7]`` -> ``"1-3,7"``, as ``--pages`` reads it."""
+    runs = []
+    for number in sorted(set(numbers)):
+        if runs and number == runs[-1][1] + 1:
+            runs[-1][1] = number
+        else:
+            runs.append([number, number])
+    return ",".join(f"{a}-{b}" if a != b else f"{a}" for a, b in runs)
+
+
+def _sidecar_pages(text, count=None):
+    """``{page: text}`` from an ocrmypdf sidecar, or None when it does not line up with ``count``.
+
+    The sidecar has one entry per page OCR read, and one placeholder for each run of pages it did
+    not: ``[OCR skipped on page(s) 4-10]`` stands for seven pages (``merge_sidecars`` in
+    ocrmypdf's _pipeline.py, worded the same from 11.7 to 17). Reading entries as pages, as this
+    module once did, stored the placeholder as a page in place of the typeset pages it stood for
+    and numbered every page after it one too low -- and doc_verify then located quotations on
+    the wrong page.
+    """
+    entries = text.split("\f")
+    for _attempt in range(2):
+        out, page, aligned = {}, 1, True
+        for entry in entries:
+            run = _SKIPPED.fullmatch(entry.strip())
+            if run:
+                first, last = int(run.group(1)), int(run.group(2) or run.group(1))
+                aligned = aligned and first == page
+                page = last + 1
+            else:
+                out[page] = entry
+                page += 1
+        if aligned and (count is None or page - 1 == count):
+            return out
+        if len(entries) < 2 or entries[-1].strip():
+            return None
+        entries = entries[:-1]          # a closing form feed, written by some versions
+    return None
+
+
+def _ocr_pages(p, meta=None, numbers=None, count=None):
+    """OCR pages ``numbers`` of a PDF (every page when None): ``{page: text}``, or None when that
+    cannot be done.
+
+    ``--force-ocr`` reads the named pages whatever text they carry -- a stamp or a garbled layer
+    is exactly what ``--skip-text`` used to leave alone -- and every other page is skipped. The
+    OCR'd PDF is discarded: the corpus stores the original file, whose sha256 is the document's
+    identity, so rasterising a page here changes nothing a reader sees. The sidecar is the only
+    output kept, and the reading is taken from it rather than from the OCR'd PDF's text layer,
+    which reads Chinese and Japanese back with a space between characters.
+
+    A run that fails writes why into ``meta['ocr_error']``. The most likely failure by far is a
+    language pack that is not installed (``brew install tesseract-lang`` for the chi_sim and jpn
+    defaults), and "OCR failed" without the reason would be the same dead end this whole path
+    exists to remove. ``ingest`` quotes it in a refusal, and otherwise drops it from meta.json:
+    the pages it cost are listed in ``unread_pages`` with the reason.
     """
     if not shutil.which(OCR_BINARY):
         return None
     from misaka.config.product import setting
 
     langs = setting("documents", "ocr_langs", OCR_LANGS_DEFAULT, str) or OCR_LANGS_DEFAULT
-    with tempfile.TemporaryDirectory(prefix=".ocr-", dir=os.path.dirname(os.path.abspath(p))) as tmp:
+    # The system's temporary folder, not the source's: a library folder may be read-only, and since
+    # one routed page is enough to OCR, such a folder refused whole books it used to index.
+    with tempfile.TemporaryDirectory(prefix="misaka-ocr-") as tmp:
         sidecar = os.path.join(tmp, "sidecar.txt")
+        argv = [OCR_BINARY, "--force-ocr", "--output-type", "pdf", "--sidecar", sidecar, "-l", langs]
+        version = _ocr_version()
+        if numbers is not None and (version is None or version >= OCR_PAGES_SINCE):
+            argv += ["--pages", _page_spec(numbers)]
         try:
-            out = subprocess.run(
-                [OCR_BINARY, "--sidecar", sidecar, "--skip-text", "-l", langs,
-                 p, os.path.join(tmp, "ocr.pdf")],
-                capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=OCR_TIMEOUT,
-                check=False)
+            out = subprocess.run(argv + [p, os.path.join(tmp, "ocr.pdf")],
+                                 capture_output=True, text=True, encoding="utf-8", errors="replace",
+                                 timeout=OCR_TIMEOUT, check=False)
             if out.returncode != 0:
                 _note(meta, "ocr_error",
                       " ".join((out.stderr or "").split())[-200:] or f"exit {out.returncode}")
@@ -223,52 +772,82 @@ def _ocr_pages(p, meta=None):
         except (OSError, ValueError, subprocess.SubprocessError) as error:
             _note(meta, "ocr_error", str(error)[:200])   # missing or unreadable sidecar, timeout
             return None
-    return _form_feed_pages(text)
+    pages = _sidecar_pages(text, count)
+    if pages is None:
+        _note(meta, "ocr_error", f"the OCR output did not line up with the file's {count} pages")
+    elif numbers is not None:
+        pages = {number: pages[number] for number in numbers if number in pages}
+    return pages
 
 
-def _merge_ocr(pages, ocr):
-    """``(pages, the 1-based numbers of the pages taken from OCR)``.
+def _reads_as_text(text):
+    """True when OCR read words or figures, not the specks tesseract finds in a photograph."""
+    chars = [c for c in text if not c.isspace()]
+    readable = sum(1 for c in chars if unicodedata.category(c)[0] in "LN")
+    return len(chars) >= EMPTY_PAGE_CHARS and readable >= len(chars) / 2
 
-    A PDF reaches OCR when fewer than a fifth of its pages carry text, so up to a fifth of them
-    *do* -- and ``--skip-text`` deliberately leaves those alone, which means the sidecar's entry
-    for such a page is ocrmypdf's placeholder rather than its words. Taking the sidecar whole
-    therefore wrote a placeholder over the real text of exactly the pages a mostly-scanned book
-    still had: the handful of typeset pages in a scan of a printed book, which are usually the
-    front matter a citation needs.
 
-    So the two are merged page by page, on the same "more than a caption's worth" rule the rest
-    of this module uses. Both sequences are one entry per page of the PDF and align by index;
-    when they do not (pdftotext and ocrmypdf disagreeing about the page count means one of them
-    read a damaged file), OCR is taken as it stands rather than pasted against page numbers it
-    does not belong to -- a citation that lands on the wrong page is worse than a scan.
+def _merge_ocr(pages, ocr, routed, why):
+    """``(pages, the pages OCR read, {page: why a page that needed OCR was not read})``.
+
+    A routed page keeps its text layer and takes OCR's reading after it. A facsimile under an
+    editor's typeset heading and a plate under its caption look alike to every signal ``_route``
+    has, and only one of them prints more than its layer holds; keeping both loses neither, and
+    doc_verify marks a quotation found on such a page as OCR. A garbled layer is the exception:
+    it is the noise OCR is there to replace.
     """
-    if len(ocr) != len(pages):
-        return ocr, list(range(1, len(ocr) + 1))
-    merged, ocred = [], []
-    for number, (extracted, scanned) in enumerate(zip(pages, ocr), 1):
-        if len(extracted.strip()) > 20:
-            merged.append(extracted)        # a real text layer: never OCR over it
+    merged, ocred, unread = list(pages), [], {}
+    for number, reason in sorted(routed.items()):
+        reading = (ocr or {}).get(number)
+        if reading is None:
+            unread[number] = f"{reason}; {why}"
+        elif not _reads_as_text(reading):
+            unread[number] = f"{reason}; {OCR_FOUND_NOTHING}"
         else:
-            merged.append(scanned)
+            layer = pages[number - 1]
+            merged[number - 1] = (reading if reason == ROUTE_GARBLED or not layer.strip()
+                                  else layer.rstrip() + "\n\n" + reading)
             ocred.append(number)
-    return merged, ocred
+    return merged, ocred, unread
 
 
-def _pdf_pages(p, meta=None):
-    pages = _pdf_text_layer(p)
-    if _has_text_layer(pages):
-        return pages                        # a real text layer: never OCR over it
-    ocr = _ocr_pages(p, meta)
-    if ocr and _has_text_layer(ocr):
-        merged, ocred = _merge_ocr(pages, ocr)
-        # doc_list/doc_outline badge OCR text as lower fidelity, and doc_verify names the page.
-        # ``ocr_pages`` is written only when the text layer survived somewhere, so the common
-        # case -- a scan, every page of it OCR'd -- does not carry a list of every page number.
+def _record_reading(meta, merged, ocred, unread):
+    """``ocr`` and ``ocr_pages`` as doc_list/doc_read/doc_verify read them, and ``unread_pages``.
+
+    ``ocr_pages`` is written only when the text layer survived somewhere, so the common case -- a
+    scan, every page of it OCR'd -- does not carry a list of every page number.
+    """
+    if ocred:
         _note(meta, "ocr", True)
         if len(ocred) < len(merged):
             _note(meta, "ocr_pages", ocred)
-        return merged
-    return pages                            # ingest turns it away, naming the install
+    if unread:
+        _note(meta, "unread_pages", {str(number): why for number, why in sorted(unread.items())})
+
+
+def _why_not_read(learned):
+    if not shutil.which(OCR_BINARY):
+        return OCR_MISSING
+    return f"OCR failed: {learned['ocr_error']}" if learned.get("ocr_error") else "OCR did not read it"
+
+
+def _pdf_pages(p, meta=None):
+    learned = meta if meta is not None else {}
+    pages = _pdf_text_layer(p)
+    if not pages:
+        # Neither extractor could so much as count the pages: OCR the file whole, as it reads.
+        read = _ocr_pages(p, learned)
+        if not read:
+            return []
+        _note(meta, "ocr", True)
+        return [read[number] for number in sorted(read)]
+    routed = _route(pages, _cover_and_marked(p, learned))
+    if not routed:
+        return pages                        # a real text layer on every page: never OCR over it
+    ocr = _ocr_pages(p, learned, sorted(routed), len(pages))
+    merged, ocred, unread = _merge_ocr(pages, ocr, routed, _why_not_read(learned))
+    _record_reading(meta, merged, ocred, unread)
+    return merged
 
 
 def _no_text_error(p, pages, ocr_error=None):
@@ -831,10 +1410,34 @@ def _epub_spine(archive):
 
 
 def _epub_pages(p, chars=3000, meta=None):
-    """An EPUB read as the book it is: chapter after chapter, in spine order.
+    """An EPUB read as the book it is: chapter after chapter, in spine order, its pictures
+    marked where they stand (``![alt]``) so doc_read can name them and doc_page_image show them.
 
     ``meta`` goes unused: EPUB content is UTF-8 or UTF-16 by specification, so there is no
     encoding here that had to be guessed and recorded."""
+    return _epub_read(p, chars, [])
+
+
+def _without_framed(listed):
+    """The pictures an EPUB read before extraction version 3 marked: none framed in <svg>, and an
+    alt-less one numbered without them -- its stored pages carry those markers, and matching them
+    against today's list showed the cover as figure 1 (0.18.9 sweep)."""
+    kept = [dict(image) for image in listed if not image.get("svg")]
+    for number, image in enumerate(kept, 1):
+        if not image["alt"]:
+            image["marker"] = f"![image {number}]"
+    return kept
+
+
+def _epub_images(p):
+    """The pictures behind an EPUB's ``![...]`` markers, in marker order: ``[{"marker", "alt",
+    "member"}]``, ``member`` the archive member the chapter's <img src> names, or None."""
+    images = []
+    _epub_read(p, 3000, images)
+    return images
+
+
+def _epub_read(p, chars, images):
     try:
         with zipfile.ZipFile(p) as archive:
             _title, members = _epub_spine(archive)
@@ -852,7 +1455,12 @@ def _epub_pages(p, chars=3000, meta=None):
                     raise ValueError(
                         f"Refused {os.path.basename(p)}: its spine expands past "
                         f"{_EPUB_BOOK_CHARS // (1024 * 1024)} MiB of markup, larger than any book")
-                pages.extend(_paginate(htmltext.readable(markup)[0], chars))
+                start = len(images)                  # one list for the book: "image N" counts book-wide
+                pages.extend(_paginate(htmltext.readable(markup, images=images)[0], chars))
+                for image in images[start:]:
+                    src = urllib.parse.unquote(image.pop("src").split("#")[0].split("?")[0])
+                    inside = src and not src.startswith(("data:", "http:", "https:"))
+                    image["member"] = posixpath.normpath(posixpath.join(posixpath.dirname(name), src)) if inside else None
     except zipfile.BadZipFile as error:
         raise ValueError(f"Not a readable EPUB: the file is not a zip archive ({error})") from error
     return pages
@@ -885,50 +1493,89 @@ def _decode_markup(data, what="EPUB chapter"):
 # through the compression -- and an HTML page entered with its tags and its <script> counted as
 # prose.
 #
-DJVU_TEXT_BINARY = "djvutxt"
+DJVU_TEXT_BINARY = "djvused"
 DJVU_RENDER_BINARY = "ddjvu"
 DJVU_TIMEOUT = 300
 
 
+def _djvu_run(argv, meta, stdin=None):
+    """stdout of one djvulibre command, or None with ``meta['djvu_error']`` saying why."""
+    try:
+        out = subprocess.run(argv, input=stdin, capture_output=True, text=True, encoding="utf-8",
+                             errors="replace", timeout=DJVU_TIMEOUT, check=False)
+    except (OSError, subprocess.SubprocessError) as error:
+        _note(meta, "djvu_error", str(error)[:200])
+        return None
+    if out.returncode != 0:
+        _note(meta, "djvu_error", " ".join((out.stderr or "").split())[-200:] or f"exit {out.returncode}")
+        return None
+    return out.stdout
+
+
+def _djvu_page_count(p, meta):
+    out = _djvu_run([DJVU_TEXT_BINARY, p, "-e", "n"], meta)
+    return int(out) if out and out.strip().isdigit() else None
+
+
+def _djvu_text_layer(p, meta):
+    """The hidden text of every page, ``""`` for a page that has none; None when unreadable.
+
+    ``djvutxt`` was the reader here, and it prints nothing at all -- not even the form feed -- for
+    a page without hidden text, so the text of a book with one blank or plate page in it was
+    stored a page early from there on. ``print-pure-txt`` per selected page closes every page with
+    a form feed, empty or not, and prints the same characters ``djvutxt`` does; the newline
+    ``djvutxt`` put before each form feed is kept, so a book it read correctly reads the same.
+    """
+    count = _djvu_page_count(p, meta)
+    if count is None:
+        return None
+    script = "".join(f"select {n}; print-pure-txt\n" for n in range(1, count + 1))
+    out = _djvu_run([DJVU_TEXT_BINARY, "-u", p], meta, stdin=script)
+    if out is None:
+        return None
+    pages = out.split("\f")[:count]
+    if len(pages) != count:
+        _note(meta, "djvu_error", f"{DJVU_TEXT_BINARY} printed {len(pages)} pages of {count}")
+        return None
+    return [text + "\n" if text else text for text in pages]
+
+
 def _djvu_pages(p, meta=None):
-    """A DjVu book: its own text layer when it has one, otherwise rendered to PDF and handed
-    to the PDF path, so a scan goes through the same OCR every scanned PDF does.
+    """A DjVu book: its own text layer, with the pages that need it OCR'd from a rendering.
 
     CADAL and Wikimedia carry a large part of the scanned Chinese classics as DjVu
     (2026-09-18, B10: download_file refused the format, a Sister fetched it by hand, and the
-    corpus then skipped it at submission). ``djvutxt`` prints the hidden text layer one page
-    per form feed, as pdftotext does, and exits 0 with nothing for a scan that has none. The
-    rendered PDF is a working copy: the DjVu's own bytes stay the document's identity.
+    corpus then skipped it at submission). Pages are chosen the way a PDF's are (``_route``),
+    on their text alone, and only those are rendered -- to a working PDF whose page ``i`` is the
+    ``i``-th chosen page -- and OCR'd. The DjVu's own bytes stay the document's identity.
     """
     if not shutil.which(DJVU_TEXT_BINARY):
         _note(meta, "djvu_error", f"{DJVU_TEXT_BINARY} is not installed (brew install djvulibre)")
         return []
-    try:
-        out = subprocess.run([DJVU_TEXT_BINARY, p], capture_output=True, text=True, encoding="utf-8",
-                             errors="replace", timeout=DJVU_TIMEOUT, check=False)
-    except (OSError, subprocess.SubprocessError) as error:
-        _note(meta, "djvu_error", str(error)[:200])
+    learned = meta if meta is not None else {}
+    pages = _djvu_text_layer(p, learned)
+    if not pages:
         return []
-    if out.returncode != 0:
-        _note(meta, "djvu_error", " ".join((out.stderr or "").split())[-200:] or f"exit {out.returncode}")
-        return []
-    pages = _form_feed_pages(out.stdout)
-    if _has_text_layer(pages) or not shutil.which(DJVU_RENDER_BINARY):
+    routed = _route(pages)
+    if not routed:
         return pages
-    with tempfile.TemporaryDirectory(prefix=".djvu-", dir=os.path.dirname(os.path.abspath(p))) as tmp:
-        rendered = os.path.join(tmp, "scan.pdf")
-        try:
-            run = subprocess.run([DJVU_RENDER_BINARY, "-format=pdf", p, rendered], capture_output=True,
-                                 text=True, encoding="utf-8", errors="replace", timeout=DJVU_TIMEOUT, check=False)
-        except (OSError, subprocess.SubprocessError) as error:
-            _note(meta, "djvu_error", str(error)[:200])
-            return pages
-        if run.returncode != 0 or not os.path.exists(rendered):
-            _note(meta, "djvu_error", " ".join((run.stderr or "").split())[-200:] or f"exit {run.returncode}")
-            return pages
-        ocred = _pdf_pages(rendered, meta)
-        # Only a rendering that actually read something beats the thin text layer it had.
-        return ocred if _has_text_layer(ocred) else pages
+    numbers, ocr = sorted(routed), None
+    if not shutil.which(DJVU_RENDER_BINARY):
+        why = f"{DJVU_RENDER_BINARY} is not installed (brew install djvulibre)"
+    else:
+        with tempfile.TemporaryDirectory(prefix="misaka-djvu-") as tmp:
+            rendered = os.path.join(tmp, "scan.pdf")
+            done = _djvu_run([DJVU_RENDER_BINARY, "-format=pdf", f"-page={_page_spec(numbers)}", p, rendered],
+                             learned)
+            read = (_ocr_pages(rendered, learned, None, len(numbers))
+                    if done is not None and os.path.exists(rendered) else None)
+        if read is not None:
+            ocr = {number: read.get(i) for i, number in enumerate(numbers, 1)}
+        why = (_why_not_read(learned) if done is not None
+               else f"rendering failed: {learned.get('djvu_error', 'no output')}")
+    merged, ocred, unread = _merge_ocr(pages, ocr, routed, why)
+    _record_reading(meta, merged, ocred, unread)
+    return merged
 
 
 # The last group is text with no format of its own: a card's analysis.csv, results.json, run.log
@@ -970,7 +1617,8 @@ _EXTRACTORS = {
 # spend minutes converting files nobody asked for. Named one by one they are read.
 _NOT_SWEPT = frozenset({".json", ".jsonl", ".ndjson", ".log", ".yaml", ".yml",
                         ".doc", ".xls", ".ppt"})
-SCAN_SUFFIXES = frozenset(_EXTRACTORS) - _NOT_SWEPT
+READABLE_SUFFIXES = frozenset(_EXTRACTORS)       # what ingest reads when a file is named
+SCAN_SUFFIXES = READABLE_SUFFIXES - _NOT_SWEPT
 
 
 def _extractor(p):
@@ -1052,8 +1700,8 @@ def _warn_no_pageindex(p):
     _warned_no_pageindex = True
     from .pageindex import INSTALL_HINT
     print(f"Warning: no PageIndex structure extraction for {os.path.basename(p)} (and any other "
-          f"document in this run): the optional extra is not installed, so documents are split "
-          f"into pages only, with no outline.\n         Install it with: {INSTALL_HINT}\n"
+          f"document in this run): PageIndex's packages are missing from this install, so documents "
+          f"are split into pages only, with no outline.\n         To fix it: {INSTALL_HINT}\n"
           f"         Then re-run the same `misaka doc add`/`doc scan` to backfill the outline.",
           file=sys.stderr)
 
@@ -1157,6 +1805,128 @@ def _page_path(ddir, page):
 # Bumping this re-asks `build_tree` for every document that had no outline last time. Raise it
 # when the extractor gains the ability to find one where it previously could not.
 TREE_ATTEMPT_VERSION = 1
+
+
+# Bumping this re-reads a PDF, a DjVu or an EPUB indexed by an older extractor the next time it is
+# ingested (``_reread``). 2: pages chosen for OCR one by one (``_route``), OCR sidecars and DjVu
+# text lined up with the file's own page numbers, and an EPUB's pictures marked where they stand.
+# 3: a statistical table is no longer taken for running lines and sent to OCR, and an EPUB's
+# pictures framed in <svg> are marked too.
+EXTRACT_VERSION = 3
+REREAD_SUFFIXES = (".pdf", ".djvu", ".epub")
+REREAD_TRIES = 3            # the re-read pdfium cannot route on this many ingests in a row is given up
+
+
+def _needs_reread(pages):
+    """Whether stored pages show what version 1 could get wrong: an OCR placeholder stored as a
+    page, or a page with little or garbled text of its own, on which the file may print something
+    the old extractor never read. A book whose every page carries text of its own is left alone."""
+    running = _running_lines(pages)
+    return any(_SKIPPED.search(text) or len(own) < SPARSE_TEXT or _garble_ratio(own) > GARBLE_RATIO
+               for text in pages for own in (_own_text(text, running),))
+
+
+def _ocr_set(meta, count):
+    if not meta.get("ocr"):
+        return set()
+    listed = meta.get("ocr_pages")
+    return set(listed) if isinstance(listed, list) else set(range(1, count + 1))
+
+
+def _reread(ddir, p, count):
+    """Bring a document indexed by an older extractor up to this one; returns its page count.
+
+    Only what the new extractor reads differently is rewritten: every page when the count changed
+    (the old pages were numbered wrong), otherwise the pages it OCR'd and any stored placeholder.
+    Every other page keeps its stored text byte for byte, so a quotation already located on it
+    stays where it was. The pages that did change are listed in ``meta['reread']``, and doc_read
+    and doc_verify say so on them.
+
+    A document with pages that need an OCR this machine does not have is not stamped as current:
+    it is read again once ocrmypdf is installed.
+    """
+    meta = _read_meta_at(ddir) or {}
+    version = int(meta.get("extract_version") or 1)
+    if version >= EXTRACT_VERSION:
+        return count
+    ext = os.path.splitext(p)[1].lower()
+    old = _stored_pages(ddir, count) if ext in REREAD_SUFFIXES else None
+    pages, learned = None, {}
+    # djvutxt skipped a page with no hidden text outright, so a DjVu stored out of step can have
+    # nothing but full pages to show for it: only its page count gives it away. An EPUB's text
+    # used to drop its pictures (all of them before 2, those framed in <svg> before 3), so one
+    # with fewer ``![...]`` markers than pictures is read again. Version 2 sent a statistical
+    # table's pages to OCR: a document with some pages OCR'd is routed again.
+    if ext == ".epub":
+        stale = old is not None and sum(text.count("![") for text in old) < len(_epub_images(p))
+    else:
+        stale = old is not None and (_needs_reread(old) or (ext == ".djvu" and shutil.which(DJVU_TEXT_BINARY)
+                                                            and _djvu_page_count(p, {}) not in (None, count))
+                                     or (version == 2 and 0 < len(_ocr_set(meta, count)) < count))
+    if stale:
+        pages = extract_pages(p, meta=learned)
+        if not _has_text_layer(pages):
+            return count                    # nothing better to offer; asked again next time
+        if learned.pop("visuals_unread", False):
+            # Routed by text alone, a plate OCR read by its image cover would go back to its
+            # caption for good: read again when pdfium answers (0.18.9 sweep) -- up to
+            # REREAD_TRIES times; a file pdfium never reads keeps what is stored, stamped current.
+            # Not given up while it holds pages waiting for an OCR this machine lacks: those are
+            # read once ocrmypdf is installed, as everywhere else in a re-read.
+            with _meta_lock(ddir):
+                m = _read_meta_at(ddir) or {}
+                put_off = m.get("reread_put_off") if isinstance(m.get("reread_put_off"), dict) else {}
+                tries = int(put_off.get("tries") or 0) + 1 if put_off.get("version") == EXTRACT_VERSION else 1
+                waits_for_ocr = not shutil.which(OCR_BINARY) and any(
+                    str(why).endswith(OCR_MISSING) for why in (m.get("unread_pages") or {}).values())
+                if tries >= REREAD_TRIES and not waits_for_ocr:
+                    m.pop("reread_put_off", None)
+                    m["extract_version"] = EXTRACT_VERSION
+                else:
+                    m["reread_put_off"] = {"version": EXTRACT_VERSION, "tries": tries}
+                atomic.write_text(os.path.join(ddir, "meta.json"), json.dumps(m, ensure_ascii=False, indent=2))
+            return count
+    unread = {int(n): why for n, why in (learned.get("unread_pages") or {}).items()}
+    ocr_missing = any(why.endswith(OCR_MISSING) for why in unread.values())
+    was_ocr, now_ocr = _ocr_set(meta, count), _ocr_set(learned, len(pages or ()))
+    changed, final_ocr = [], was_ocr
+    if pages is not None and len(pages) != count:
+        if ocr_missing and was_ocr:
+            return count                    # the stored pages hold OCR this machine cannot redo
+        changed, final_ocr = list(range(1, len(pages) + 1)), now_ocr
+    elif pages is not None:
+        # A page OCR'd before and not routed now (a table version 2 took for a scan) goes back to
+        # its text layer; one still routed whose OCR this machine cannot redo keeps its reading.
+        changed = [n for n in range(1, count + 1)
+                   if (ext == ".epub" or n in now_ocr or (n in was_ocr and n not in unread)
+                       or _SKIPPED.search(old[n - 1])) and pages[n - 1] != old[n - 1]]
+        final_ocr = (was_ocr - set(changed)) | (now_ocr & set(changed))
+        # A page still holding an earlier OCR's reading has been read, whatever this run managed.
+        unread = {n: why for n, why in unread.items() if n in changed or n not in was_ocr}
+    total = len(pages) if changed else count
+    with _meta_lock(ddir):
+        for n in changed:
+            atomic.write_text(_page_path(ddir, n), pages[n - 1])
+        for n in range(total + 1, count + 1):           # a count that shrank
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(_page_path(ddir, n))
+        if changed:
+            for derived in ("figures.json", "labels.json"):   # read off the old pages: found again on asking
+                with contextlib.suppress(FileNotFoundError):
+                    os.unlink(os.path.join(ddir, derived))
+        m = _read_meta_at(ddir) or {}
+        if pages is not None:
+            for key in ("ocr", "ocr_pages", "unread_pages"):
+                m.pop(key, None)
+            m["pages"] = total
+            _record_reading(m, [None] * total, sorted(final_ocr), unread)
+        if changed:
+            m["reread"] = {"at": int(time.time()), "pages": changed, "pages_before": count}
+        if not ocr_missing:
+            m["extract_version"] = EXTRACT_VERSION
+            m.pop("reread_put_off", None)       # a later try that pdfium answered
+        atomic.write_text(os.path.join(ddir, "meta.json"), json.dumps(m, ensure_ascii=False, indent=2))
+    return total
 
 
 def _read_meta_at(ddir):
@@ -1302,6 +2072,7 @@ def ingest(p, title=None, with_tree=True, task_id=None, workspace=None):
         if (_read_meta_at(existing) or {}).get("sha256") != sha:
             raise ValueError(f"Document ID collision: {doc_id}")
         count = _link(existing, p, task_id)
+        count = _reread(existing, p, count)
         # Without this, installing the pageindex extra repairs nothing: every document already
         # in the corpus stays outline-less forever, because re-ingest used to stop at the link.
         #
@@ -1336,6 +2107,8 @@ def ingest(p, title=None, with_tree=True, task_id=None, workspace=None):
     pages = extract_pages(p, meta=extracted)
     if not _has_text_layer(pages):
         raise _no_text_error(p, pages, extracted.pop("ocr_error", None))
+    extracted.pop("ocr_error", None)        # the pages it cost are in unread_pages, with the reason
+    extracted.pop("visuals_unread", None)   # only a re-read asks it
     tree_wanted = with_tree and len(pages) >= TREE_MIN_PAGES
     tree_reason = {}
     tree = _outline_for(p, os.path.splitext(p)[1].lower(), pages, tree_reason) if tree_wanted else None
@@ -1358,7 +2131,7 @@ def ingest(p, title=None, with_tree=True, task_id=None, workspace=None):
         attempted = ({"tree_attempted_version": TREE_ATTEMPT_VERSION}
                      if tree_reason.get("tree") == "none_found" else {})
         meta = {"doc_id": doc_id, "title": title or source_title(p) or os.path.basename(p),
-                "orig_path": p, "paths": [p], **attempted,
+                "orig_path": p, "paths": [p], **attempted, "extract_version": EXTRACT_VERSION,
                 "sha256": sha, "pages": len(pages), "task_id": task_id,
                 "task_ids": [task_id] if task_id else [], "added_at": int(time.time()),
                 **extracted}
@@ -1582,6 +2355,14 @@ def _folded_spans(text, keep_break_hyphens=False):
     return "".join(folded), spans
 
 
+@functools.lru_cache(maxsize=4096)
+def _normalized_page(text, keep):
+    """A page as quotations are matched against it, worked out once: a run's every unfound
+    quotation read and normalised every page of its document again -- half a minute for 200 of
+    them in an 800-page book, on the event loop (0.18.10 sweep)."""
+    return normalize_for_quote_match(text, keep_break_hyphens=keep)
+
+
 def _locate(text, needle):
     """Return the ``(start, end)`` slice of the raw ``text`` holding an already normalized
     ``needle``, or None. Callers get raw offsets: what is stored and shown is always the page's
@@ -1593,7 +2374,7 @@ def _locate(text, needle):
     wins when it matches, keeping today's matches and offsets unchanged."""
     readings = (False, True) if _HYPHEN_BREAK.search(text) else (False,)
     for keep in readings:
-        if needle not in normalize_for_quote_match(text, keep_break_hyphens=keep):
+        if needle not in _normalized_page(text, keep):
             continue           # cheap reject: one C call per page, the span walk runs only on a hit
         folded, spans = _folded_spans(text, keep_break_hyphens=keep)
         pos = folded.find(needle)
@@ -1616,15 +2397,37 @@ def search_literal(q, limit=10, doc_id=None, workspace=None):
     targets = [doc_id] if doc_id else [m["doc_id"] for m in docs(workspace)]
     hits = []
     for did in targets:
+        labels = None
         for page, text in _iter_pages(did, workspace=workspace):
             span = _locate(text, needle)
             if span:
                 pos, end = span
                 snip = text[max(0, pos - 12):pos] + "<<" + text[pos:end] + ">>" + text[end:end + 12]
-                hits.append({"doc_id": did, "page": page, "s": snip.replace("\n", " ")})
+                if labels is None:
+                    labels = page_labels(did, workspace=workspace)[0]
+                hits.append({"doc_id": did, "page": page, "printed": labels.get(page, ""),
+                             "s": snip.replace("\n", " ")})
                 if len(hits) >= limit:
                     return hits
     return hits
+
+
+def _pages_holding(doc_id, workspace, needle):
+    """The pages whose normalised text holds ``needle`` (either reading of a line-break hyphen)."""
+    ddir = resolve_doc(doc_id, workspace=workspace)
+    try:
+        stamp = os.stat(os.path.join(ddir, "meta.json")).st_mtime_ns if ddir else None
+    except OSError:
+        stamp = None
+    return {pg for pg, readings in _normalized_doc(doc_id, workspace, stamp) if any(needle in r for r in readings)}
+
+
+@functools.lru_cache(maxsize=8)
+def _normalized_doc(doc_id, workspace, _stamp):
+    """``(page, (its normalised readings))`` for every page of a document, at one index version."""
+    return tuple((pg, tuple(_normalized_page(text, keep) for keep in
+                            ((False, True) if _HYPHEN_BREAK.search(text) else (False,))))
+                 for pg, text in _iter_pages(doc_id, workspace=workspace))
 
 
 def verify_quote(doc_id, quote, page=None, workspace=None):
@@ -1634,13 +2437,69 @@ def verify_quote(doc_id, quote, page=None, workspace=None):
     needle = normalize_for_quote_match(quote)
     if not needle:
         return None
-    for pg, text in _iter_pages(doc_id, lo=page, hi=page, workspace=workspace):
+    candidates = None
+    if page is None:
+        # The whole document: pages that cannot hold it are set aside on its normalised text,
+        # read once per version of the index, instead of reading and folding every page per quotation.
+        candidates = _pages_holding(doc_id, workspace, needle)
+        if not candidates:
+            return None
+    lo, hi = (page, page) if candidates is None else (min(candidates), max(candidates))
+    for pg, text in _iter_pages(doc_id, lo=lo, hi=hi, workspace=workspace):
+        if candidates is not None and pg not in candidates:
+            continue
         span = _locate(text, needle)
         if not span:
             continue
         real = span[0]
-        return {"page": pg, "offset": real, "claim_hash": claim_hash(doc_id, pg, real, quote)}
+        labels, where = page_labels(doc_id, workspace=workspace)
+        return {"page": pg, "offset": real, "claim_hash": claim_hash(doc_id, pg, real, quote),
+                "printed": labels.get(pg, ""), "printed_from": where if pg in labels else None}
     return None
+
+
+def _across_page_break(doc_id, quote, page, workspace):
+    """A quotation that begins on the cited ``page`` and runs onto the next: the two pages read as
+    one text (0.18.9 sweep: it was marked "not found" and listed as not where it was cited). A
+    running head or folio printed between the two pages still breaks it -- a locator, not a verdict."""
+    needle = normalize_for_quote_match(quote)
+    if page is None or not needle:
+        return None
+    pages = list(_iter_pages(doc_id, lo=page, hi=page + 1, workspace=workspace))
+    if len(pages) != 2:
+        return None
+    (first, head), (_second, tail) = pages
+    span = _locate(head + "\n" + tail, needle)
+    if not span or span[0] >= len(head):
+        return None
+    labels, where = page_labels(doc_id, workspace=workspace)
+    return {"page": first, "offset": span[0], "claim_hash": claim_hash(doc_id, first, span[0], quote),
+            "printed": labels.get(first, ""), "printed_from": where if first in labels else None,
+            "continues_on": page + 1}
+
+
+def locate_quote(doc_id, quote, page=None, workspace=None):
+    """Where a quotation cited on ``page`` actually is: ``{"status": ...}`` with ``status`` one of
+    ``"on_page"`` (where it was cited, or anywhere when no page was given), ``"elsewhere"`` (not
+    on the cited page; ``page`` says where it is), ``"not_found"``, or ``"no_document"``.
+
+    A locator, never a verdict (prompt.QUOTATION_LOCATOR_GUIDELINE): OCR and typography make
+    a true quotation miss. What it rules out is the quiet case GitHub issue #9 found, where a
+    quotation matched somewhere in a book and the page cited for it was never compared.
+    """
+    if not resolve_doc(doc_id, workspace=workspace):
+        return {"status": "no_document", "cited_page": page}
+    found = verify_quote(doc_id, quote, page=page, workspace=workspace)
+    if found:
+        return {"status": "on_page", "cited_page": page, **found}
+    found = _across_page_break(doc_id, quote, page, workspace)
+    if found:
+        return {"status": "on_page", "cited_page": page, **found}
+    if page is not None:
+        found = verify_quote(doc_id, quote, workspace=workspace)
+        if found:
+            return {"status": "elsewhere", "cited_page": page, **found}
+    return {"status": "not_found", "cited_page": page}
 
 
 def tree_outline(doc_id, max_nodes=120, workspace=None):
@@ -1684,6 +2543,12 @@ def node_pages(doc_id, node_id, workspace=None):
     return found[0] if found and found[0][0] else None
 
 
+def pages_have_text(doc_id, start, end, workspace=None):
+    """Whether any page from ``start`` to ``end`` carries text. ``read_pages`` is never empty --
+    each page has its ``--- pN ---`` line -- so it cannot answer this itself."""
+    return any(text.strip() for _page, text in _iter_pages(doc_id, lo=start, hi=end, workspace=workspace))
+
+
 def read_pages(doc_id, start, end, max_chars=12000, offset=0, workspace=None):
     """The pages' text as one window: ``offset`` characters in, ``max_chars`` long, with a note
     on how to continue when there is more -- so a single page longer than the window is read
@@ -1691,8 +2556,10 @@ def read_pages(doc_id, start, end, max_chars=12000, offset=0, workspace=None):
     offset = max(0, int(offset or 0))
     stop = offset + max_chars
     pieces, seen, more = [], 0, False
+    labels, _where = page_labels(doc_id, workspace=workspace)
     for page, t in _iter_pages(doc_id, lo=start, hi=end, workspace=workspace):
-        chunk = f"\n--- p{page} ---\n{t}"
+        head = f"--- p{page} (printed p. {labels[page]}) ---" if page in labels else f"--- p{page} ---"
+        chunk = f"\n{head}\n{t}" if t.strip() else f"\n{head} (no text on this page)\n"
         if seen + len(chunk) > offset:
             pieces.append(chunk[max(0, offset - seen):stop - seen])
         seen += len(chunk)

@@ -12,8 +12,9 @@ MATERIAL_REUSE_GUIDELINE = (
 
 QUOTATION_LOCATOR_GUIDELINE = (
     "When available, doc_verify is an optional literal-text locator, not a citation gate or a test "
-    "of support for a claim. A missing match may reflect extraction or typography; assess the "
-    "quotation and argument by reading the source in context."
+    "of support for a claim. Give it the page you cite, so a quotation that is on another page is "
+    "caught. A missing match may reflect extraction or typography; assess the quotation and "
+    "argument by reading the source in context."
 )
 
 WEB_EVIDENCE_GUIDELINE = (

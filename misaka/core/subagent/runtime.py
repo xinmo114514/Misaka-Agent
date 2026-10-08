@@ -49,7 +49,6 @@ from misaka.utils.async_lifecycle import run_in_thread, settle, settle_thread_ca
 from misaka.utils.values import read_field
 
 TERMINAL_STATUSES = frozenset({"completed", "failed", "killed"})
-BUDGET_HEARTBEAT_SECONDS = 60
 
 
 def turn_outcome(stop_requested, error, error_message, stop_reason, background):
@@ -342,76 +341,6 @@ def finalize_messages(
         "totalToolUseCount": tool_uses,
         "usage": usage,
     }
-
-
-def _usage_ledger_messages(task: AgentTask) -> list[dict[str, Any]]:
-    """Normalize every model call in one agent turn for the shared budget."""
-    out: list[dict[str, Any]] = []
-    for item in task.messages:
-        if not _is_assistant(item):
-            continue
-        usage = read_field(_message(item), "usage")
-        if usage is None:
-            continue
-        normalized = dict(usage) if isinstance(usage, Mapping) else {
-            key: read_field(usage, key)
-            for key in (
-                "input",
-                "output",
-                "cacheRead",
-                "cacheWrite",
-                "input_tokens",
-                "output_tokens",
-                "cache_read_input_tokens",
-                "cache_creation_input_tokens",
-                "totalTokens",
-            )
-            if read_field(usage, key) is not None
-        }
-        normalized["totalTokens"] = _usage_tokens(usage)
-        out.append({"role": "assistant", "usage": normalized})
-    if not out and isinstance(task.result, Mapping):
-        usage = task.result.get("usage")
-        if usage is not None:
-            normalized = dict(usage) if isinstance(usage, Mapping) else {}
-            normalized["totalTokens"] = _usage_tokens(usage)
-            out.append({"role": "assistant", "usage": normalized})
-    return out
-
-
-def _write_usage_sink(context: RoleContext, task: AgentTask) -> bool:
-    messages = _usage_ledger_messages(task)
-    if (
-        not context.usage_db
-        or not context.usage_task_id
-        or context.usage_generation is None
-    ):
-        return False
-    from misaka.core.platform import budget
-
-    message_total = sum(
-        int(message.get("usage", {}).get("totalTokens") or 0)
-        for message in messages
-    )
-    reported = getattr(task, "_budget_usage", None)
-    if reported is not None:
-        total = max(message_total, int(reported))
-    elif getattr(task, "_budget_reservation", None):
-        # A killed child may vanish before its final usage frame.  Charge the
-        # reserved slice rather than releasing an unknowable provider spend.
-        total = max(message_total, int(getattr(task, "_budget_limit", 0) or 0))
-    else:
-        total = message_total
-    committed = budget.commit_agent_usage_path(
-        context.usage_db,
-        getattr(task, "_budget_reservation", None),
-        context.usage_task_id,
-        context.usage_generation,
-        total,
-    )
-    if committed and hasattr(task, "_budget_reservation"):
-        task._budget_reservation = None
-    return committed
 
 
 
@@ -903,10 +832,6 @@ class AgentTask:
     _state_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
     _persist_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
     _stop_requested: bool = field(default=False, repr=False)
-    _budget_reservation: str | None = field(default=None, repr=False)
-    _budget_heartbeat: asyncio.Task[None] | None = field(default=None, repr=False)
-    _budget_limit: int = field(default=0, repr=False)
-    _budget_usage: int | None = field(default=None, repr=False)
     hook_environ: dict[str, str] = field(default_factory=dict, repr=False)
     _stop_epoch: int = field(default=0, repr=False)
     _worktree_lock: Any = field(default=None, repr=False)
@@ -1649,7 +1574,7 @@ class SubagentManager:
                 if task._stop_requested:
                     await self._finish(task, "killed", "Agent task was stopped", notify)
                     return
-                await self._reserve_budget(task)
+                await self._admit(task)
                 await self._run_turn(task, prompt, notify=notify)
         except asyncio.CancelledError:
             task._stop_requested = True
@@ -1688,75 +1613,31 @@ class SubagentManager:
                 status, detail = "failed", str(error)
             await self._finish(task, status, detail, notify)
 
-    async def _reserve_budget(self, task: AgentTask) -> None:
+    def _billed_to(self):
+        """``(db, task id, generation, claim lock, cap)`` an agent started now is billed to, or
+        None: the role's own (a card's environment), else the turn's -- a window research turn
+        bills through an async-local ledger its environment never held, and the agents it started
+        ran uncapped and unrecorded (0.18.9 sweep). Cap None: settings.json, read at each request."""
         context = self.role_context
-        if (
-            task._budget_reservation
-            or not context.usage_db
-            or not context.usage_task_id
-            or context.usage_generation is None
-        ):
-            return
+        if context.usage_db and context.usage_task_id and context.usage_generation is not None:
+            return (context.usage_db, context.usage_task_id, context.usage_generation,
+                    context.usage_claim_lock, context.usage_token_cap)
         from misaka.core.platform import budget
+        current = budget.ledger()
+        if current is None:
+            return None
+        path, task_id, generation, _cap = current
+        return path, task_id, int(generation) if str(generation).isdigit() else 1, None, None
 
-        reading, cancelled = await settle_thread_call(
-            budget.reserve_agent_path,
-            context.usage_db,
-            context.usage_token_cap,
-            context.usage_task_id,
-            context.usage_generation,
-            600,
-        )
-        if cancelled is not None:
-            if reading.get("token"):
-                await settle_thread_call(
-                    budget.release_agent_path,
-                    context.usage_db,
-                    reading["token"],
-                )
-            raise cancelled
-        if not reading.get("allowed"):
-            raise RuntimeError(
-                "Shared token budget exhausted; nested Agent launch rejected "
-                f"({reading.get('used', 0)} used, {reading.get('reserved', 0)} reserved, "
-                f"cap {reading.get('cap', 0)})"
-            )
-        task._budget_reservation = reading.get("token")
-        task._budget_limit = int(reading.get("tokens") or 0)
-        if task._budget_reservation:
-            task._budget_heartbeat = asyncio.create_task(
-                self._budget_heartbeat_loop(task)
-            )
-
-    async def _budget_heartbeat_loop(self, task: AgentTask) -> None:
-        from misaka.core.platform import budget
-
-        while task._budget_reservation and self.role_context.usage_db:
-            await asyncio.sleep(BUDGET_HEARTBEAT_SECONDS)
-            token = task._budget_reservation
-            if not token:
-                return
-            try:
-                alive = await asyncio.to_thread(
-                    budget.touch_agent_path,
-                    self.role_context.usage_db,
-                    token,
-                    600,
-                )
-            except Exception:  # noqa: BLE001, S112 - terminal result already exists
-                # Keep retrying while the existing 10-minute lease is
-                # valid; one transient busy/IO error must not fail open.
-                continue
-            if not alive:
-                # The lease is the right to run: losing it stops the child, not just this loop.
-                task.error = task.error or "Shared token budget lease lost; the agent was stopped"
-                task._stop_requested = True
-                task._budget_reservation = None
-                if task.process is None and task.runner is not None:
-                    task.runner.cancel()
-                elif task.process is not None:
-                    await task.stop()
-                return
+    async def _admit(self, task: AgentTask) -> None:
+        """Refuse to start an agent once the research run it is billed to has spent its cap; what
+        it then spends is leased and recorded request by request (``metering``), in this process
+        or the child's."""
+        from misaka.core.network import worker
+        billed = self._billed_to()
+        over = billed is not None and await asyncio.to_thread(worker.over_cap, billed[0], billed[1], billed[4])
+        if over:
+            raise RuntimeError(f"Nested Agent launch rejected: {worker.budget_cap_reason()}")
 
     @staticmethod
     def _async_hook_request_path(
@@ -2069,7 +1950,6 @@ class SubagentManager:
             task.end_time_ms = 0
             task.messages = []
             task.stderr.clear()
-            task._budget_usage = None
         await task.persist()
 
         flags = await self._child_flags(task)
@@ -2111,10 +1991,6 @@ class SubagentManager:
                 "MISAKA_PROJECT_TRUST": "1" if task.project_trusted else "0",
             }
         )
-        if task._budget_limit:
-            env["MISAKA_TURN_TOKEN_LIMIT"] = str(task._budget_limit)
-        else:
-            env.pop("MISAKA_TURN_TOKEN_LIMIT", None)
         if self.role_context.profile_dir:
             env["MISAKA_PROFILE_DIR"] = self.role_context.profile_dir
         else:
@@ -2154,26 +2030,22 @@ class SubagentManager:
             env["MISAKA_SUBAGENT_INHERIT_ALL_TOOLS"] = "1"
         else:
             env.pop("MISAKA_SUBAGENT_INHERIT_ALL_TOOLS", None)
-        if (
-            self.role_context.usage_db
-            and self.role_context.usage_task_id
-            and self.role_context.usage_generation is not None
-        ):
+        billed = self._billed_to()
+        if billed is not None:
+            usage_db, usage_task_id, usage_generation, claim_lock, token_cap = billed
             env.update(
                 {
-                    "MISAKA_USAGE_DB": self.role_context.usage_db,
-                    "MISAKA_USAGE_TASK_ID": self.role_context.usage_task_id,
-                    "MISAKA_USAGE_GENERATION": str(
-                        self.role_context.usage_generation
-                    ),
+                    "MISAKA_USAGE_DB": str(usage_db),
+                    "MISAKA_USAGE_TASK_ID": str(usage_task_id),
+                    "MISAKA_USAGE_GENERATION": str(usage_generation),
                 }
             )
-            if self.role_context.usage_claim_lock:
-                env["MISAKA_USAGE_CLAIM_LOCK"] = self.role_context.usage_claim_lock
+            if claim_lock:
+                env["MISAKA_USAGE_CLAIM_LOCK"] = claim_lock
             else:
                 env.pop("MISAKA_USAGE_CLAIM_LOCK", None)
-            if self.role_context.usage_token_cap is not None:
-                env["MISAKA_USAGE_TOKEN_CAP"] = str(self.role_context.usage_token_cap)
+            if token_cap is not None:
+                env["MISAKA_USAGE_TOKEN_CAP"] = str(token_cap)
             else:
                 env.pop("MISAKA_USAGE_TOKEN_CAP", None)
         else:
@@ -2443,12 +2315,6 @@ class SubagentManager:
                     if child_turn_id is None or event.get("turnId") != child_turn_id:
                         raise RuntimeError("sub-agent child returned an unexpected turn result")
                     task.messages = await self._read_turn_messages(task, event)
-                    raw_budget_usage = event.get("budgetUsage")
-                    task._budget_usage = (
-                        max(0, int(raw_budget_usage))
-                        if isinstance(raw_budget_usage, (int, float))
-                        else None
-                    )
                     task.initial_prompt_sent = True
                     if event.get("error"):
                         task.error = str(event["error"])
@@ -3071,37 +2937,6 @@ class SubagentManager:
                 pass
             except Exception:  # noqa: BLE001, S110 - the terminal state is already set; a failed persist is retried on the next transition
                 pass
-            def commit_usage() -> None:
-                context = self.role_context
-                if (
-                    not context.usage_db
-                    or not context.usage_task_id
-                    or context.usage_generation is None
-                ):
-                    return
-                delay = 0.05
-                for _attempt in range(8):   # Bounded retries if the ledger keeps failing: better to miss one entry than to hang completion.
-                    try:
-                        committed = _write_usage_sink(self.role_context, task)
-                    except Exception:  # noqa: BLE001 - never fail open on ledger IO
-                        committed = False
-                    if committed:
-                        return
-                    time.sleep(delay)
-                    delay = min(5.0, delay * 2)
-                task.error = task.error or "usage ledger unavailable; usage not committed"
-
-            # A terminal result is not continuable until its reservation and
-            # actual/conservative usage have been atomically settled.  Shield
-            # the whole blocking ledger retry, including loop shutdown and
-            # repeated cancellation, while its heartbeat keeps the lease alive.
-            await settle_thread_call(commit_usage)
-            heartbeat = task._budget_heartbeat
-            task._budget_heartbeat = None
-            task._budget_limit = 0
-            if heartbeat is not None:
-                heartbeat.cancel()
-                await asyncio.gather(heartbeat, return_exceptions=True)
             if task.id in self._async_hook_jobs_by_agent:
                 # An async hook may still need the isolated filesystem.  Its
                 # completion callback performs cleanup after this turn settles.

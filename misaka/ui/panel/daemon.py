@@ -1808,13 +1808,26 @@ class Daemon:
             raise ValueError(f"Card not found: {task_id}")
         if row["status"] != "ready":
             raise ValueError(f"Card {task_id} is not ready (current status: {row['status']}).")
+        from misaka.core.network import worker
+        if worker.over_cap(_expand(CFG["db"]), task_id, CFG["token_cap"]):
+            # The research run's cap is spent: the card is not started and stays ready.
+            raise ValueError(f"Card {task_id} was not started: {worker.budget_cap_reason()}.")
         # A card requeued while its last window is still open runs in that window again.
         reuse = self._card_pane_to_reuse(task_id)
         from misaka.core.network.ally import presets
         if row["assignee"] not in presets.names():     # an ally's runner says itself why it cannot start
             profile = os.path.join(_expand(CFG["profiles_root"]), row["assignee"])
             if not os.path.isdir(profile):
-                raise ValueError(f"Sister {row['assignee']} is not in the roster.")
+                # Failed for good, as headless dispatch fails it (a configuration fault): left
+                # ready, the card was asked for again on every poll and its research never ended.
+                reason = f"Sister {row['assignee']} is not in the roster."
+                generation = int(row["generation"])
+                lock = f"net:{socket.gethostname()}:{os.getpid()}:{secrets.token_hex(4)}"
+                if db.claim(con, task_id, lock, ttl_seconds=60, generation=generation, pid=os.getpid()):
+                    db.add_event(con, task_id, "failed", {"reason": reason}, generation=generation, claim_lock=lock)
+                    db.mark_failed(con, task_id, generation=generation, claim_lock=lock,
+                                   failure_kind="configuration", reason=reason)
+                raise ValueError(reason)
         generation = int(row["generation"])
         lock = f"net:{socket.gethostname()}:{os.getpid()}:{secrets.token_hex(4)}"
         host_cap, assignee_cap = admission.limits()
@@ -1848,7 +1861,7 @@ class Daemon:
                        "MISAKA_USAGE_TASK_ID": task_id,
                        "MISAKA_USAGE_GENERATION": str(generation),
                        "MISAKA_USAGE_CLAIM_LOCK": lock,
-                       "MISAKA_USAGE_TOKEN_CAP": str(int(CFG["token_cap"] or 0))}
+                       "MISAKA_USAGE_TOKEN_CAP": ""}          # settings.json, read at each request
             if reuse is not None and self.panes.get(reuse.id) is reuse:
                 pane = reuse
                 await self._replace_program(pane, argv, cwd=workspace, env=hosting, title=title)
@@ -1933,6 +1946,10 @@ class Daemon:
                             tail,
                         ).strip()
                         reason = f"{row['assignee']}'s card process exited with code {exit_code}"
+                        from misaka.utils import loop_watchdog
+                        stall = loop_watchdog.report(f"card-{pane.card}", since=pane.started or pane.started_at)
+                        if stall:
+                            reason += f"; {stall}"
                         if tail:
                             reason += f": {tail[-500:]}"
                         if db.add_event(
@@ -2501,7 +2518,9 @@ def main():
     home.ensure()
     configure_logging()      # the daemon's warnings belong in the log file, not net.sock.log (B6)
     env_file.load()          # panes inherit it; a panel started outside a shell still has its keys
-    asyncio.run(Daemon().run())
+    from misaka.utils import loop_watchdog
+    loop_watchdog.configure("panel-daemon", exit_on_stall=False)   # its exit would take every pane with it
+    asyncio.run(loop_watchdog.watched(Daemon().run()))
 
 
 if __name__ == "__main__":

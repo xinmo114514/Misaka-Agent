@@ -27,6 +27,8 @@ def install(*, check_settings: bool = True) -> None:
         raise SystemExit("settings.json has values MISAKA cannot use; fix or remove them:\n  "
                          + "\n  ".join(errors))
     wiring.bundled = extensions.discover
+    from misaka.core.platform import metering
+    metering.install()          # every model request of a metered session is leased and recorded
 
 
 __all__ = ["install"]

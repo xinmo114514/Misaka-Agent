@@ -1,5 +1,4 @@
 """Execute durable Sister task cards."""
-import asyncio
 import contextlib
 import json
 import logging
@@ -9,6 +8,7 @@ from pathlib import Path, PurePosixPath, PureWindowsPath
 
 from misaka.config import profiles
 from misaka.core.platform import tasks as task_store
+from misaka.core.platform.prompt_guard import untrusted
 from misaka.core.platform.session import run_coro, run_session
 from misaka.core.platform.vocabulary import MANAGEMENT_TOOLS
 from misaka.core.skills import sandbox as skill_sandbox
@@ -17,196 +17,26 @@ from misaka.utils.paths import posix_relpath
 logger = logging.getLogger(__name__)
 
 MAX_ARTIFACT_PATH_CHARS = 1_024
-RESERVATION_HEARTBEAT_SECONDS = 300
 
 
-def _reserve_usage(usage_db, usage_task_id, usage_generation, usage_token_cap, timeout):
-    if not usage_db or not usage_task_id or usage_generation is None:
-        return {"allowed": True, "token": None}
+def over_cap(usage_db, task_id, cap):
+    """Whether the research run ``task_id`` belongs to has spent ``cap``: a card is not started then."""
     from misaka.core.platform import budget
-
-    return budget.reserve_agent_path(
-        str(usage_db),
-        usage_token_cap,
-        str(usage_task_id),
-        int(usage_generation),
-        ttl_seconds=600 if timeout is None else max(60, int(timeout) + 60),
-    )
+    cap = budget.default_cap() if cap is None else int(cap or 0)
+    if not usage_db or not task_id or not cap:
+        return False
+    return budget.status_path(str(usage_db), cap, task_id=str(task_id))["mode"] == "stop"
 
 
-def _release_usage(usage_db, reading):
-    token = reading.get("token") if isinstance(reading, dict) else None
-    if token and usage_db:
-        from misaka.core.platform import budget
-
-        budget.release_agent_path(str(usage_db), token)
+def budget_cap_reason():
+    from misaka.core.platform import budget
+    return f"{budget.EXHAUSTED_MESSAGE}; the card stays ready"
 
 
-async def _run_with_reservation(coro, usage_db, reservation):
-    """Keep an unbounded card run's finite budget lease alive."""
-    token = reservation.get("token") if isinstance(reservation, dict) else None
-    if not token or not usage_db:
-        return await coro
-    task = asyncio.create_task(coro)
-    try:
-        while True:
-            done, _pending = await asyncio.wait(
-                {task}, timeout=RESERVATION_HEARTBEAT_SECONDS
-            )
-            if done:
-                return await task
-            from misaka.core.platform import budget
-
-            alive = await asyncio.to_thread(
-                budget.touch_agent_path, str(usage_db), token, 600
-            )
-            if alive:
-                continue
-            task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
-            return {
-                "text": None,
-                "timed_out": False,
-                "error": "shared token budget lease lost",
-                "budget_usage": None,
-            }
-
-    finally:
-        if not task.done():
-            task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
-
-
-class _UsageRecorder:
-    """Account a root worker turn before releasing its parallel reservation."""
-
-    def __init__(self, callback, usage_db, task_id, generation, reservation):
-        self.callback = callback
-        self.usage_db = usage_db
-        self.task_id = task_id
-        self.generation = generation
-        self.reservation = reservation
-        self.fallback_tokens = 0
-        self.observed_tokens = 0
-        self.delivered_tokens = 0
-
-    @staticmethod
-    def _tokens(line):
-        try:
-            event = json.loads(line)
-        except (TypeError, ValueError):
-            return 0
-        if event.get("type") != "agent_end":
-            return 0
-        total = 0
-        for message in event.get("messages") or []:
-            usage = message.get("usage") if isinstance(message, dict) else None
-            if not isinstance(usage, dict):
-                continue
-            if isinstance(usage.get("totalTokens"), int):
-                total += usage["totalTokens"]
-            else:
-                total += sum(
-                    int(usage.get(key) or 0)
-                    for key in (
-                        "input",
-                        "output",
-                        "cacheRead",
-                        "cacheWrite",
-                        "input_tokens",
-                        "output_tokens",
-                        "cache_read_input_tokens",
-                        "cache_creation_input_tokens",
-                    )
-                )
-        return total
-
-    def __call__(self, line):
-        total = self._tokens(line)
-        self.observed_tokens += total
-        delivered = False
-        if self.callback:
-            try:
-                delivered = self.callback(line) is True
-            except Exception:  # noqa: BLE001 - accounting fallback must survive observer failure
-                delivered = False
-        if total and not delivered:
-            self.fallback_tokens += total
-        elif total:
-            self.delivered_tokens += total
-
-    def settle(self, accounted_tokens=None):
-        if not self.usage_db or not self.task_id or self.generation is None:
-            return
-        from misaka.core.platform import budget
-
-        token = self.reservation.get("token") if self.reservation else None
-        target = max(
-            self.observed_tokens,
-            max(0, int(accounted_tokens)) if accounted_tokens is not None else 0,
-        )
-        # Successfully delivered harn_event usage is already in the same
-        # ledger.  Commit only the missing compaction/fallback delta while
-        # atomically releasing the reservation.
-        additional = max(0, target - self.delivered_tokens)
-        if additional:
-            budget.commit_agent_usage_path(
-                str(self.usage_db),
-                token,
-                str(self.task_id),
-                int(self.generation),
-                additional,
-            )
-        else:
-            _release_usage(self.usage_db, self.reservation)
-
-
-def install_card_usage(session, *, usage_db, task_id, generation):
-    """Record a pane's completed requests, not historical messages or its exit.
-
-    Only card-shell opts in: headless workers and managed children already meter
-    their calls. Observe session events without wrapping the provider's stream.
-    """
-    from misaka.core.platform.session import event_line
-    from misaka.utils.values import read_field
-
-    recorder = _UsageRecorder(None, usage_db, task_id, generation, None)
-
-    def flush():
-        nonlocal recorder
-        if not recorder.observed_tokens:
-            return
-        try:
-            recorder.settle()
-        except Exception:  # a receipt failure must not discard the model's response
-            logger.warning("Card %s generation %s: %s tokens remain unrecorded",
-                           task_id, generation, recorder.observed_tokens, exc_info=True)
-        else:
-            recorder = _UsageRecorder(None, usage_db, task_id, generation, None)
-
-    def record(event):
-        kind = read_field(event, "type")
-        if kind == "message_end":
-            message = read_field(event, "message")
-            if read_field(message, "usage") is None:
-                return
-        elif kind == "compaction_end":
-            usage = read_field(read_field(event, "result"), "usage")
-            if usage is None:
-                return
-            message = {"usage": usage}
-        else:
-            return
-        recorder(event_line({"type": "agent_end", "messages": [message]}))
-        flush()
-
-    unsubscribe = session.subscribe(record)
-
-    def close():
-        unsubscribe()
-        flush()
-
-    return close
+def stopped_at_cap(error):
+    """Whether a run ended because a request did not fit under ``research.token_cap``."""
+    from misaka.core.platform import budget
+    return budget.EXHAUSTED_MESSAGE in str(error or "")
 
 
 COMPLETION_INSTRUCTIONS = """
@@ -289,19 +119,32 @@ def declare_completion(con, row, summary):
     """Record that this attempt's work is done. The host submits it when the turn ends: a
     Sister's session at ``agent_settled``, an ally's runner after its ACP turn. A board event,
     so a declaration made in another process (an ally's MCP bridge) reaches the host too."""
-    if not task_store.add_event(con, row["id"], COMPLETION_EVENT, {"summary": summary},
+    if not task_store.add_event(con, row["id"], COMPLETION_EVENT, {"summary": summary, "claim_lock": row["claim_lock"]},
                                 generation=row["generation"], claim_lock=row["claim_lock"]):
         raise ValueError("Card ownership changed before its completion was recorded.")
 
 
-def declared_completion(con, row):
-    """The summary this attempt declared with ``misaka_card_complete``, or None."""
-    raw = task_store.latest_payload(con, row["id"], COMPLETION_EVENT, generation=row["generation"])
+def attempt_payload(con, row, kind):
+    """What this attempt of the card recorded under ``kind``, or None. A card sent back to ready --
+    a retry, a dead worker reclaimed, a reviewer asking for changes -- keeps its generation, so an
+    event of the generation can be an earlier attempt's: only one stamped with this attempt's claim
+    lock counts. Before, the next attempt submitted with the last one's summary (0.18.10 sweep)."""
+    raw = task_store.latest_payload(con, row["id"], kind, generation=row["generation"])
     try:
         value = json.loads(raw) if raw else None
     except (TypeError, ValueError):
         return None
-    return str(value.get("summary") or "") if isinstance(value, dict) else None
+    if not isinstance(value, dict):
+        return None
+    # A settled card has no claim left: its redeclaration (a red team revising its critique after a
+    # note) reads what its last attempt recorded, as before.
+    return value if row["claim_lock"] is None or value.get("claim_lock") == row["claim_lock"] else None
+
+
+def declared_completion(con, row):
+    """The summary this attempt declared with ``misaka_card_complete``, or None."""
+    value = attempt_payload(con, row, COMPLETION_EVENT)
+    return str(value.get("summary") or "") if value is not None else None
 
 
 def missing_deliverable(task):
@@ -372,6 +215,7 @@ def card_handoffs(con, task):
     return out
 
 
+_MATERIAL_TITLE_CHARS = 200    # an HTML <title> is cut there already; a downloaded .md's front matter is not
 _MATERIALS_LIMIT = 40   # lines of the "already downloaded" list; the rest is counted, not listed
 
 
@@ -423,13 +267,17 @@ def materials_on_hand(workspace):
             if url:
                 line += f" ← {url}"
             if provenance.get("title"):
-                line += f' "{provenance["title"]}"'
+                title = " ".join(str(provenance["title"]).split())
+                line += f' "{title[:_MATERIAL_TITLE_CHARS]}"'
         doc_id = doc_ids.get(os.path.realpath(path))
         if doc_id:
             line += f" (doc {doc_id})"
         lines.append(line)
     if len(files) > _MATERIALS_LIMIT:
         lines.append(f"- … and {len(files) - _MATERIALS_LIMIT} more under `{_download_dir_name()}/`")
+    # URLs and titles come from the pages themselves: web_fetch fences a title, and reading it
+    # back out of the saved file's front matter must not unfence it (issue #10 audit, M5).
+    lines = [untrusted("materials", "\n".join(lines))]
     lines.append("This material list is a snapshot. Reuse relevant items; check the current workspace "
                  "or an available document index when you need to discover additional or newer material.")
     return "\n".join(lines)
@@ -669,12 +517,12 @@ def build_submission(con, task, summary):
         "findings": findings,
     }
     # Typed tool data, frozen with the card's completion. Never reopen a model-written JSON file.
-    critique = task_store.latest_payload(con, task["id"], "research_critique", generation=task["generation"])
+    critique = attempt_payload(con, task, "research_critique")
     if critique is not None:
-        submission["issues"] = json.loads(critique)["issues"]
-    divergence = task_store.latest_payload(con, task["id"], "research_divergence", generation=task["generation"])
+        submission["issues"] = critique["issues"]
+    divergence = attempt_payload(con, task, "research_divergence")
     if divergence is not None:
-        submission["alternatives"] = json.loads(divergence)["alternatives"]
+        submission["alternatives"] = divergence["alternatives"]
     if con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='research_run_tasks'").fetchone():
         link = con.execute("SELECT kind FROM research_run_tasks WHERE task_id=?", (task["id"],)).fetchone()
         from misaka.core.research import runs
@@ -812,55 +660,22 @@ def run_card(
         })
         if usage_claim_lock:
             env["MISAKA_USAGE_CLAIM_LOCK"] = str(usage_claim_lock)
-    reservation = _reserve_usage(
-        usage_db,
-        task_id,
-        usage_generation,
-        usage_token_cap,
-        1800,
-    )
-    if not reservation.get("allowed"):
+    if over_cap(usage_db, task_id, usage_token_cap):
         skill_sandbox.cleanup(ro_root)
-        return {
-            "ok": False,
-            "reason": "shared token budget exhausted",
-            "exit_code": 0,
-            "budget_stop": True,
-        }
-    if reservation.get("tokens"):
-        env["MISAKA_TURN_TOKEN_LIMIT"] = str(reservation["tokens"])
-    recorder = _UsageRecorder(
-        on_event, usage_db, task_id, usage_generation, reservation
-    )
+        return {"ok": False, "reason": budget_cap_reason(), "exit_code": 0, "budget_stop": True}
     r = None
     try:
-        r = run_coro(
-            _run_with_reservation(
-                run_session(
-                    flags,
-                    prompt,
-                    workspace,
-                    on_event=recorder,
-                    timeout=None,
-                    assembly=assembly,
-                    env=env,
-                ),
-                usage_db,
-                reservation,
-            )
-        )
+        r = run_coro(run_session(flags, prompt, workspace, on_event=on_event, timeout=None,
+                                 assembly=assembly, env=env))
     finally:
-        recorder.settle(
-            r.get("budget_usage")
-            if isinstance(r, dict)
-            else int(reservation.get("tokens") or 0)
-        )
         skill_sandbox.cleanup(ro_root)          # the read-only copies go with the run, however it ended
 
     row = task_store.get(con, task_id) if con is not None and task_id else None
     if row is not None and row["status"] != "running":
         return {"ok": True, "settled": True, "exit_code": 0}
     reason = r["error"] or "session exited before the card was finalized"
+    if stopped_at_cap(r["error"]):
+        return {"ok": False, "reason": reason, "exit_code": 0, "budget_stop": True}
     return {
         "ok": False,
         "reason": reason,

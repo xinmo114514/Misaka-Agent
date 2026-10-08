@@ -38,7 +38,26 @@ def _event_summary(d, nbytes):
 
 
 def _compact_event(line, cap=4000):
-    """Cap a harness event line at ``cap`` bytes: reduce ``agent_end`` to a token total, anything else to a summary."""
+    """Cap a harness event line at ``cap`` bytes, anything over it reduced to a summary. An
+    ``agent_end`` keeps no usage: every model request is recorded in the ledger by the meter as it
+    ends (``misaka.core.platform.metering``), and a total here would count the turn twice -- old
+    rows that carry one are still counted (``budget.spent``), new ones never do.
+
+    A ``message_update`` is not kept (None): it is one streamed delta of the message its
+    ``message_end`` records whole, and kept, a card wrote a board transaction per token -- 46,000
+    rows, 22 MB for one run (0.18.10 sweep)."""
+    if '"message_update"' in line:
+        try:
+            if json.loads(line).get("type") == "message_update":
+                return None
+        except ValueError:
+            pass
+    if '"agent_end"' in line:
+        try:
+            if json.loads(line).get("type") == "agent_end":
+                return json.dumps({"type": "agent_end"})
+        except ValueError:
+            pass
     if len(line) <= cap:
         return line
     try:
@@ -46,38 +65,6 @@ def _compact_event(line, cap=4000):
     except ValueError:
         return json.dumps({"type": "raw", "truncated_bytes": len(line),
                            "preview": line[:200]}, ensure_ascii=False)
-    if d.get("type") == "agent_end":
-        total = 0
-        for message in d.get("messages") or []:
-            usage = message.get("usage") if isinstance(message, dict) else None
-            if not isinstance(usage, dict):
-                continue
-            if isinstance(usage.get("totalTokens"), int):
-                total += usage["totalTokens"]
-            else:
-                total += sum(
-                    int(usage.get(key) or 0)
-                    for key in (
-                        "input",
-                        "output",
-                        "cacheRead",
-                        "cacheWrite",
-                        "input_tokens",
-                        "output_tokens",
-                        "cache_read_input_tokens",
-                        "cache_creation_input_tokens",
-                    )
-                )
-        # Always valid JSON, bounded regardless of message count or size;
-        # slicing the serialized ledger used to yield invalid JSON.
-        return json.dumps(
-            {
-                "type": "agent_end",
-                "messages": [{"role": "assistant", "usage": {"totalTokens": total}}],
-            },
-            ensure_ascii=False,
-            separators=(",", ":"),
-        )
     return _event_summary(d, len(line))
 
 
@@ -127,10 +114,10 @@ def reconcile(con, cfg, *, task_ids=None, workspace=None):
     process identity is alive; its claim is released under the exact ownership fence, so
     a paused-but-live Last Order keeps the Sister it still owns. A worker is wedged when
     its process is alive but the card has shown no progress for ``HEARTBEAT_STALE_SECONDS``.
-    Only a headless card process is stopped for that: it runs in its own process group under
-    its own lease, whereas a Last Order's or the panel's lease stands for a process that
-    hosts other work and stops its own wedged Sisters itself. ``task_ids`` and ``workspace``
-    narrow the pass.
+    Only a card whose recorded process leads its own process group is stopped for that (a
+    headless worker, a Sister root): a panel card records no group and is never in this branch,
+    and a card under a Last Order's lock (``lo*``) is left to her -- her process hosts other work
+    and stops its own wedged Sisters itself. ``task_ids`` and ``workspace`` narrow the pass.
     """
     import time as _time
 
@@ -164,6 +151,10 @@ def reconcile(con, cfg, *, task_ids=None, workspace=None):
             # A recorded identity is checked against the PID that holds it now, so a reused
             # PID does not read as the original worker.
             continue
+        from misaka.utils import loop_watchdog
+        stall = loop_watchdog.report(f"card-{t['id']}", t["worker_pid"])
+        if stall:
+            reason = f"{reason}; {stall}"
         try:
             finish_abandoned(con, t, reason=reason)
         except Exception as error:  # noqa: BLE001 - one card must not strand the rest
@@ -249,7 +240,7 @@ def run_task(con, t, cfg, *, say=None):
     task["_attachments"] = card_files.attachment_list(run_dir, t["id"], workspace=workspace)
     task["_handoffs"] = worker.card_handoffs(con, t)
     task.update(worker.card_extras(con, t, cfg))
-    bud = budget.status(con, cfg.get("token_cap"))
+    bud = budget.status(con, cfg.get("token_cap"), task_id=t["id"])
     if bud["mode"] == "stop":
         if db.back_to_ready(
             con, t["id"], generation=generation, claim_lock=lock
@@ -270,11 +261,11 @@ def run_task(con, t, cfg, *, say=None):
     try:
         verdict = _run_ally(con, task, generation, lock, usage_db, say) if ally else worker.run_card(
             task, run_dir, profile_dir, cfg["provider"], cfg["default_model"],
-            on_event=lambda line: db.add_event(
+            on_event=lambda line: (event := _compact_event(line)) is not None and db.add_event(
                 con,
                 t["id"],
                 "harn_event",
-                _compact_event(line),
+                event,
                 generation=generation,
                 claim_lock=lock,
             ),
@@ -304,7 +295,7 @@ def run_task(con, t, cfg, *, say=None):
                 con,
                 t["id"],
                 "budget_stop",
-                budget.status(con, cfg.get("token_cap")),
+                budget.status(con, cfg.get("token_cap"), task_id=t["id"]),
                 generation=generation,
             )
     elif verdict.get("settled"):

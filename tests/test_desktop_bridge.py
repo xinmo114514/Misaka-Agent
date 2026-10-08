@@ -653,7 +653,11 @@ async def test_workspace_lookup_does_not_create_bucket_when_new_session_is_cance
 @pytest.mark.asyncio
 async def test_workspace_lookup_uses_cwd_bucket_without_listing_every_history(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     import misaka.cli.desktop_bridge as bridge_mod
-    from misaka.core.session_manager import CURRENT_SESSION_VERSION, SessionManager, encode_cwd
+    from misaka.core.session_manager import (
+        CURRENT_SESSION_VERSION,
+        SessionManager,
+        encode_cwd,
+    )
     workspace = tmp_path / "target"
     workspace.mkdir()
     root = tmp_path / "sessions"
@@ -681,7 +685,11 @@ async def test_workspace_lookup_uses_cwd_bucket_without_listing_every_history(mo
 @pytest.mark.asyncio
 async def test_workspace_existing_history_previews_before_activation(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     import misaka.cli.desktop_bridge as bridge_mod
-    from misaka.core.session_manager import CURRENT_SESSION_VERSION, SessionManager, encode_cwd
+    from misaka.core.session_manager import (
+        CURRENT_SESSION_VERSION,
+        SessionManager,
+        encode_cwd,
+    )
     workspace = tmp_path / "target"
     workspace.mkdir()
     root = tmp_path / "sessions"
@@ -1167,6 +1175,7 @@ def test_bridge_main_opens_a_last_order_session(monkeypatch: pytest.MonkeyPatch,
     no misaka_research_*) and no Last Order persona.
     """
     from types import SimpleNamespace
+
     import misaka.core.platform.session as session_mod
     from misaka.cli import desktop_bridge
 
@@ -1199,6 +1208,7 @@ def test_bridge_main_passes_the_model_to_the_role_setup_once(monkeypatch: pytest
                                                              tmp_path: Path) -> None:
     """A second --model would silently let the last flag win."""
     from types import SimpleNamespace
+
     import misaka.core.platform.session as session_mod
     from misaka.cli import desktop_bridge
 
@@ -1762,9 +1772,10 @@ def test_a_dead_driver_lease_is_not_driving(tmp_path, monkeypatch) -> None:
 @pytest.mark.asyncio
 async def test_research_detail_and_global_activity_commands_keep_workspace_scope(monkeypatch, tmp_path):
     from contextlib import closing
+
+    import misaka.cli.desktop_bridge as bridge_module
     from misaka.core.platform import tasks
     from misaka.core.research import runs
-    import misaka.cli.desktop_bridge as bridge_module
 
     workspace = tmp_path / "project"
     other_workspace = tmp_path / "other"
@@ -1829,9 +1840,10 @@ async def test_normal_conversation_bridge_cannot_start_an_independent_research_r
 async def test_ordinary_session_cannot_compact_a_live_research_root(monkeypatch, tmp_path):
     import sqlite3
     from contextlib import closing
+
+    import misaka.cli.desktop_bridge as bridge_module
     from misaka.core.platform import tasks
     from misaka.core.research import runs
-    import misaka.cli.desktop_bridge as bridge_module
 
     workspace = tmp_path / "project"
     workspace.mkdir()
@@ -1867,9 +1879,10 @@ async def test_ordinary_session_cannot_compact_a_live_research_root(monkeypatch,
 
 def test_session_mutation_guard_detects_active_research_root_and_node_sessions(tmp_path):
     from contextlib import closing
+
+    from misaka.cli.desktop_bridge import session_belongs_to_active_research
     from misaka.core.platform import tasks
     from misaka.core.research import runs
-    from misaka.cli.desktop_bridge import session_belongs_to_active_research
 
     workspace = tmp_path / "project"
     workspace.mkdir()
@@ -1887,3 +1900,24 @@ def test_session_mutation_guard_detects_active_research_root_and_node_sessions(t
         assert session_belongs_to_active_research(con, str(node_path))
         runs.set_state(con, run["id"], status="done")
         assert session_belongs_to_active_research(con, str(root_path)) is False
+
+
+def test_bridge_direct_entry_installs_meter_before_opening_session(monkeypatch, tmp_path):
+    from types import SimpleNamespace
+
+    from misaka.ai import api_registry
+    from misaka.cli import desktop_bridge
+    from misaka.core import wiring
+    from misaka.core.platform import metering, session
+
+    monkeypatch.setattr(api_registry, "_request_meter", None)
+    monkeypatch.setattr(wiring, "bundled", wiring.bundled)
+
+    installed = []
+    async def capture(flags, cwd, assembly=None):
+        installed.append(api_registry._request_meter is metering.meter)
+        return None, None, "captured"
+
+    monkeypatch.setattr(session, "open_session", capture)
+    assert desktop_bridge.main(SimpleNamespace(cwd=str(tmp_path))) == 1
+    assert installed == [True]

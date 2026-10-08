@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import uuid
 from typing import Any
 
@@ -85,6 +86,45 @@ def is_rate_limitish(message: str) -> bool:
     """Heuristic: does an error message look like free-tier throttling?"""
     lowered = (message or "").lower()
     return any(marker in lowered for marker in _RATE_LIMIT_MARKERS)
+
+
+# A free tier that refuses this client (401/402/403: anonymous access revoked, IP reputation gate)
+# or errors server-side (5xx) fails every query from here, while another vendor may still serve it.
+# Anchored to the status the error starts with (after the ``Keyless <Vendor> search failed:`` prefix),
+# so a terminal error that echoes the query ("HTTP 400: invalid query 'http 503'") does not match.
+# Hermes' own, taken over 2026-10-07 (GitHub issue #9: Firecrawl's keyless 403 stopped the walk).
+_VENDOR_REFUSAL_RE = re.compile(
+    r"\s*(?:keyless\s+\w+\s+search\s+failed:\s*)?"
+    r"(?:http(?:\s+status)?|status(?:\s+code)?|client\s+error|error\s+code)"
+    r"\s*[:=']*\s*(?:40[123]|5\d\d)\b",
+    re.IGNORECASE,
+)
+
+
+# MISAKA's, not Hermes': a vendor this machine cannot reach (a blocked host, a reset connection)
+# fails here the way a refusal does, while another vendor may well be reachable. The transports
+# write it "request failed: <error>"; Hermes stops the walk on it.
+_UNREACHABLE_RE = re.compile(r"\s*(?:keyless\s+\w+\s+search\s+failed:\s*)?request\s+failed:", re.IGNORECASE)
+
+
+def is_search_failover_eligible(message: str) -> bool:
+    """Return whether another anonymous vendor may serve the search.
+
+    Rate limits and structured HTTP 401/402/403/5xx vendor refusals are local to
+    one free search endpoint. Free-text markers are deliberately ignored:
+    vendors may echo the query in an otherwise terminal error.
+    """
+    return (is_rate_limitish(message) or bool(_VENDOR_REFUSAL_RE.match(message or ""))
+            or bool(_UNREACHABLE_RE.match(message or "")))
+
+
+def _short_reason(message: str) -> str:
+    if is_rate_limitish(message):
+        return "throttled"
+    if _UNREACHABLE_RE.match(message or ""):
+        return "unreachable"
+    status = re.search(r"\b([45]\d\d)\b", message or "")
+    return f"HTTP {status.group(1)}" if status else "failed"
 
 
 # ---------------------------------------------------------------------------
@@ -446,14 +486,18 @@ async def firecrawl_search_keyless(query: str, limit: int = 5) -> dict[str, Any]
                     json={"query": query, "limit": limit},
                     headers={"Content-Type": "application/json"},
                 )
-            response.raise_for_status()
+            if response.status_code >= 400:
+                # Hermes' shape (plugins/web/firecrawl/provider.py, _post): the walk reads ``HTTP
+                # <code>``; httpx's own "Server error '503 ...'" matched no failover (0.18.9 sweep).
+                raise KeylessError(f"HTTP {response.status_code}: {response.text.strip()[:300]}")
             payload = response.json()
         return {"success": True, "data": {"web": normalize_search_results(payload)}}
     except Exception as exc:  # noqa: BLE001 - normalized below, as in Hermes
+        detail = f"request failed: {exc}" if isinstance(exc, httpx.TransportError) else exc
         return {
             "success": False,
             "error": (
-                f"Keyless Firecrawl search failed: {exc}. "
+                f"Keyless Firecrawl search failed: {detail}. "
                 "Set FIRECRAWL_API_KEY (https://firecrawl.dev) or another web "
                 f"backend via `{config_label()}` for reliable service."
             ),
@@ -496,9 +540,7 @@ async def keenable_search_keyless(query: str, limit: int = 5) -> dict[str, Any]:
                 },
             )
         if response.status_code >= 400:
-            raise KeylessError(
-                (response.text or "").strip() or f"HTTP {response.status_code}"
-            )
+            raise KeylessError(f"HTTP {response.status_code}: {(response.text or '').strip()[:300]}")
         data = check_response(response.json())
     except KeylessError as exc:
         return {
@@ -510,7 +552,8 @@ async def keenable_search_keyless(query: str, limit: int = 5) -> dict[str, Any]:
             ),
         }
     except Exception as exc:  # noqa: BLE001 - transport/JSON errors, as in Hermes
-        return {"success": False, "error": f"Keyless Keenable search failed: {exc}."}
+        detail = f"request failed: {exc}" if isinstance(exc, httpx.TransportError) else exc
+        return {"success": False, "error": f"Keyless Keenable search failed: {detail}."}
     web_results = []
     for i, result in enumerate(data.get("results") or []):
         web_results.append(
@@ -548,9 +591,7 @@ async def keenable_extract_keyless(urls: list[str]) -> list[dict[str, Any]]:
                     headers={"X-Keenable-Title": CLIENT_NAME},
                 )
             if response.status_code >= 400:
-                raise KeylessError(
-                    (response.text or "").strip() or f"HTTP {response.status_code}"
-                )
+                raise KeylessError(f"HTTP {response.status_code}: {(response.text or '').strip()[:300]}")
             data = check_response(response.json())
             if not isinstance(data, dict):
                 raise TypeError(f"expected a JSON object, got {type(data).__name__}")
@@ -658,9 +699,14 @@ async def search_with_failover(name: str, query: str, limit: int = 5) -> dict[st
     """Keyless search across the vendor ring with next-in-line failover.
 
     Starts at *name* when the user pinned it, otherwise at the round-robin cursor.
-    Rate-limit-shaped errors advance to the next ring vendor; non-throttle errors stop
-    the walk (a malformed query fails everywhere). The result notes the serving vendor
-    via ``data.served_by`` whenever it differs from *name*.
+    Rate limits and vendor refusals (HTTP 401/402/403/5xx) advance to the next vendor;
+    other errors stop the walk (a malformed query fails everywhere). The result notes
+    the serving vendor via ``data.served_by`` whenever it differs from *name*.
+
+    When every vendor failed, the model is told so in one line and the vendors' own
+    messages -- each a paragraph of setup advice -- go to the log (local delta from Hermes,
+    2026-10-07, GitHub issue #9: handed that advice as the tool's answer, a card set out to
+    write its own scraper).
     """
     order = ring_order(name)
     if not order:
@@ -668,23 +714,30 @@ async def search_with_failover(name: str, query: str, limit: int = 5) -> dict[st
             "success": False,
             "error": "All keyless web providers are disabled or pinned to paid tiers.",
         }
-    last: dict[str, Any] = {}
+    failed: list[tuple[str, str]] = []
     for i, vendor in enumerate(order):
         result = await _KEYLESS_SEARCHERS[vendor](query, limit)
         if result.get("success"):
             if vendor != name:
                 result.setdefault("data", {})["served_by"] = vendor
             return result
-        last = result
-        if not is_rate_limitish(result.get("error", "")):
+        error = result.get("error", "")
+        if not is_search_failover_eligible(error):
             return result
+        failed.append((vendor, error))
         nxt = order[i + 1] if i + 1 < len(order) else None
         if nxt:
-            logger.info("keyless %s search throttled; failing over to %s", vendor, nxt)
-    last["error"] = (
-        f"{last.get('error', '')} (all keyless vendors throttled: {', '.join(order)})"
-    )
-    return last
+            logger.info("keyless %s search unavailable; failing over to %s", vendor, nxt)
+    logger.warning("keyless web search failed at every vendor: %s",
+                   " | ".join(f"{vendor}: {error}" for vendor, error in failed))
+    said = ", ".join(f"{vendor} {_short_reason(error)}" for vendor, error in failed)
+    return {
+        "success": False,
+        "error": (
+            f"Web search is unavailable right now: every free search service failed ({said}). "
+            "Try again later or go on with the sources at hand; a search key is set up with `misaka web`."
+        ),
+    }
 
 
 def _note_served_by(results: list[dict[str, Any]], vendor: str) -> None:

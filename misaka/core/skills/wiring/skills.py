@@ -15,6 +15,7 @@ import tempfile
 import threading
 from pathlib import Path
 
+from misaka.config import home
 from misaka.core.moments import CoreCommand
 from misaka.core.platform import home_guard
 from misaka.core.skills import bundles, reader, sandbox, visibility
@@ -31,6 +32,7 @@ from misaka.core.skills.manage import (
     prepare_arguments,
 )
 from misaka.core.skills.vendor import commands as hermes_commands
+from misaka.core.tools.path_utils import resolve_to_cwd
 from misaka.utils.async_lifecycle import run_in_thread, settle
 
 _SKILL_INVOCATION_PREFIX = "[IMPORTANT: The user has invoked the "
@@ -245,9 +247,16 @@ class SkillsPart:
         def _touches_live_skills(tool, args):
             """Why this call is refused -- "path", "dynamic", or the home's own sentence -- or None."""
             if tool in ("write", "edit"):
-                target = os.path.realpath(os.path.join(workspace, os.path.expanduser(str(args.get("path") or ""))))
-                if any(target == root or target.startswith(root + os.sep) for root in live_roots):
+                # Resolved as write and edit resolve it (a leading @, file://, Unicode spaces): a
+                # target read any other way let `@PROJECT.md` past this check onto PROJECT.md.
+                target = os.path.realpath(resolve_to_cwd(str(args.get("path") or ""), workspace))
+                folded = home.folded(target)
+                if any(folded == root or root in folded.parents for root in map(home.folded, live_roots)):
                     return "path"
+                if kind in _WORKER_KINDS and _is_context_file_above(target, workspace):
+                    return ("PROJECT.md, AGENTS.md and CLAUDE.md here are what every later session in this "
+                            "project reads as its instructions; a Sister or sub-agent does not change them. "
+                            "Tell Last Order what should change.")
                 # The one place a file tool's target is resolved, so the home's rule is asked here too,
                 # and research's: what a run's workflow saved and froze is not the tools' to change (B126).
                 from misaka.core.research.runs import frozen_refusal
@@ -1078,6 +1087,22 @@ def _has_dynamic_shell_syntax(command, shell):
             or any(token and all(c in ";&|()<>" for c in token) for token in argv))
 
 
+# Sisters' cards and the sub-agents they start: the sessions that work for Last Order, unattended.
+_WORKER_KINDS = frozenset({"card", "beast", "child"})
+
+
+def _is_context_file_above(target, workspace):
+    """Whether ``target`` is a file a session in ``workspace`` loads as its instructions: a context
+    file name in the workspace or a folder above it (issue #10 audit, H4: a card could rewrite
+    PROJECT.md, and every later session of the project took it as its brief)."""
+    from misaka.core.resource_loader import CONTEXT_FILE_NAMES
+    target = home.folded(target)
+    if target.name not in {home.fold(name) for name in CONTEXT_FILE_NAMES}:
+        return False
+    here = home.folded(workspace)
+    return here == target.parent or target.parent in here.parents
+
+
 def _command_touches(command, workspace, live_roots, *, shell="bash", unattended=True):
     """Why a shell command is refused near a live skill tree: "path", "dynamic", or None.
 
@@ -1099,7 +1124,10 @@ def _command_touches(command, workspace, live_roots, *, shell="bash", unattended
     """
     if not command.strip():
         return None
-    if any(root in command for root in live_roots):
+    # Compared as the file system compares names: `rm -rf ~/.MISAKA/skills/x` is the live tree on
+    # macOS and Windows (0.18.9 sweep).
+    live_roots = {home.fold(root) for root in live_roots}
+    if any(root in home.fold(command) for root in live_roots):
         return "path"
     # Substitution is only a reason by itself where nobody is watching. In a card or a child
     # the guard is the only reader of the command, so an expansion it cannot resolve is refused
@@ -1122,15 +1150,22 @@ def _command_touches(command, workspace, live_roots, *, shell="bash", unattended
             # A token that is itself a command line -- `bash -c "..."`, `eval "..."`, a
             # `find -exec` payload -- hides its paths one level down.
             try:
-                pending.extend(shlex.split(item))
+                words = shlex.split(item)
             except ValueError:
                 if unattended:
                     return "dynamic"
-            continue
+                continue
+            if words != [item]:
+                pending.extend(words)
+                continue
+            # Only whitespace shlex does not split on is left (U+3000, U+00A0, ...). Bash does not
+            # split on it either, so this is one word: check it as a path. Re-queueing it unchanged
+            # never ended -- the guard spun on the session's event loop forever (GitHub issue #10).
         candidate = os.path.expanduser(item)
         if not os.path.isabs(candidate):
             candidate = os.path.join(workspace, candidate)
         for resolved in (os.path.abspath(candidate), os.path.realpath(candidate)):
+            resolved = home.fold(resolved)
             if any(resolved == root or resolved.startswith(root + os.sep) for root in live_roots):
                 return "path"
     return "dynamic" if dynamic and unattended else None

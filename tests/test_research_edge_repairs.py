@@ -272,11 +272,11 @@ def test_research_status_does_not_charge_another_task(state, monkeypatch, other_
 
     con, run, _root = state
     monkeypatch.setattr(research, "_cfg", lambda: {"token_cap": 0})
-    budget.commit_agent_usage(con, None, run["id"], 1, 100)
+    budget.settle_request(con, None, run["id"], 1, 100)
     if other_tokens:
-        budget.commit_agent_usage(con, None, "unrelated-card", 1, other_tokens)
+        budget.settle_request(con, None, "unrelated-card", 1, other_tokens)
     shown = research._status(con, run["id"], run["workspace"])
-    assert "tokens added by this run 100" in shown, shown
+    assert "tokens used by this run 100" in shown, shown
 
 
 @pytest.mark.asyncio
@@ -336,23 +336,6 @@ async def test_queued_followup_error_does_not_invalidate_phase_answer(
     from misaka.core.network.wiring.capabilities import SisterCapabilitiesPart
     from misaka.core.research import window
 
-    monkeypatch.setattr(
-        window.worker,
-        "_reserve_usage",
-        lambda *a: {"allowed": True, "tokens": 0, "token": None},
-    )
-
-    class Recorder:
-        def __init__(self, *a):
-            pass
-
-        def __call__(self, *a):
-            pass
-
-        def settle(self, *a):
-            pass
-
-    monkeypatch.setattr(window.worker, "_UsageRecorder", Recorder)
     observers = []
 
     async def send(*a):

@@ -377,6 +377,27 @@ async def retry_google_request(request, options: Any = None):
     )
 
 
+async def open_content_stream(client: Any, params: dict[str, Any]) -> tuple[Any, Any]:
+    """``(the SDK's stream, its first chunk or None)`` with the request sent. pi's JS SDK sends it
+    when ``generateContentStream`` is called; the Python SDK's call returns a generator that sends
+    it on the first read, so a refusal surfaced inside the read loop -- after "start", and past
+    ``retry_google_request``, which never retried it (0.18.9 sweep)."""
+    google_stream = await client.aio.models.generate_content_stream(**params)
+    try:
+        first = await google_stream.__anext__()
+    except StopAsyncIteration:
+        first = None
+    return google_stream, first
+
+
+async def chunks_from(first: Any, google_stream: Any):
+    """The stream ``open_content_stream`` opened, its first chunk put back in front."""
+    if first is not None:
+        yield first
+    async for chunk in google_stream:
+        yield chunk
+
+
 def map_stop_reason(reason: Any) -> StopReason:
     name = getattr(reason, "name", None)
     if isinstance(name, str):

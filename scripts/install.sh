@@ -10,6 +10,7 @@
 # MISAKA_PREFIX  install root (default ~/.local/share/misaka)
 # MISAKA_BIN     directory for the misaka link (default ~/.local/bin)
 # MISAKA_REPO    GitHub owner/name
+# MISAKA_REPLACE set to 1 to replace a misaka command another install put in MISAKA_BIN
 
 set -eu
 
@@ -47,6 +48,24 @@ fi
 if [ -z "$version" ]; then
   echo "Could not tell which release to install. Pass a version, or set MISAKA_VERSION." >&2
   exit 1
+fi
+
+# The link goes where `uv tool install` puts its misaka too. Replacing an archive's link is an
+# update; replacing anything else would take that install's command away without a word.
+link="${BIN_DIR}/misaka"
+if [ -e "$link" ] || [ -L "$link" ]; then
+  current=$(readlink "$link" 2>/dev/null || echo "$link")
+  case "$current" in
+    "${PREFIX}"/misaka-*/bin/misaka) ;;
+    *)
+      if [ "${MISAKA_REPLACE:-}" != "1" ]; then
+        echo "${link} is another MISAKA install (${current})." >&2
+        echo "Remove that one first (uv tool uninstall misaka, or pipx uninstall misaka), set" >&2
+        echo "MISAKA_REPLACE=1 to replace its command with this one, or set MISAKA_BIN to another folder." >&2
+        exit 1
+      fi
+      ;;
+  esac
 fi
 
 name="misaka-${version}-${target}.tar.gz"

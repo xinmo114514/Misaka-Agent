@@ -119,7 +119,8 @@ your research question.
 Parameters and question may also be given on one line, as in
 `/research --depth 2 --max-nodes 12 QUESTION`. Parameters left unspecified take their defaults:
 depth 3, four nodes and four cards at a time, two follow-up rounds, two revisions and a limit of
-30 nodes. From the shell, `misaka research` accepts the same parameters.
+30 nodes. From the shell, `misaka research` accepts the same parameters. A running run's
+parameters are changed with `/research limits --sister-parallel 2` (and the other options).
 
 ### Inside a node
 
@@ -227,10 +228,19 @@ window can hold. MISAKA addresses the following problems by design.
   hierarchical table of contents giving the page range of each section.
 - An agent first consults the outline (`doc_outline`) and then reads by section node or page
   range (`doc_read`), so that only the required text enters the context.
-- For PDF and DjVu a page is the printed page; other formats are divided at paragraph boundaries
-  into pages of about 3,000 characters, to which page citations refer.
+- For PDF and DjVu a page is a page of the file, counted from 1, which is not always the number
+  printed on it (the printed number is shown beside it where the PDF labels its pages or the
+  page heads print it); other formats are divided at paragraph boundaries into pages of about 3,000
+  characters, to which page citations refer.
 - `doc_find` performs literal search; `doc_verify` returns the page, character offset and
-  checksum of a quotation; `doc_page_image` reads a page as an image, for figures, maps and scans.
+  checksum of a quotation.
+- Scanned pages are found one by one and read by OCR, so a book that mixes typeset and scanned
+  pages loses neither.
+- `doc_read` names the figures its text does not carry: images and drawings on a PDF page, a
+  scanned page that is likely a map or a plate, a slide whose meaning is in a picture, a picture
+  a Word document or an EPUB embeds. `doc_page_image` shows the page, the slide or the one
+  figure. For a model without vision, every image is read to it in words by one vision model
+  (`vision.model`).
 - Texts produced during the research are indexed on completion. The final report retrieves each
   node's conclusion as a document, without loading everything into the context at once.
 
@@ -279,6 +289,9 @@ for your confirmation before committing.
 | Start MISAKA | `misaka` |
 | Begin a research run | `/research`, followed by your question |
 | Check, halt or resume a run | `/research status`, `/research stop`, `/research resume` |
+| Say something to a running node | `/research tell [--to NODE_ID] MESSAGE` |
+| Change a running run's limits | `/research limits --sister-parallel 2` |
+| See what a run spent | `misaka usage --run RUN_ID` |
 | Talk to a single Sister | `/sister 10032` |
 | Create a Sister | `misaka create 10036 --desc "Econometrics and causal inference"` |
 | Index your documents | `misaka doc scan sources/` |
@@ -300,6 +313,7 @@ The [command reference](docs/reference/commands.md) lists every command.
 | Signing in, choosing models, local models | [Models](docs/guide/models.md) |
 | Working with documents and the web | [Documents and the web](docs/guide/sources.md) |
 | Troubleshooting | [Troubleshooting](docs/guide/troubleshooting.md) |
+| What MISAKA does and does not protect | [Running MISAKA safely](docs/guide/security.md) |
 | Command and configuration reference | [Commands](docs/reference/commands.md), [Configuration](docs/reference/configuration.md) |
 
 [docs/README.md](docs/README.md) indexes every page and defines the terms MISAKA uses.
@@ -315,8 +329,8 @@ terms to OpenAlex. MISAKA sends no telemetry.
 
 A research run operates at scale: by default up to four branches run at once, each with up to four
 Sisters working in parallel as memory allows, so a deep run makes many model calls. A smaller
-depth reduces cost, and `research.token_cap` in `~/.misaka/settings.json` sets a hard budget
-across all runs.
+depth reduces cost, and `research.token_cap` in `~/.misaka/settings.json` sets a hard token
+budget for each run.
 
 ## About the name
 

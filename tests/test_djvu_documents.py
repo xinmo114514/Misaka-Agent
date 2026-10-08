@@ -3,8 +3,10 @@
 2026-09-18 (B10): CADAL and Wikimedia carry most scanned Chinese classics as DjVu. download_file
 refused the format, the Sister fetched it by hand with bash, and the corpus then skipped it at
 submission (``index_skipped``). The machine already had djvulibre installed."""
+import json
 import shutil
 import subprocess
+from pathlib import Path
 
 import pytest
 
@@ -57,6 +59,38 @@ def test_a_thin_text_layer_is_kept_rather_than_replaced_by_an_empty_rendering(tm
     assert [p.strip() for p in pages] == ["page 1 w0", "page 2 w0"]
 
 
+def test_a_page_without_hidden_text_keeps_the_pages_after_it_in_place(tmp_path):
+    """2026-10-07: ``djvutxt`` prints nothing at all -- not even the form feed -- for a page with
+    no hidden text, so every page after a blank or a plate was stored one page early."""
+    book = build_djvu(tmp_path, pages=3)
+    subprocess.run(["djvused", str(book), "-e", "select 1; remove-txt", "-s"], check=True, capture_output=True)
+    pages = corpus._djvu_pages(str(book), {})
+    assert len(pages) == 3 and not pages[0].strip()
+    assert pages[1].startswith("page 2 w0") and pages[2].startswith("page 3 w0")
+
+
+def test_a_djvu_stored_out_of_step_is_renumbered_when_ingested_again(tmp_path):
+    """Every stored page was full -- djvutxt had dropped the empty one -- so only the count shows it."""
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    book = build_djvu(workspace, pages=3)
+    subprocess.run(["djvused", str(book), "-e", "select 1; remove-txt", "-s"], check=True, capture_output=True)
+    doc_id, _ = corpus.ingest(str(book), workspace=str(workspace), with_tree=False)
+    ddir = corpus.resolve_doc(doc_id, workspace=str(workspace))
+    meta = json.loads((Path(ddir) / "meta.json").read_text(encoding="utf-8"))
+    for n, text in ((1, corpus.read_page(doc_id, 2, workspace=str(workspace))),
+                    (2, corpus.read_page(doc_id, 3, workspace=str(workspace)))):
+        (Path(ddir) / "pages" / f"p{n:04d}.txt").write_text(text, encoding="utf-8")
+    (Path(ddir) / "pages" / "p0003.txt").unlink()
+    meta.update(pages=2)
+    meta.pop("extract_version")
+    meta.pop("unread_pages", None)
+    (Path(ddir) / "meta.json").write_text(json.dumps(meta), encoding="utf-8")       # as version 1 stored it
+    _, count = corpus.ingest(str(book), workspace=str(workspace), with_tree=False)
+    assert count == 3
+    assert corpus.read_page(doc_id, 2, workspace=str(workspace)).startswith("page 2 w0")
+
+
 def test_without_djvulibre_the_reader_says_what_to_install(tmp_path, monkeypatch):
     monkeypatch.setattr(corpus.shutil, "which", lambda name: None)
     meta = {}
@@ -65,15 +99,14 @@ def test_without_djvulibre_the_reader_says_what_to_install(tmp_path, monkeypatch
 
 
 def test_a_broken_djvu_reports_the_tool_error(tmp_path):
-    if shutil.which("djvutxt") is None:
+    if shutil.which("djvused") is None:
         pytest.skip("djvulibre is not installed")
     broken = tmp_path / "broken.djvu"
     broken.write_bytes(b"AT&TFORM" + b"\x00" * 32)
     meta = {}
     pages = corpus._djvu_pages(str(broken), meta)
-    assert not corpus._has_text_layer(pages)          # djvutxt itself answers nothing, exit 0
-    if shutil.which("ddjvu"):
-        assert meta.get("djvu_error"), "the rendering attempt is what names the damage"
+    assert not corpus._has_text_layer(pages)
+    assert meta.get("djvu_error"), "djvused names the damage"
 
 
 def test_a_downloaded_djvu_is_indexed_on_arrival(tmp_path, monkeypatch):

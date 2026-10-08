@@ -354,7 +354,6 @@ async def amain() -> int:
         await asyncio.gather(parent_watch, return_exceptions=True)
         return 2
 
-    from misaka.agent.request_budget import install_turn_budget
     from misaka.core.platform import session as engine_session
     from misaka.core.subagent import hooks as subagent_hooks
     from misaka.core.subagent import policy as subagent_policy
@@ -752,7 +751,6 @@ async def amain() -> int:
     subagent_policy.set_permission_classifier(classify_auto_permission)
 
     model_turn_count = 0
-    turn_budget = install_turn_budget(session)
     async def stop_at_turn_boundary(context: Any, abort_signal: Any = None) -> bool:
         return max_turns is not None and model_turn_count >= max_turns
 
@@ -926,7 +924,6 @@ async def amain() -> int:
                 "turnId": turn_id,
                 "messagesFile": messages_file,
                 "error": turn_error,
-                "budgetUsage": turn_budget.accounted if turn_budget is not None else None,
             }
         )
         if active_turn_id == turn_id:

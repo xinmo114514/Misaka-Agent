@@ -60,9 +60,20 @@ try {
     $Bin = Join-Path $Dest "bin"
     $UserPath = [Environment]::GetEnvironmentVariable("Path", "User")
     if (-not $UserPath) { $UserPath = "" }
-    $pieces = $UserPath -split ";" | Where-Object { $_ -and ($_.TrimEnd("\") -ne $Bin.TrimEnd("\")) }
+    # This archive's bin goes first; an earlier archive's bin goes, so updates do not pile up on PATH.
+    $Earlier = Join-Path $Prefix "misaka-*\bin"
+    $pieces = $UserPath -split ";" | Where-Object {
+        $_ -and ($_.TrimEnd("\") -ne $Bin.TrimEnd("\")) -and -not ($_.TrimEnd("\") -like $Earlier)
+    }
     $Updated = (@($Bin) + @($pieces)) -join ";"
     [Environment]::SetEnvironmentVariable("Path", $Updated, "User")
+    # Another install's misaka (uv tool, pipx) is not removed, but it no longer answers to `misaka`.
+    $Others = Get-Command misaka -All -ErrorAction SilentlyContinue | Where-Object {
+        $_.Source -and -not $_.Source.StartsWith($Prefix, [System.StringComparison]::OrdinalIgnoreCase)
+    }
+    foreach ($Other in $Others) {
+        Write-Warning "Another MISAKA is on PATH: $($Other.Source). New terminals run this one first; remove the other (uv tool uninstall misaka) if you no longer want it."
+    }
     Write-Host "Installed $Dest"
     Write-Host "Command: $(Join-Path $Bin 'misaka.exe')"
     Write-Host "Open a new terminal, then: mkdir `$HOME\Documents\my-research; cd `$HOME\Documents\my-research; misaka setup"

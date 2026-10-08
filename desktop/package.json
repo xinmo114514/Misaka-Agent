@@ -1,6 +1,6 @@
 {
   "name": "misaka-desktop",
-  "version": "0.18.5",
+  "version": "0.18.11",
   "private": true,
   "main": "dist-electron/main.js",
   "scripts": {

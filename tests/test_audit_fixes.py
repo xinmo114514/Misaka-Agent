@@ -155,7 +155,7 @@ def test_budget_cache_matches_ledger_after_task_deletion(tmp_path, monkeypatch):
     monkeypatch.setattr(tasks, 'task_state_dir', lambda tid: str(tmp_path / 'state' / tid))
     try:
         tid = tasks.create_task(con, 'fixture', workspace=str(tmp_path), assignee='10032')
-        budget.commit_agent_usage(con, None, tid, 1, 100)
+        budget.settle_request(con, None, tid, 1, 100)
         assert budget.spent(con) == 100
         assert tasks.delete_task(con, tid)[0]
         fresh = tasks.connect(path)
@@ -478,7 +478,7 @@ def test_budget_tracks_other_connections_updates_and_deletes(tmp_path):
     first = tasks.connect(str(tmp_path / 'board.db'))
     second = tasks.connect(str(tmp_path / 'board.db'))
     try:
-        budget.commit_agent_usage(first, None, 'fixture', 1, 100)
+        budget.settle_request(first, None, 'fixture', 1, 100)
         assert budget.spent(first) == budget.spent(second) == 100
         second.execute('UPDATE events SET payload=?', ('{"totalTokens": 70}',))
         assert budget.spent(first) == budget.spent(second) == 70

@@ -355,11 +355,24 @@ explains the tabs, panes and keys.
 | stop a run and get a partial report | `/research stop [RUN_ID]` | Ctrl+C in the running command |
 | resume a stopped or failed run | `/research resume [RUN_ID] [ANSWER]` | `misaka research --resume RUN_ID` |
 | resume in a different window | `/research resume RUN_ID --here` | |
+| say something to a running node's Last Order (the root's by default) | `/research tell [RUN_ID] [--to NODE_ID] MESSAGE` | `misaka research --tell RUN_ID [--to NODE_ID] "MESSAGE"` |
+| change a running run's limits | `/research limits [RUN_ID] --sister-parallel 2 …` | `misaka research --limits RUN_ID --sister-parallel 2 …` |
 
 Resume a run in the Last Order conversation that started it; from any other window,
 `/research resume` names the conversation to open (the sidebar lists it under sessions).
 `--here` resumes in the current window, whose Last Order starts without the run's earlier
 conversation.
+
+`tell` reaches a node's Last Order as if you typed in her window: while she is mid-turn it steers
+that turn, while she waits on her cards it is a turn of its own. Her answer goes into her
+conversation; from the shell, `misaka chat --attach --session PATH` (the path `tell` prints)
+follows it. A node that is not running cannot hear; `tell` names the nodes that can.
+
+While a node's cards run, you can have its plan changed: ask its Last Order to add a card, to give
+a card that has not started to another Sister (one created since the plan was made, say), or to
+cancel one. She records the change with `misaka_research_cards`, checked as a plan's cards are;
+the run applies it at once, the cards already working go on, and the node's plan file lists what
+changed and why.
 
 A resumed run needs the Sisters its cards went to. If you removed one, create her again with the
 same number first.
@@ -405,9 +418,27 @@ limit, the follow-ups and the revisions.
 many cards each node runs at once. Your machine adds a ceiling of its own based on free memory
 (`network.max_concurrent_sisters`).
 
+Every limit can be changed while the run goes on, with `/research limits` and the same options.
+Each is read where it is used: the cards per node at once, the nodes at once from the next level
+of nodes, the depth and the node limit at the next reconciliation, follow-ups and revisions at
+each node's next decision. A limit is never set below what the graph already holds.
+
+`misaka usage --run RUN_ID` shows what a run spent, in tokens and money, by conversation (the
+root's Last Order, each node, each card with its retries) and by model; `misaka usage` lists the
+recent runs, and `/research status` gives the total. Money is what the model catalogue prices
+each call at; a call to a model with no price there is counted apart.
+
 For a hard limit on spending, set `research.token_cap` in `~/.misaka/settings.json` to a number
-of tokens for everything on the board (`0`, the default, means no limit). A run that reaches it
-stops with a partial report.
+of tokens for one research run (`0`, the default, means no limit). It counts everything the run
+spends: its Last Orders, every card, the sub-agents its cards start, and the calls around them
+(compaction, reading images to a model that cannot see, MoA). Each model request reserves what it
+could cost before it is sent and is recorded when it ends, so several nodes and cards working at
+once cannot go past the cap together. Reasoning stays on; it is paid for out of the cap.
+
+A run whose next request no longer fits stops with a partial report, and its cards wait, ready.
+Raise the cap and resume it to go on. Cards outside a research run are recorded but never capped.
+One model API, Codex, takes no output limit: its requests reserve their model's whole output and
+cannot be cut short.
 
 ## What a run writes
 
@@ -435,6 +466,10 @@ my-research/
     ├── <run>-graph.json        the graph as data
     └── <run>-SOURCES.md, <run>-sources/
 ```
+
+A `SOURCES.md` also lists the quotations that are not on the page a finding cites them on, with
+the page they are on, or that the document's indexed text does not contain (see
+[Documents and the web](sources.md)).
 
 `NODE.md`, the graph files, the paths list and every `SOURCES.md` and `sources/` are rebuilt from
 the run's records whenever something changes, so leave them unedited; the run itself is kept in

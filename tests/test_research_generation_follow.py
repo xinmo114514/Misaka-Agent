@@ -12,7 +12,7 @@ async def test_drive_tasks_follows_a_card_into_its_next_attempt(monkeypatch):
     monkeypatch.setattr(workflow.runs, "get", lambda con, run_id: {"id": run_id, "workspace": "/tmp", "limits_json": "{}"})
     monkeypatch.setattr(workflow.runs, "tasks", lambda con, run_id: rows)
     monkeypatch.setattr(workflow.runs, "stop_requested", lambda con, run_id: False)
-    monkeypatch.setattr(workflow.budget, "exhausted", lambda con, cap: False)
+    monkeypatch.setattr(workflow.budget, "exhausted", lambda con, cap=None, **_: False)
     monkeypatch.setattr(workflow, "_release_dependencies", lambda con, run_id, owner=None: None)
     events = []
 

@@ -11,7 +11,6 @@ from PIL import Image
 from misaka.agent import request_budget
 from misaka.agent.request_budget import (
     CONTEXT_FRAMING_TOKENS,
-    TurnBudgetLimiter,
     context_token_upper_bound,
     image_token_upper_bound,
 )
@@ -56,14 +55,6 @@ def test_text_contexts_are_bounded_as_before():
     text = "数据" * 1000
     bound = context_token_upper_bound(_context(TextContent(text=text)))
     assert bound > len(text.encode()) + CONTEXT_FRAMING_TOKENS
-
-
-def test_reserve_serialises_the_context_once(monkeypatch):
-    calls = []
-    real = request_budget.context_token_upper_bound
-    monkeypatch.setattr(request_budget, "context_token_upper_bound", lambda context: calls.append(1) or real(context))
-    TurnBudgetLimiter(1_000_000).reserve(_context(TextContent(text="hi")))
-    assert len(calls) == 1
 
 
 def test_measured_images_are_not_kept_alive():

@@ -4,17 +4,15 @@ from __future__ import annotations
 
 import importlib.util
 
-# The third-party packages the vendored tree imports. ``pypdfium2`` is a base dependency;
-# the other three arrive only with the ``pageindex`` extra, which is why a plain install can
-# split a PDF into pages but never build its outline.
+# The third-party packages the vendored tree imports, all of them MISAKA's own dependencies
+# since 2026-10-07 (they were the ``pageindex`` extra). One missing is a broken install.
 REQUIREMENTS = ("PyPDF2", "pypdfium2", "regex", "sortedcontainers")
 
-# A wheel user cannot run `uv sync`; name the pip command first and keep the repo one after.
-INSTALL_HINT = "pip install 'misaka[pageindex]' (or, in a checkout, uv sync --extra pageindex)"
+INSTALL_HINT = "reinstall MISAKA (PyPDF2 and sortedcontainers are its dependencies; in a checkout, uv sync)"
 
 
 class PageIndexUnavailable(RuntimeError):
-    """The optional ``pageindex`` extra is not installed.
+    """PageIndex's packages are missing from this install.
 
     A distinct type so callers can tell "this install cannot do structure extraction at all"
     -- actionable, and the same for every document -- from a per-document parse failure.

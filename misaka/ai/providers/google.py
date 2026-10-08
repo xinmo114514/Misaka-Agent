@@ -23,12 +23,14 @@ from misaka.ai.providers._common import (
     _prepare_sdk_params,
 )
 from misaka.ai.providers.google_shared import (
+    chunks_from,
     coerce_thought_signature,
     convert_messages,
     convert_tools,
     get_disabled_google_thinking_config,
     is_thinking_part,
     map_stop_reason,
+    open_content_stream,
     resolve_google_function_calling_mode,
     resolve_google_thinking_level,
     retain_thought_signature,
@@ -288,14 +290,15 @@ def stream_google(
             # MISAKA fork: pi hands the SDK the abort signal as ``config.abortSignal``; the
             # Python SDK takes none (``_prepare_sdk_params`` drops it), so the wait for the
             # stream races the signal instead.
-            google_stream = await race_with_abort_signal(retry_google_request(
-                lambda: client.aio.models.generate_content_stream(**_prepare_sdk_params(params)),
+            google_stream, first = await race_with_abort_signal(retry_google_request(
+                lambda: open_content_stream(client, _prepare_sdk_params(params)),
                 options,
             ), signal)
             stream.push(StartEvent(partial=output))
 
             current_block: TextContent | ThinkingContent | None = None
-            async for chunk in _iterate_async_iterable(google_stream, signal, on_abort=lambda: _close_stream(google_stream)):
+            async for chunk in _iterate_async_iterable(chunks_from(first, google_stream), signal,
+                                                       on_abort=lambda: _close_stream(google_stream)):
                 if signal_aborted(signal):
                     raise RuntimeError("Request was aborted")
 

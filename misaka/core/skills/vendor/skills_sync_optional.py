@@ -142,9 +142,22 @@ def restore_official_optional_skill(name: str, *, restore: bool = False) -> dict
         return {"ok": False, "message": message, "restored": [], "backfilled": [], "backed_up": []}
     restored: List[str] = []
     backed_up: List[str] = []
+    blocked: List[str] = []
+    verdicts: Dict[str, str] = {}
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
     backup_root = ss._skills_dir() / ".restore-backups" / f"official-optional-{timestamp}"
+    from misaka.core.skills import guard
     for folder_name, install_path, src in targets if restore else []:
+        # Scanned as the hub scans a shipped official bundle (Hermes' reserved label "official",
+        # skills_hub._scan_quarantined), before anything is moved, and the verdict recorded
+        # (issue #10 audit, H6). 0.18.9 passed "builtin", a label the scanner does not know: it
+        # read as community and refused 66 of the 140 shipped skills.
+        scan = guard.scan_skill(src, source="official")
+        allowed, reason = guard.should_allow_install(scan)
+        if allowed is not True:
+            blocked.append(f"{folder_name}: {reason}")
+            continue
+        verdicts[src.name] = scan.verdict
         dest = ss._skills_dir() / Path(*install_path.split("/"))
         canonical_ok = dest.exists() and ss._dir_hash(dest) == ss._dir_hash(src)
         # Active copies by frontmatter name or folder slug (the curator may have moved the skill
@@ -161,8 +174,10 @@ def restore_official_optional_skill(name: str, *, restore: bool = False) -> dict
             ss._copy_dir(src, dest)
             restored.append(folder_name)
     return {
-        "ok": True, "message": "Official optional skill repair complete.", "restored": restored,
-        "backfilled": _backfill_optional_provenance(quiet=True), "backed_up": backed_up,
+        "ok": not blocked, "message": "Official optional skill repair complete." if not blocked else
+        "Refused by the skill scan: " + "; ".join(blocked),
+        "restored": restored, "blocked": blocked,
+        "backfilled": _backfill_optional_provenance(quiet=True, verdicts=verdicts), "backed_up": backed_up,
         "backup_dir": str(backup_root) if backed_up else ""}
 
 
@@ -192,7 +207,7 @@ def _relocated_dest(src_name: str, index: Dict[str, List[Path]]) -> Optional[Tup
         return None
 
 
-def _backfill_optional_provenance(quiet: bool = False) -> List[str]:
+def _backfill_optional_provenance(quiet: bool = False, verdicts: Optional[Dict[str, str]] = None) -> List[str]:
     """Mark already-present official optional skills as hub-installed: formerly bundled (or
     hand-copied) skills now under optional-skills/ get official provenance when byte-identical
     to the source; modified/local skills are left alone."""
@@ -223,7 +238,7 @@ def _backfill_optional_provenance(quiet: bool = False) -> List[str]:
         timestamp = datetime.now(timezone.utc).isoformat()
         installed[lock_name] = {
             "source": "official", "identifier": f"official/{install_path}",
-            "trust_level": "builtin", "scan_verdict": "backfilled",
+            "trust_level": "builtin", "scan_verdict": (verdicts or {}).get(lock_name, "backfilled"),
             "content_hash": _content_hash(dest), "install_path": install_path,
             "files": _skill_file_list(dest), "metadata": {"backfilled_from": "optional-skills"},
             "installed_at": timestamp, "updated_at": timestamp}

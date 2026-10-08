@@ -66,6 +66,17 @@ def test_a_draft_changed_after_it_was_saved_is_put_back_and_the_change_kept(lab)
     assert "An edit made between phases." in kept.read_text(encoding="utf-8")
 
 
+def test_a_draft_moved_away_is_rebuilt_from_the_run(lab):
+    """A missing file raised past the restore: the final review failed, and every resume after it,
+    until the file was put back by hand (0.18.10 sweep)."""
+    con, run = lab
+    draft = _saved_draft(con, run)
+    path = Path(draft["path"])
+    path.rename(path.with_name("moved.md"))
+    again = report._checkpoint(con, run, "draft")
+    assert runs.artifact_text(again) == DRAFT.strip() + "\n"
+
+
 def test_a_changed_checkpoint_with_nothing_to_rebuild_it_from_stays_an_error(lab):
     con, run = lab
     report._save(con, run, "draft", DRAFT)                      # no recorded command behind it
@@ -102,3 +113,26 @@ def test_the_path_guard_refuses_last_order_s_own_window_too(lab):
         assert call("write", path=str(Path(run["workspace"]) / "notes.md"), content="x") is None
     finally:
         asyncio.run(part.session_shutdown({}, SimpleNamespace()))
+
+
+def test_a_frozen_file_is_refused_in_any_spelling_its_file_system_takes(tmp_path, monkeypatch):
+    """APFS takes a name's NFC and NFD spellings for one file, and folds case: a frozen plan or
+    conclusion was edited past the check under another spelling (0.18.10 sweep)."""
+    import unicodedata
+    from contextlib import closing
+
+    from misaka.config import CFG, home
+    from misaka.core.platform import tasks
+    monkeypatch.setattr(home, "FOLDS_CASE", True)
+    monkeypatch.setattr(home, "FOLDS_UNICODE", True)
+    workspace = tmp_path / unicodedata.normalize("NFD", "研究データ")
+    workspace.mkdir()
+    with closing(tasks.connect(CFG["db"])) as con:
+        run = runs.create(con, workspace=str(workspace), question="Why?")
+        runs.acquire_driver(con, run["id"], "driver:test")
+        run = runs.get(con, run["id"])
+        draft = report._save(con, run, "draft", DRAFT)
+    stored = draft["path"]
+    assert runs.frozen_refusal(stored)
+    assert runs.frozen_refusal(unicodedata.normalize("NFC", stored))
+    assert runs.frozen_refusal(stored.replace("final", "FINAL"))

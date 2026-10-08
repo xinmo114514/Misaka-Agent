@@ -57,6 +57,15 @@ MCP servers are set per role, in that role's own `settings.json`, in the shape H
 
 `/mcp` in her window lists the servers and their tools.
 
+A server starts with a small part of MISAKA's environment: `PATH`, `HOME`, the locale, the proxy
+and certificate variables, the settings of npm, uv and pip (a registry mirror reaches `npx` and
+`uvx`) and the like, never an API key or a registry's token. A key it needs goes in its `env`, where
+`${NAME}` takes the value from the environment (or the home's `.env`):
+
+```json
+"mcpServers": {"github": {"command": "npx", "args": ["-y", "github-mcp"], "env": {"GITHUB_TOKEN": "${GITHUB_TOKEN}"}}}
+```
+
 What every role shares lives in the home: `~/.misaka/MISAKA.md` (the shared identity),
 `~/.misaka/skills/` and `~/.misaka/subagents/`. The [configuration reference](../reference/configuration.md)
 has the full layout.
@@ -127,7 +136,8 @@ for the answer. Last Order brings the question to you when it is yours to decide
 In ordinary chat, Last Order can split a request into cards for the Sisters. She lays the cards
 out and waits for your go-ahead before starting work that costs money. Cards are Markdown files in
 the project's `cards/` folder, each with its dependencies. `/board` or `misaka board` shows them;
-`misaka task --delete ID` removes one with its history. Research runs use the same board and
+`misaka task add TITLE --to SISTER --body-file FILE` adds one by hand, `misaka task start ID`
+runs a ready one in the terminal, and `misaka task ID --delete` removes one with its history. Research runs use the same board and
 cards.
 
 In the panel, each card she starts opens in a pane beside her, in her tab. A finished card's pane

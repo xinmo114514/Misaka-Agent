@@ -956,7 +956,7 @@ wheels = [
 
 [[package]]
 name = "misaka"
-version = "0.18.5"
+version = "0.18.11"
 source = { editable = "." }
 dependencies = [
     { name = "filelock" },
@@ -972,12 +972,15 @@ dependencies = [
     { name = "pydantic" },
     { name = "pygments" },
     { name = "pylatexenc" },
+    { name = "pypdf2" },
     { name = "pypdfium2" },
     { name = "pyte" },
     { name = "python-docx" },
     { name = "python-pptx" },
     { name = "pyyaml" },
+    { name = "regex" },
     { name = "ruamel-yaml" },
+    { name = "sortedcontainers" },
     { name = "tiktoken" },
     { name = "wcmatch" },
     { name = "wcwidth" },
@@ -1006,12 +1009,6 @@ mistral = [
 openai = [
     { name = "openai" },
 ]
-pageindex = [
-    { name = "pypdf2" },
-    { name = "pypdfium2" },
-    { name = "regex" },
-    { name = "sortedcontainers" },
-]
 providers = [
     { name = "anthropic" },
     { name = "boto3" },
@@ -1022,7 +1019,7 @@ providers = [
 
 [package.dev-dependencies]
 dev = [
-    { name = "misaka", extra = ["pageindex", "providers"] },
+    { name = "misaka", extra = ["providers"] },
     { name = "pytest" },
     { name = "pytest-asyncio" },
     { name = "ruff" },
@@ -1051,16 +1048,15 @@ requires-dist = [
     { name = "pydantic", specifier = ">=2.10" },
     { name = "pygments", specifier = ">=2.18" },
     { name = "pylatexenc", specifier = ">=2.10" },
-    { name = "pypdf2", marker = "extra == 'pageindex'", specifier = "==3.0.1" },
-    { name = "pypdfium2", specifier = ">=4.30" },
-    { name = "pypdfium2", marker = "extra == 'pageindex'", specifier = "==4.30.0" },
+    { name = "pypdf2", specifier = "==3.0.1" },
+    { name = "pypdfium2", specifier = "==4.30.0" },
     { name = "pyte", specifier = ">=0.8.2" },
     { name = "python-docx", specifier = ">=1.1" },
     { name = "python-pptx", specifier = ">=1.0" },
     { name = "pyyaml", specifier = ">=6.0" },
-    { name = "regex", marker = "extra == 'pageindex'", specifier = ">=2024.0.0" },
+    { name = "regex", specifier = ">=2024.0.0" },
     { name = "ruamel-yaml", specifier = ">=0.18" },
-    { name = "sortedcontainers", marker = "extra == 'pageindex'", specifier = "==2.4.0" },
+    { name = "sortedcontainers", specifier = "==2.4.0" },
     { name = "tiktoken", specifier = ">=0.14.0" },
     { name = "wcmatch", specifier = ">=10.0" },
     { name = "wcwidth", specifier = ">=0.2" },

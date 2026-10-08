@@ -1817,6 +1817,8 @@ class InteractiveMode(Conversation):
             stop = _callable_attr(self.ui, "stop")
             if stop is not None:
                 stop()
+            from misaka.utils import loop_watchdog
+            loop_watchdog.suspend()        # a stopped process is not a stalled one
             os.kill(0, signal.SIGTSTP)
         except Exception:
             keep_alive.cancel()

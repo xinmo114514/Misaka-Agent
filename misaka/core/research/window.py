@@ -5,11 +5,9 @@ import asyncio
 import os
 from contextlib import ExitStack, asynccontextmanager
 
-from misaka.agent.request_budget import install_turn_budget
 from misaka.ai.utils.overflow import output_limit_error
 from misaka.core.network import worker
 from misaka.core.platform import budget
-from misaka.core.platform.session import event_line
 from misaka.core.research.report import DRAFT_CONTRACT, FINAL_CONTRACT
 from misaka.core.session_control import for_session, wait_for_session
 from misaka.utils.async_lifecycle import settle
@@ -24,6 +22,49 @@ def node_description(con, node_id):
     run = runs.get(con, node["run_id"])
     return {"run_id": run["id"], "node": node["id"], "depth": node["depth"],
             "run_phase": run["phase"], "run_status": run["status"], "node_phase": node["status"]}
+
+
+def _listening(con, run, node):
+    """The catalog record of the live session a node's Last Order is running in, or None."""
+    from misaka.core import session_catalog
+    from misaka.core.research import planner
+
+    path = planner.lo_session_file(run, node)
+    record = session_catalog.owner_record(path) if path else {}
+    live = session_catalog.live_session(record.get("id")) if record.get("control") else None
+    return live if live and live.get("control") else None
+
+
+async def tell(con, run, text, *, node_id=None):
+    """Say something to a node's Last Order while the run goes on -- the root's when no node is
+    named -- as if it were typed in her window: through the input socket every live session opens
+    (``misaka chat --attach``), a steer while she is mid-turn, a turn of its own while she waits on
+    her cards. Returns the session file her answer is written to. Raises ValueError naming who can
+    hear when the node named cannot."""
+    from misaka.core.research import runs
+    from misaka.core.session_control import request
+
+    text = (text or "").strip()
+    if not text:
+        raise ValueError("Say what to tell the run.")
+    every = runs.nodes(con, run["id"])
+    node = next((row for row in every if (row["id"] == node_id if node_id else runs.is_root(row))), None)
+    listening = [(row, _listening(con, run, row)) for row in every]
+    listening = [(row, record) for row, record in listening if record]
+    who = "; ".join(f"{row['id']} (depth {row['depth']}): {' '.join(row['question'].split())[:60]}"
+                    for row, _record in listening) or "none"
+    if node is None:
+        raise ValueError(f"Research run {run['id']} has no node {node_id}. Listening now: {who}")
+    record = next((record for row, record in listening if row["id"] == node["id"]), None)
+    if record is None:
+        raise ValueError(f"The Last Order of node {node['id']} is not running now ({node['status']}). "
+                         f"Listening now: {who}")
+    try:
+        await request(record, "input", text=text)
+    except (OSError, KeyError, TimeoutError) as error:
+        raise ValueError(f"Delivery to node {node['id']} is unconfirmed: {error or 'no answer'}. "
+                         "Not sent again automatically.") from error
+    return record.get("path")
 
 
 class WindowLO:
@@ -111,24 +152,16 @@ class WindowLO:
             raise RuntimeError("Research window changed conversation; resume in the intended session.")
         if os.path.realpath(options["session_dir"]) != os.path.realpath(os.path.dirname(self.session_file)):
             raise RuntimeError("A research call was routed to a different node's session.")
-        reservation = worker._reserve_usage(
-            options.get("usage_db"), options.get("usage_task_id"), options.get("usage_generation"),
-            options.get("usage_token_cap"), None)
-        if not reservation.get("allowed"):
-            return None, "", "shared token budget exhausted"
-        recorder = worker._UsageRecorder(None, options.get("usage_db"), options.get("usage_task_id"),
-                                        options.get("usage_generation"), reservation)
+        if worker.over_cap(options.get("usage_db"), options.get("usage_task_id"), options.get("usage_token_cap")):
+            # Last Order's window, not a card: nothing "stays ready" here; the run halts at its cap.
+            return None, "", f"{budget.EXHAUSTED_MESSAGE}: this research run stops here until the cap is raised."
         definitions = list(options.get("extra_tools", ()))
         scope = ExitStack()
-        stream = session.agent.streamFn
-        previous_limiter = getattr(session.agent, "_misaka_turn_budget", None)
         guard_hooks = None
-        limiter = None
         answer, error = None, None
 
         def observe(event):
             nonlocal answer, error
-            recorder(event_line(event))
             if read_field(event, "type") != "message_end":
                 return
             message = read_field(event, "message")
@@ -146,23 +179,6 @@ class WindowLO:
                 error = None
 
         unsubscribe = session.subscribe(observe)
-        heartbeat = None
-        reservation_errors = []
-
-        async def keep_reservation():
-            while True:
-                await asyncio.sleep(worker.RESERVATION_HEARTBEAT_SECONDS)
-                try:
-                    alive = await asyncio.to_thread(budget.touch_agent_path, options["usage_db"], reservation["token"], 600)
-                    if alive:
-                        continue
-                    reason = "shared token budget lease lost"
-                except Exception as error:  # noqa: BLE001 - a failed heartbeat must stop spending
-                    reason = f"shared token budget heartbeat failed: {error}"
-                reservation_errors.append(reason)
-                await session.abort()
-                return
-
         try:
             from misaka.core.research.planner import session_tools
             # Re-read at the actual turn boundary; a queued phase's old selection
@@ -176,23 +192,19 @@ class WindowLO:
             missing = set(names) - set(session.getActiveToolNames()) - set(OPTIONAL_MATERIAL_TOOLS)
             if missing:
                 raise RuntimeError(f"The window is missing research tools: {', '.join(sorted(missing))}")
-            if reservation.get("tokens"):
-                # Nest inside any existing session cap, then restore the exact provider
-                # wrapper. No process-wide environment or session identity is changed.
-                if previous_limiter is not None:
-                    del session.agent._misaka_turn_budget
-                limiter = install_turn_budget(session, int(reservation["tokens"]))
             if self.headless and not hasattr(session.agent, "_misaka_guards"):
                 from misaka.agent.guards import install_guards
+                from misaka.core.platform import metering
                 from misaka.core.platform.session import BOOKKEEPING_TOOLS
 
                 guard_hooks = (session.agent.finishTurn, session.agent.prepareNextTurnWithContext)
-                install_guards(session, limiter, bookkeeping_tools=BOOKKEEPING_TOOLS)
-            if reservation.get("token"):
-                heartbeat = asyncio.create_task(keep_reservation())
+                install_guards(session, metering.allowance, bookkeeping_tools=BOOKKEEPING_TOOLS)
             # Direct await enters the session's active-run guard before yielding. A
             # queued notification cannot take the window between idle and this turn.
-            with budget.usage_context(options.get("usage_db"), options.get("usage_task_id"), options.get("usage_generation")):
+            # The turn's model requests -- the phase's own, compaction, the vision bridge --
+            # are billed to the run through this context (metering).
+            with budget.usage_context(options.get("usage_db"), options.get("usage_task_id"),
+                                      options.get("usage_generation"), options.get("usage_token_cap")):
                 if preflight is not None:
                     await session.prompt(prompt, {"streamingBehavior": "steer", "preflightResult": preflight})
                 else:
@@ -204,32 +216,16 @@ class WindowLO:
                                      "stage": "adjudication_draft" if prompt.startswith((DRAFT_CONTRACT, FINAL_CONTRACT)) else None}},
                         {"triggerTurn": True, "prepareTurn": True})
             self.check_active()
-            if reservation_errors:
-                raise RuntimeError(reservation_errors[0])
             return None, answer or "", error or (None if answer is not None else "no completed research response")
         finally:
-            if heartbeat is not None:
-                heartbeat.cancel()
             unsubscribe()
-            session.agent.streamFn = stream
             if guard_hooks is not None:
                 session.agent.finishTurn, session.agent.prepareNextTurnWithContext = guard_hooks
                 del session.agent._misaka_guards
-            if previous_limiter is not None:
-                session.agent._misaka_turn_budget = previous_limiter
-            elif hasattr(session.agent, "_misaka_turn_budget"):
-                del session.agent._misaka_turn_budget
             try:
-                try:
-                    session.unregisterCustomTools(definitions)
-                finally:
-                    scope.close()
+                session.unregisterCustomTools(definitions)
             finally:
-                try:
-                    recorder.settle(limiter.accounted if limiter else None)
-                finally:
-                    if heartbeat is not None:
-                        await asyncio.gather(heartbeat, return_exceptions=True)
+                scope.close()
 
 
 @asynccontextmanager
@@ -246,12 +242,16 @@ async def node_session(con, cfg, run, node):
         os.path.join(cfg["roles_root"], "last_order"), run["workspace"],
         research_context=True, overrides=runs.session_overrides(run))
     flags += ["--session-dir", directory]
-    if session_file:
+    # A conversation recorded but never written -- the run failed before its first entry was
+    # persisted -- is opened anew: asked for by name it raised FileNotFoundError on every resume,
+    # and --continue would pick whatever else is newest in its directory, for a root started from
+    # a chat that chat's other conversations (0.18.10 sweep).
+    if session_file and os.path.exists(session_file):
         flags += ["--session", session_file]
-    else:
+    elif not session_file:
         flags.append("--continue")
     env.update(MISAKA_USAGE_DB=str(cfg["db"]), MISAKA_USAGE_TASK_ID=run["id"],
-               MISAKA_USAGE_GENERATION="1", MISAKA_USAGE_TOKEN_CAP=str(cfg.get("token_cap") or 0))
+               MISAKA_USAGE_GENERATION="1", MISAKA_USAGE_TOKEN_CAP="")
 
     def check_active():
         if runs.stop_requested(con, run["id"]):
@@ -288,7 +288,7 @@ async def node_session(con, cfg, run, node):
                         "session_dir": directory, "tools": planner.session_tools(bridge),
                         "extra_tools": list(getattr(control, "review_tools", ()) or ()),
                         "usage_db": cfg["db"], "usage_task_id": run["id"], "usage_generation": 1,
-                        "usage_token_cap": cfg.get("token_cap"),
+                        "usage_token_cap": None,
                     }, preflight=preflight)
                     if error:
                         raise RuntimeError(error)

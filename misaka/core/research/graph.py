@@ -126,7 +126,7 @@ def resolve_reconcile(con, run, payload):
     """Check a reconciliation's structure against the graph as it stands and return what applying
     it creates: each new node with its parents (the nodes whose options it pursues, or the nodes
     it joins). Raises ValueError with what to change; judges nothing about content."""
-    chosen = runs.limits(run)
+    chosen = runs.current_limits(con, run)
     pending = {row["id"]: row for row in reconcilable_options(con, run)}
     named = Counter([oid for item in payload["nodes"] for oid in item["options"]]
                     + [item["option"] for item in payload["not_pursued"]])

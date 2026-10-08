@@ -931,7 +931,9 @@ def build(target_name: str) -> Path:
         _wrap(
             _rel(bin_dir, python_executable(stage)),
             ["-m", "misaka"],
-            [*shared_env, ("PYTHONNOUSERSITE", "1")],
+            # ``-m`` puts the working directory first on sys.path, so a folder holding a
+            # ``misaka`` package (a source checkout) would be run instead of the archive's own.
+            [*shared_env, ("PYTHONNOUSERSITE", "1"), ("PYTHONSAFEPATH", "1")],
             ["../tools"],
         ),
     )

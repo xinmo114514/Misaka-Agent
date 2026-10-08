@@ -207,8 +207,6 @@ class TodoPart:
         self._touched = 0.0
         self._in_flight = 0               # tool calls started and not yet answered
         self._stamper = None              # the task that stamps progress while one is
-        self.usage = None                 # card-shell opts in; managed/headless workers already meter their calls
-        self._close_usage = None
 
         def con():
             return self.con()
@@ -310,7 +308,8 @@ class TodoPart:
                     raise ValueError("Only this node's red-team card may record critique issues.")
                 generation, claim_lock = self._ownership()
                 if generation is None or not bdb.add_event(
-                    c, task_id, "research_critique", {"issues": [item.model_dump() for item in p.issues]},
+                    c, task_id, "research_critique",
+                    {"issues": [item.model_dump() for item in p.issues], "claim_lock": claim_lock},
                     generation=generation, claim_lock=claim_lock,
                 ):
                     raise ValueError("Card ownership changed before its review was recorded.")
@@ -319,7 +318,8 @@ class TodoPart:
                     raise ValueError("Only this node's divergence-review card may record alternatives.")
                 generation, claim_lock = self._ownership()
                 if generation is None or not bdb.add_event(
-                    c, task_id, "research_divergence", {"alternatives": [item.model_dump() for item in p.alternatives]},
+                    c, task_id, "research_divergence",
+                    {"alternatives": [item.model_dump() for item in p.alternatives], "claim_lock": claim_lock},
                     generation=generation, claim_lock=claim_lock,
                 ):
                     raise ValueError("Card ownership changed before its alternatives were recorded.")
@@ -370,9 +370,8 @@ class TodoPart:
             # review found them (2026-10-01, B117). Once per attempt, before the review is
             # submitted, its author checks her own file against her record.
             recorded = _review_record(submission)
-            if recorded is not None and bdb.latest_payload(con(), task_id, "review_record_checked",
-                                                           generation=row["generation"]) is None:
-                bdb.add_event(con(), task_id, "review_record_checked", {"items": recorded[1]},
+            if recorded is not None and worker.attempt_payload(con(), row, "review_record_checked") is None:
+                bdb.add_event(con(), task_id, "review_record_checked", {"items": recorded[1], "claim_lock": row["claim_lock"]},
                               generation=row["generation"], claim_lock=row["claim_lock"])
                 raise ValueError(
                     "Before this review is submitted, check the file you wrote against what you recorded "
@@ -436,11 +435,6 @@ class TodoPart:
 
     def attach(self, session):
         self.session = session
-
-    async def session_start(self, event=None, ctx=None):
-        if self.usage is not None and self._close_usage is None:
-            from misaka.core.network import worker
-            self._close_usage = worker.install_card_usage(self.session, **self.usage)
 
     def con(self):
         if self._con is None:
@@ -645,6 +639,14 @@ class TodoPart:
         if row is None:
             return
         generation = int(row["generation"])
+        from misaka.core.network import worker
+        if worker.stopped_at_cap(reason):
+            # The research run's token cap, not this card: it waits, ready, for a resume.
+            if self._bdb.back_to_ready(self.con(), self.task_id, generation=generation,
+                                       claim_lock=row["claim_lock"]):
+                self._bdb.add_event(self.con(), self.task_id, "budget_stop", {"reason": reason},
+                                    generation=generation)
+            return
         if stop == "length" and self._continued_generation != generation:
             self._continued_generation = generation
             self._prompt(f"Your last reply was cut off: {reason}. Continue the card from where it "
@@ -796,9 +798,6 @@ class TodoPart:
 
     async def session_shutdown(self, event=None, ctx=None):
         self._calls_settled()
-        if self._close_usage is not None:
-            self._close_usage()
-            self._close_usage = None
         if self._con is not None:
             self._con.close()
             self._con = None

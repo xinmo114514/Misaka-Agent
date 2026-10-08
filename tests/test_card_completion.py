@@ -201,3 +201,30 @@ def test_bookkeeping_lists_know_the_tool():
     assert "misaka_card_complete" in BOOKKEEPING_TOOLS
     assert "misaka_card_complete" in SISTER_TOOLS
     assert "misaka_card_complete" in worker.COMPLETION_INSTRUCTIONS
+
+
+async def test_an_earlier_attempts_declaration_does_not_submit_the_next(tmp_path, monkeypatch, request):
+    """A card sent back to ready keeps its generation; the next attempt's first turn submitted it
+    with the last attempt's summary -- a reviewer's request for changes bypassed, silently."""
+    import os
+
+    from misaka.core.network import todo
+    from misaka.core.platform import tasks
+    con, tid, out = _board(tmp_path, request)
+    con.execute("UPDATE tasks SET reviewer='10033' WHERE id=?", (tid,))
+    con.commit()
+    part = _part(monkeypatch, con, tid)
+    (out / "choson-tusol-genealogy.md").write_text("# v1\n", encoding="utf-8")
+    await _tool(part, "misaka_card_complete").execute(None, {"summary": "v1 summary"}, None, None, None)
+    await _end_turn(part, "done")
+    assert tasks.claim_review(con, tid, "10033", "rv1", generation=1)
+    assert tasks.request_review_changes(con, tid, "rv1", "Section 2 is wrong; rewrite it.", generation=1)
+    assert tasks.claim(con, tid, "lock2", generation=1, pid=os.getpid())
+    monkeypatch.setenv("MISAKA_USAGE_CLAIM_LOCK", "lock2")
+    rework = todo.TodoPart(tid, "10032")
+    rework._con = con
+    rework.attach(_Session())
+    await rework.agent_start()
+    await _end_turn(rework, "Read the feedback; I will rewrite section 2 next.")
+    assert tasks.get(con, tid)["status"] == "running"
+    assert con.execute("SELECT COUNT(*) FROM events WHERE task_id=? AND kind='submitted'", (tid,)).fetchone()[0] == 1

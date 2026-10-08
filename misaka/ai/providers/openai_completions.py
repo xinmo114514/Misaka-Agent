@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import time
@@ -17,9 +18,9 @@ from misaka.ai.env_api_keys import get_env_api_key
 from misaka.ai.models import calculate_cost, clamp_thinking_level
 from misaka.ai.providers._common import (
     _await_maybe_with_signal,
-    _await_with_signal,
     _close_stream,
     _empty_usage,
+    _iterate_async_iterable,
     _option,
     resolve_cache_retention,
 )
@@ -253,6 +254,7 @@ def stream_openai_completions(
             timestamp=time.time_ns() // 1_000_000,
         )
 
+        chunks = None
         try:
             compat = get_compat(model)
             client = _option(options, "client")
@@ -360,7 +362,8 @@ def stream_openai_completions(
                     tool_call_index_by_id[tool_call["id"]] = existing_index
                 return existing_index, block
 
-            async for raw_chunk in _iterate_stream(openai_stream, _option(options, "signal")):
+            chunks = _iterate_stream(openai_stream, _option(options, "signal"))
+            async for raw_chunk in chunks:
                 if not isinstance(raw_chunk, Mapping):
                     continue
 
@@ -536,6 +539,9 @@ def stream_openai_completions(
                 output.errorMessage = f"{output.errorMessage}\n{raw_metadata['raw']}"
             stream.push(ErrorEvent(reason=output.stopReason, error=output), cause=error)
         finally:
+            if chunks is not None:          # closed now, its abort task with it, not when GC finds it
+                with contextlib.suppress(Exception):
+                    await chunks.aclose()
             stream.end()
 
     spawn_stream_task(run(), stream=stream)
@@ -1270,16 +1276,23 @@ def parse_chunk_usage(raw_usage: Mapping[str, Any], model: Model) -> Usage:
     prompt_tokens = int(raw_usage.get("prompt_tokens") or 0)
     prompt_details = raw_usage.get("prompt_tokens_details")
     prompt_details = prompt_details if isinstance(prompt_details, Mapping) else {}
-    cache_read_tokens = int(prompt_details.get("cached_tokens") or raw_usage.get("prompt_cache_hit_tokens") or 0)
+    # Where providers put cache hits (pi parseChunkUsage): OpenAI/OpenRouter in
+    # prompt_tokens_details, DeepSeek as prompt_cache_hit_tokens, Kimi at the top level.
+    cache_read_tokens = int(prompt_details.get("cached_tokens") or raw_usage.get("prompt_cache_hit_tokens")
+                            or raw_usage.get("cached_tokens") or 0)
     cache_write_tokens = int(prompt_details.get("cache_write_tokens") or 0)
     input_tokens = max(0, prompt_tokens - cache_read_tokens - cache_write_tokens)
+    # completion_tokens already includes the reasoning tokens; the breakdown is reported apart.
     output_tokens = int(raw_usage.get("completion_tokens") or 0)
+    completion_details = raw_usage.get("completion_tokens_details")
+    completion_details = completion_details if isinstance(completion_details, Mapping) else {}
 
     usage = Usage(
         input=input_tokens,
         output=output_tokens,
         cacheRead=cache_read_tokens,
         cacheWrite=cache_write_tokens,
+        reasoning=int(completion_details.get("reasoning_tokens") or 0),
         totalTokens=input_tokens + output_tokens + cache_read_tokens + cache_write_tokens,
         cost=UsageCost(input=0, output=0, cacheRead=0, cacheWrite=0, total=0),
     )
@@ -1496,26 +1509,49 @@ async def _create_completion_stream(client: Any, params: dict[str, Any], options
 
 
 async def _iterate_stream(stream_obj: Any, signal: Any = None) -> AsyncIterator[dict[str, Any]]:
-    iterator = stream_obj.__aiter__()
-    while True:
-        try:
-            chunk = await _await_with_signal(iterator.__anext__(), signal, on_abort=lambda: _close_stream(stream_obj))
-        except StopAsyncIteration:
-            return
-
-        if hasattr(chunk, "model_dump"):
-            dumped = chunk.model_dump()
-            if isinstance(dumped, dict):
-                yield dumped
+    # One abort task for the whole stream (_iterate_async_iterable), not one per SSE item: a task
+    # per item cost several loop turns per event, which a busy TUI turned into a stream that fell
+    # minutes behind the provider (GitHub issue #6).
+    # Closed with this generator, so its abort task goes with it (a turn that ended in an
+    # error left a pending signal.wait() behind until the cyclic GC destroyed it).
+    async with contextlib.aclosing(
+            _iterate_async_iterable(stream_obj, signal, on_abort=lambda: _close_stream(stream_obj))) as items:
+        async for chunk in items:
+            if hasattr(chunk, "model_dump"):
+                dumped = chunk.model_dump()
+                if isinstance(dumped, dict):
+                    yield dumped
+                    continue
+            if isinstance(chunk, dict):
+                yield chunk
                 continue
-        if isinstance(chunk, dict):
-            yield chunk
-            continue
-        yield json.loads(json.dumps(chunk, default=lambda value: value.__dict__))
+            yield json.loads(json.dumps(chunk, default=lambda value: value.__dict__))
 
 
 def _format_completion_error(error: Any) -> str:
-    return str(error) if isinstance(error, Exception) else json.dumps(error, default=str)
+    if not isinstance(error, Exception):
+        return json.dumps(error, default=str)
+    message = str(error)
+    # The SDK's "Connection error." says nothing of what failed; the transport exception it was
+    # raised from does (a read timeout, a reset, a peer that closed mid-body). Name the innermost
+    # one so a report can tell them apart (GitHub issue #6). The SDK's text stays first, which is
+    # what the retry classifier matches on.
+    cause = error.__cause__
+    for _ in range(8):  # a chain is a handful deep; the bound only guards `raise e from e`
+        if cause is None or cause.__cause__ is None:
+            break
+        cause = cause.__cause__
+    if cause is None:
+        return message
+    name = type(cause).__name__
+    if name == "LocalProtocolError":
+        # The request this side built was refused before it was sent, and the refusal quotes it:
+        # an API key with a trailing space or line break came back whole (0.18.9 sweep).
+        return f"{message} ({name}: the request could not be sent -- does the API key end in a space or a line break?)"
+    from misaka.utils.redact import redact
+    detail = redact(str(cause)).strip()
+    said = f"({name}: {detail})" if detail and detail != message.strip() else f"({name})"
+    return f"{message} {said}" if message.strip() else said
 
 
 streamOpenAICompletions = stream_openai_completions

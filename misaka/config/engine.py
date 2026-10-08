@@ -6,6 +6,9 @@ the names pi's code calls them by. Product-side CFG lives in misaka/config/produ
 
 from __future__ import annotations
 
+import itertools
+import os
+import sys
 from importlib import metadata as importlib_metadata
 from pathlib import Path
 
@@ -88,6 +91,25 @@ def configure_logging() -> str | None:
 
 def get_bin_dir() -> str:
     return str(home.path("bin"))
+
+
+def bundle_root() -> Path | None:
+    """The release archive this interpreter runs from, or None. An archive carries its own
+    CPython at ``python/`` beside ``bin/misaka`` and ``BUNDLED.txt`` (scripts/build_release.py)."""
+    root = Path(sys.prefix).parent
+    return root if (root / "BUNDLED.txt").is_file() and (root / "bin").is_dir() else None
+
+
+def bundle_installer(root: Path) -> str:
+    """Who put a release archive where it is: Homebrew keeps it in its Cellar, winget under its
+    Packages folder; "" for MISAKA's own installer. Each is updated and removed by its own tool."""
+    parts = [part.casefold() for part in Path(os.path.realpath(root)).parts]
+    pairs = set(itertools.pairwise(parts))
+    if ("cellar", "misaka") in pairs:                      # <prefix>/Cellar/misaka/<version>/libexec
+        return "Homebrew"
+    if ("winget", "packages") in pairs and any(part.startswith("luciole-studio.misaka") for part in parts):
+        return "winget"
+    return ""
 
 
 def _get_package_module_dir() -> Path:

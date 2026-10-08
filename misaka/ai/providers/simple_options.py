@@ -130,7 +130,50 @@ def adjust_max_tokens_for_thinking(
     return AdjustedThinkingTokens(maxTokens=max_tokens, thinkingBudget=thinking_budget)
 
 
+def thinking_allowance(model: Model, options: SimpleStreamOptions | None) -> int:
+    """Thinking a provider adapter requests *beyond* ``maxTokens`` for this request, in tokens.
+
+    Two adapters add one: budget-thinking Claude (``anthropic-messages``, Bedrock), whose wire
+    ``max_tokens`` is ``min(base + budget, model max)`` (``adjust_max_tokens_for_thinking``), and
+    Gemini 2.5, whose ``thinkingBudget`` is not counted in ``maxOutputTokens`` (a dynamic budget,
+    ``-1``, is taken as the model's whole output). Every other adapter -- adaptive Claude, the
+    OpenAI APIs, DeepSeek (its ``max_tokens`` covers the reasoning, api-docs.deepseek.com),
+    Mistral -- counts thinking inside ``maxTokens``. The one place these rules are written down:
+    the token-cap meter (``misaka.core.platform.metering``) budgets a request from it.
+    """
+    from misaka.utils.values import read_field
+    reasoning = read_field(options, "reasoning") if options is not None else None
+    if not reasoning or reasoning == "off" or not getattr(model, "reasoning", False):
+        return 0
+    budgets = read_field(options, "thinkingBudgets")
+    if model.api == "anthropic-messages":
+        from misaka.ai.providers.anthropic import _force_adaptive_thinking
+        return 0 if _force_adaptive_thinking(model) is True else thinking_budget_for_level(reasoning, budgets)
+    if model.api == "bedrock-converse-stream":
+        from misaka.ai.providers.amazon_bedrock import (
+            is_anthropic_claude_model,
+            supports_adaptive_thinking,
+        )
+        if is_anthropic_claude_model(model) and not supports_adaptive_thinking(model.id, model.name):
+            return thinking_budget_for_level(reasoning, budgets)
+        return 0
+    if model.api in ("google-generative-ai", "google-vertex"):
+        from misaka.ai.models import clamp_thinking_level
+        from misaka.ai.providers.google import get_google_budget
+        from misaka.ai.providers.google_shared import (
+            resolve_google_thinking_level,
+            uses_google_thinking_level,
+        )
+        clamped = clamp_thinking_level(model, reasoning)
+        if clamped == "off" or uses_google_thinking_level(model):
+            return 0
+        budget = get_google_budget(model, resolve_google_thinking_level(model, clamped), budgets)
+        return int(model.maxTokens or 0) if budget == -1 else max(0, int(budget))
+    return 0
+
+
 __all__ = [
     "DEFAULT_THINKING_BUDGETS",
+    "thinking_allowance",
     "thinking_budget_for_level",
     ]

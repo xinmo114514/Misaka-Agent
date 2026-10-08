@@ -2,6 +2,7 @@
 import argparse
 import os
 import sys
+import time
 
 from misaka.cli import bootstrap
 from misaka.config import CFG, VERSION, current_config, home, layout
@@ -28,15 +29,26 @@ def _parser(extension_commands=None):
     p.add_argument("--version", "-V", action="version", version=VERSION)
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    tk = sub.add_parser("task", help="Manage task cards")
-    tk.add_argument("task_id")
-    tk.add_argument("--delete", action="store_true", required=True,
-                    help="Delete the card and its event history")
+    tk = sub.add_parser("task", help="Add a task card, start one, or delete one",
+                        usage="misaka task add TITLE --to SISTER (--body TEXT | --body-file PATH) [options]\n"
+                              "       misaka task start ID\n"
+                              "       misaka task ID --delete")
+    tk.add_argument("words", nargs="+", help=argparse.SUPPRESS)
+    tk.add_argument("--delete", action="store_true", help="Delete the card and its event history")
+    tk.add_argument("--to", metavar="SISTER", help="add: the Sister (or ally) the card is for")
+    tk.add_argument("--body", help="add: the task contract; it must have a `## acceptance criteria` section")
+    tk.add_argument("--body-file", help="add: read the task contract from this file")
+    tk.add_argument("--reviewer", help="add: an independent reviewer, a Sister other than the assignee")
+    tk.add_argument("--priority", type=int, default=0, help="add: higher runs first (default: 0)")
+    tk.add_argument("--model", help="add: the model for this card only (default: the Sister's own)")
+    tk.add_argument("--needs", action="append", default=[], metavar="ID",
+                    help="add: a card this one waits for (repeatable)")
 
     sub.add_parser("board", help="Show the task board")
     sub.add_parser("allies", help="List the enabled allies and whether each can take a card (spends no quota)")
 
-    dmp = sub.add_parser("dm", help="Deliver a message to an agent's contact session and run one turn")
+    dmp = sub.add_parser("dm", help="Deliver a message to an agent's contact session and run one turn "
+                         "(a running research node is told with misaka research --tell)")
     dmp.add_argument("to", help="Recipient: last-order or a Sister ID")
     dmp.add_argument("message", nargs="?", help="Message body (omitted: deliver what is already queued)")
     dmp.add_argument("--from", dest="sender", help="Sender role (default: the user)")
@@ -110,10 +122,19 @@ def _parser(extension_commands=None):
     access.add_argument("--read-only", action="store_true",
                     help="Show existing session records without starting an agent")
 
+    us = sub.add_parser("usage", help="What research runs spent: tokens and money, by conversation and by model")
+    us.add_argument("--run", metavar="RUN_ID", help="One run, by conversation and by model")
+    us.add_argument("--limit", type=int, default=10, help="How many recent runs to list without --run (default: 10)")
+
     rs = sub.add_parser("research", help="Run the Research Workflow on a question")
     rs.add_argument("goal", nargs="?", help="Research question for a new run")
     rs.add_argument("--resume", metavar="RUN_ID", help="Resume an existing research run")
-    rs.add_argument("--depth", type=int, default=3, help="Maximum branch depth")
+    rs.add_argument("--tell", metavar="RUN_ID",
+                    help="Say GOAL (the message) to a running node's Last Order, the root's unless --to names a node")
+    rs.add_argument("--to", metavar="NODE_ID", help="With --tell: the node whose Last Order hears it")
+    rs.add_argument("--limits", metavar="RUN_ID",
+                    help="Change the limits of a running run to the options given with it (--sister-parallel 2 ...)")
+    rs.add_argument("--depth", type=int, help="Maximum branch depth (default: 3)")
     rs.add_argument("--parallel", type=int, help="Maximum concurrent LO nodes (default: 4); saved with the run")
     rs.add_argument("--sister-parallel", type=int,
                     help="Maximum active Sister cards per LO node (default: 4); saved with the run, subject to global admission limits")
@@ -196,6 +217,7 @@ def _parser(extension_commands=None):
     dc.add_argument("arg", nargs="?", help="File path (add), folder (scan; default: this folder), "
                                            "query (find), quote (verify), or document ID (tree)")
     dc.add_argument("--doc", help="Restrict to one document ID")
+    dc.add_argument("--page", type=int, help="verify: the page the quotation is cited on")
     dc.add_argument("--no-tree", action="store_true", help="Skip PageIndex structure extraction")
 
 
@@ -351,15 +373,106 @@ def _cmd_dm(args):
 def _cmd_task(args):
     from misaka.core.platform import cards as card_files
     con = db.connect(CFG["db"])
-    row = db.get(con, args.task_id)
-    ok, msg = (card_files.remove(con, row["workspace"], args.task_id) if row
-               else (False, f"Card not found: {args.task_id}"))
+    op, rest = args.words[0], args.words[1:]
+    if op == "add":
+        sys.exit(_task_add(con, " ".join(rest), args))
+    if op == "start" and len(rest) == 1:
+        sys.exit(_task_start(con, rest[0]))
+    if not args.delete or rest:
+        sys.exit("usage: misaka task add TITLE --to SISTER (--body TEXT | --body-file PATH) | "
+                 "misaka task start ID | misaka task ID --delete")
+    row = db.get(con, op)
+    ok, msg = (card_files.remove(con, row["workspace"], op) if row
+               else (False, f"Card not found: {op}"))
     print(msg)
     sys.exit(0 if ok else 1)
 
 
+def _task_add(con, title, args):
+    """A card made by hand: the front door, checks and defaults of Last Order's ``misaka_card``."""
+    from misaka.core.network import roster, validate
+    from misaka.core.platform import cards as card_files
+    body = args.body
+    if args.body_file:
+        try:
+            with open(args.body_file, encoding="utf-8-sig") as f:   # Notepad's BOM is not the body's
+                body = f.read()
+        except OSError as error:
+            return f"Cannot read {args.body_file}: {error}"
+        except UnicodeDecodeError:
+            return f"{args.body_file} is not UTF-8 text; save it as UTF-8 (Notepad: Save as, Encoding: UTF-8)."
+    cards, errors = validate.validate_cards(
+        [{"title": title, "body": body, "assignee": args.to, "priority": args.priority, "model": args.model}],
+        roster.executors())
+    if args.reviewer and args.reviewer not in set(roster.roster_names()):
+        errors.append(f"reviewer {args.reviewer} is not in the Sister roster")
+    if args.reviewer and args.reviewer == args.to:
+        errors.append("the reviewer must be different from the assignee")
+    if errors:
+        return ("Card not added: " + "; ".join(errors) +
+                "\nThe body is the task contract: `## goal`, `## boundaries` and `## acceptance criteria`.")
+    card = cards[0]
+    try:
+        tid = card_files.create(con, db.canonical_workspace(), card["title"], card["body"], card["assignee"],
+                                model=card["model"], priority=card["priority"], reviewer=args.reviewer,
+                                needs=args.needs)
+    except ValueError as error:
+        return f"Card not added: {error}"
+    print(f"Added {tid}: {card['title']} → {card['assignee']}. Work has not started: "
+          f"misaka task start {tid}, or ask Last Order to dispatch it.")
+    return 0
+
+
+def _task_start(con, task_id):
+    """Run one ready card in this terminal: the claim, admission, budget and settling a pane or
+    Last Order's dispatch would give it (``dispatch.run_task``)."""
+    from misaka.core.network import dispatch
+    from misaka.core.research import runs
+    row = db.get(con, task_id)
+    if row is None:
+        return f"Card not found: {task_id}"
+    context = runs.task_contexts(con).get(task_id)
+    if context:
+        return (f"Card {task_id} belongs to research run {context['run_id']}, whose driver starts it; "
+                f"/research resume {context['run_id']} continues a paused run.")
+    if row["status"] != "ready":
+        return f"Card {task_id} is {row['status']}; only a ready card can be started."
+    from misaka.utils import loop_watchdog
+    loop_watchdog.configure(f"task-{task_id}", exit_on_stall=False)
+    print(f"Running {task_id} → {row['assignee']} in this terminal (Ctrl+C stops it)…", flush=True)
+    ran = dispatch.run_task(con, row, current_config())
+    after = db.get(con, task_id)
+    print(f"Card {task_id}: {after['status'] if after else 'gone'}.")
+    return 0 if ran else 1
+
+
 def _cmd_board(args):
     tail.board_view(db.connect(CFG["db"]), db.canonical_workspace())
+
+
+def _cmd_usage(args):
+    from misaka.core.research import runs, usage
+    cfg = current_config()
+    con = db.connect(cfg["db"])
+    runs.init(con)
+    if args.run:
+        run = runs.get(con, args.run)
+        if not run:
+            sys.exit(f"Research run not found: {args.run}")
+        scope = {run["id"], *(task["id"] for task in runs.tasks(con, run["id"]))}
+        print(usage.report(con, run, ledger_tokens=budget.spent(con, task_ids=scope)))
+        return
+    recent = con.execute("SELECT * FROM research_runs ORDER BY created_at DESC LIMIT ?", (max(1, args.limit),)).fetchall()
+    for run in recent:
+        spent = usage.run_usage(con, run)["total"]
+        print(f"{run['id']}  {time.strftime('%Y-%m-%d', time.localtime(run['created_at']))}  {run['status']:<8} "
+              f"{spent['tokens']:>13,} tokens  {usage.money(spent):<10}  {' '.join(run['question'].split())[:50]}")
+    if not recent:
+        print("No research runs yet.")
+    cap = int(cfg.get("token_cap") or 0)
+    print(f"Board token ledger: {budget.spent(con):,} tokens recorded"
+          + (f"; research.token_cap is {cap:,} for each research run" if cap else "")
+          + ". One run in detail: misaka usage --run RUN_ID")
 
 
 def _cmd_research(args):
@@ -378,6 +491,33 @@ def _cmd_research(args):
                     "Create at least one Sister first, for example: misaka create 10032")
     con = db.connect(cfg["db"])
     runs.init(con)
+    def chosen_limits():
+        chosen = {"max_depth": args.depth, "parallel": args.parallel, "sister_parallel": args.sister_parallel,
+                  "max_followups": args.followups, "max_revisions": args.revisions, "max_nodes": args.max_nodes}
+        return {key: value for key, value in chosen.items() if value is not None}
+
+    if args.tell:
+        from misaka.core.research import window
+        run = runs.get(con, args.tell)
+        if not run:
+            sys.exit(f"Research run not found: {args.tell}")
+        try:
+            path = _asyncio.run(window.tell(con, run, args.goal, node_id=args.to))
+        except ValueError as error:
+            sys.exit(str(error))
+        print(f"Told the Last Order of {args.to or 'the root'} ({run['id']}). Her answer is written to her "
+              f"conversation; follow it with: misaka chat --attach --session {path}")
+        return
+    if args.limits:
+        chosen = chosen_limits()
+        if not chosen:
+            sys.exit("Name the limits to change, for example: misaka research --limits RUN_ID --sister-parallel 2")
+        try:
+            before, after = runs.update_limits(con, args.limits, chosen)
+        except ValueError as error:
+            sys.exit(str(error))
+        print(f"Research run {args.limits}: {runs.limits_changed(before, after)}")
+        return
     if args.resume:
         run = runs.get(con, args.resume)
         if not run:
@@ -401,10 +541,7 @@ def _cmd_research(args):
         if not args.goal:
             sys.exit("A new research run requires a question; use --resume RUN_ID to continue one.")
         try:
-            chosen = {"parallel": args.parallel, "sister_parallel": args.sister_parallel, "max_followups": args.followups,
-                      "max_revisions": args.revisions, "max_nodes": args.max_nodes}
-            limits = runs.normalize_limits({"max_depth": args.depth,
-                                            **{key: value for key, value in chosen.items() if value is not None}})
+            limits = runs.normalize_limits(chosen_limits())
         except ValueError as error:
             sys.exit(str(error))
         from misaka.core.platform import cards as card_files
@@ -419,9 +556,11 @@ def _cmd_research(args):
             print(f"  - {item['title']} → Sister {item['assignee']}", flush=True)
 
     try:
-        out = _asyncio.run(workflow.run(
-            con, cfg, research_node.ProcessSpawner(),
-            run_id=run["id"], poll_seconds=1.0, resume=bool(args.resume), progress=progress))
+        from misaka.utils import loop_watchdog
+        loop_watchdog.configure("research", exit_on_stall=False)
+        out = _asyncio.run(loop_watchdog.watched(workflow.run(
+            con, cfg, research_node.ProcessSpawner(show_output=True),   # nodes print beside this output, in a pane's shell too
+            run_id=run["id"], poll_seconds=1.0, resume=bool(args.resume), progress=progress)))
     except RuntimeError as err:
         # Node failures already print their own reason above; the workflow's own summary is
         # the useful part, and a traceback of the event loop is not.
@@ -656,20 +795,46 @@ def _cmd_bundles(args):
         sys.exit(str(error))
 
 
+def _doc_notes(did, since):
+    """What indexing ``did`` left unread, and what it re-read at or after ``since``."""
+    ddir = corpus.resolve_doc(did, workspace=db.canonical_workspace())
+    meta = (corpus._read_meta_at(ddir) if ddir else None) or {}
+    notes = []
+    listed = meta.get("unread_pages") if isinstance(meta.get("unread_pages"), dict) else {}
+    unread = {n: why for n, why in listed.items() if not str(why).endswith(corpus.OCR_FOUND_NOTHING)}
+    if unread:
+        reasons = sorted(set(unread.values()))
+        notes.append(f"{len(unread)} page(s) need OCR and were not read: {reasons[0]}"
+                     + (f" (and {len(reasons) - 1} other reason(s))" if len(reasons) > 1 else ""))
+    if textless := len(listed) - len(unread):
+        notes.append(f"{textless} page(s) hold no text OCR could read (blank pages, pictures, maps)")
+    reread = meta.get("reread")
+    if isinstance(reread, dict) and int(reread.get("at") or 0) >= since:
+        notes.append(f"re-read by the current extractor: {len(reread.get('pages') or [])} page(s) changed "
+                     f"({reread.get('pages_before')} -> {meta.get('pages')} pages)")
+    return notes
+
+
 def _cmd_doc(args):
     if args.action == "add":
         if not args.arg:
             sys.exit("Usage: misaka doc add <file> [--no-tree]")
+        since = int(time.time())
         did, n = corpus.ingest(args.arg, with_tree=not args.no_tree, workspace=db.canonical_workspace())
         doc = corpus.resolve_doc(did, workspace=db.canonical_workspace())
         has = doc and os.path.exists(os.path.join(doc, "tree.json"))
         structure = "with PageIndex structure" if has else "page navigation only"
         print(f"Added {os.path.basename(args.arg)} as {did}: {n} pages, {structure}.")
+        for note in _doc_notes(did, since):
+            print(f"  {note}")
     elif args.action == "scan":
         target = args.arg or os.getcwd()
+        since = int(time.time())
         ingested, skipped = corpus.scan(target, with_tree=not args.no_tree, workspace=db.canonical_workspace())
         for did, path in ingested:
             print(f"  {did}  {path}")
+            for note in _doc_notes(did, since):
+                print(f"      {note}")
         for path, reason in skipped:
             print(f"  skipped {path}: {reason}")
         if not ingested:
@@ -686,15 +851,20 @@ def _cmd_doc(args):
     elif args.action == "find":
         hits = corpus.search_literal(args.arg, doc_id=args.doc, workspace=db.canonical_workspace())
         for h in hits:
-            print(f"  {h['doc_id']} p{h['page']}  {h['s'][:90]}")
+            printed = f" (printed p. {h['printed']})" if h.get("printed") else ""
+            print(f"  {h['doc_id']} p{h['page']}{printed}  {h['s'][:90]}")
         print(f"{len(hits)} match(es). Use `misaka doc verify` before citing a quotation.")
     elif args.action == "verify":
         if not args.arg or not args.doc:
             sys.exit("Usage: misaka doc verify <quote> --doc <doc-id>")
-        v = corpus.verify_quote(args.doc, args.arg, workspace=db.canonical_workspace())
-        if not v:
+        found = corpus.locate_quote(args.doc, args.arg, args.page, workspace=db.canonical_workspace())
+        if found["status"] in ("not_found", "no_document"):
             sys.exit("❌ Quote not found in that document.")
-        print(f"✅ p{v['page']} offset {v['offset']}\n   claim_hash {v['claim_hash']}")
+        v = found
+        if found["status"] == "elsewhere":
+            print(f"⚠ Not on page {args.page}: it is on page {v['page']}.")
+        printed = f" (printed p. {v['printed']}, from {v['printed_from']})" if v.get("printed") else ""
+        print(f"✅ p{v['page']}{printed} offset {v['offset']}\n   claim_hash {v['claim_hash']}")
     elif args.action == "tree":
         if not (args.arg or args.doc):
             sys.exit("Usage: misaka doc tree <doc-id>")
@@ -747,6 +917,7 @@ COMMANDS = {
     "task": _cmd_task,
     "board": _cmd_board,
     "research": _cmd_research,
+    "usage": _cmd_usage,
     "web": _cmd_web,
     "moa": _cmd_moa,
     "skills": _cmd_skills,

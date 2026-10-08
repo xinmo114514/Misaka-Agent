@@ -475,14 +475,11 @@ async def test_research_inherits_order_and_preserves_selection_through_lifecycle
 @pytest.mark.parametrize("outcome", ["answer", "error", "cancelled"])
 async def test_research_turn_rechecks_selection_and_keeps_mode_between_turns(prompt_home, monkeypatch, outcome, thinking):
     import asyncio
-    from types import SimpleNamespace
 
     from misaka.core.platform.toolkit import tool_definition
     from misaka.core.research import window
     from misaka.core.research.tool_policy import research_tools
 
-    monkeypatch.setattr(window.worker, "_reserve_usage", lambda *_: {"allowed": True, "token": None})
-    monkeypatch.setattr(window.worker, "_UsageRecorder", lambda *_: SimpleNamespace(settle=lambda *_: None))
     async with assembled(prompt_home, "last_order", "foreground") as session:
         # Research must preserve the current selection, independent of model clamping.
         session.agent.state.thinkingLevel = thinking

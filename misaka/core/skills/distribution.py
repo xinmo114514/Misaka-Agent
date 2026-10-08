@@ -90,8 +90,12 @@ def _install(identifier, *, sources, category='', force=False, update=False):
     if total > 64 * 1024 * 1024 or len(bundle.files) > 4096:
         raise ValueError('Skill bundle exceeds the byte/file budget.')
     stage = native.quarantine_bundle(bundle)
-    scan, provenance = guard.scan_skill_cached(stage, source=bundle.metadata.get('repo') or (bundle.identifier.rsplit("/", 1)[0] if bundle.source == "github" else bundle.trust_level),
-                                                source_url=bundle.identifier)
+    # A shipped official bundle scans under Hermes' reserved label "official" (skills_hub.
+    # _scan_quarantined); its trust_level "builtin" is no label the scanner knows and read as
+    # community. Live third-party content behind an official entry ("trusted") stays as it was.
+    label = ("official" if bundle.source == "official" and bundle.trust_level == "builtin"
+             else bundle.metadata.get('repo') or (bundle.identifier.rsplit("/", 1)[0] if bundle.source == "github" else bundle.trust_level))
+    scan, provenance = guard.scan_skill_cached(stage, source=label, source_url=bundle.identifier)
     allowed, reason = guard.should_allow_install(scan, force=force)
     try:
         advisory = tier1.run_tier1_scan(stage) if tier1.tier1_advisory_enabled() else tier1.Tier1Report(available=False, error='disabled')
