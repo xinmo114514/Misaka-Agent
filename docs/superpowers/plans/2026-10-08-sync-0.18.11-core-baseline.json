@@ -712,5 +712,6 @@
     "misaka/ui/tui/tui.py": "8c883f1094eabb8a20279d55cfd7596f4d686174760ed2d13d769f1e2342fa7e",
     "misaka/ui/tui/undo_stack.py": "b620848469ac1b057b6835b5fa1832d235975fe7d259d508e4c009e8863f3be8",
     "misaka/ui/tui/utils.py": "ba6e4a1d0cdf0a2126dbf819dd5fae0248a6b742ccccb4b58c5aafab3a1042b3"
-  }
+  },
+  "integration_commit": "7336ce81cb0997ad9d23eda59d54aa52f0d14d4b"
 }
