@@ -135,6 +135,48 @@ def create_sister(sid, root=None, specialty=None, model=None, thinking=None):
     )
 
 
+def ensure_research_sisters(root=None):
+    """Seed an empty usable research roster without replacing any existing profiles.
+
+    A cross-process lock covers discovery and both canonical ``create_sister`` calls:
+    concurrent desktop hosts see complete durable profiles, not half-written files.
+    Existing specialists keep their files, settings and mounted skills untouched.
+    """
+    from filelock import FileLock
+
+    from misaka.utils.frontmatter import parse_frontmatter
+
+    root = os.path.abspath(os.path.expanduser(root or current_config()["profiles_root"]))
+    os.makedirs(root, exist_ok=True)
+
+    def usable():
+        out = []
+        for sid in roster_names(root):
+            if not _valid(sid) or not os.path.isfile(os.path.join(root, sid, "SOUL.md")):
+                continue
+            try:
+                with open(os.path.join(root, sid, "DESCRIBE.md"), encoding="utf-8-sig") as source:
+                    parsed = parse_frontmatter(source.read())
+            except (OSError, ValueError):
+                continue  # Keep the original profile; its diagnostic is not a capability.
+            if str(parsed.frontmatter.get("description") or "").strip() or parsed.body.strip():
+                out.append(sid)
+        return out
+
+    with FileLock(os.path.join(root, ".research-roster.lock"), timeout=30):
+        existing = usable()
+        if existing:
+            return existing
+        for sid, specialty in (
+            ("research-generalist", "Find and compare evidence, investigate sources, and synthesize research findings."),
+            ("research-reviewer", "Independently scrutinize evidence, challenge assumptions, and review research conclusions."),
+        ):
+            ok, message = create_sister(sid, root=root, specialty=specialty)
+            if not ok:
+                raise ValueError(message)
+        return usable()
+
+
 def describe(sid, root=None):
     """Return the short description and body from DESCRIBE.md."""
     from misaka.utils.frontmatter import parse_frontmatter

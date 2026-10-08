@@ -10,6 +10,9 @@ import {
   ShieldAlert,
 } from 'lucide-react'
 import type { ChatMessage } from '../../types/session'
+import { useSessionStore } from '../../store/useSessionStore'
+import { ResearchRunPill } from './ResearchRunPill'
+import { ResearchFinalReport } from './ResearchFinalReport'
 
 /**
  * One engine notice from the conversation's own feed.
@@ -65,6 +68,28 @@ const TONE_LABEL: Record<Tone, string> = {
 export const CustomNotice: React.FC<{ message: ChatMessage }> = ({ message }) => {
   // The engine decides what the feed shows; a notice it marked hidden stays out of the timeline.
   if (message.display === false) return null
+
+  const customType = message.customType || ''
+  const runId = String(message.details?.run_id || message.details?.runId || '')
+
+  if (customType === 'research-final') {
+    return <ResearchFinalReport message={message} />
+  }
+
+  if (customType.startsWith('research-') && runId) {
+    const state = useSessionStore.getState()
+    const allMessages = state.agentMode === 'research' && state.researchBinding ? state.researchConversation.messages : state.messages
+    const firstNoticeForRun = allMessages.find(m =>
+      m.role === 'custom' &&
+      m.customType?.startsWith('research-') &&
+      m.customType !== 'research-final' &&
+      (m.details?.run_id === runId || m.details?.runId === runId)
+    )
+    if (firstNoticeForRun && firstNoticeForRun.id === message.id) {
+      return <ResearchRunPill runId={runId} />
+    }
+    return null
+  }
 
   const kind = KINDS[message.customType || ''] || {
     label: message.customType || '系统消息',

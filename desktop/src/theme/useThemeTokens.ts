@@ -17,6 +17,16 @@ export interface ThemeTokens {
   warning: string
   danger: string
   info: string
+  graphBackground: string
+  graphGrid: string
+  graphEdge: string
+  graphEdgeActive: string
+  graphEdgeStrong: string
+  graphMinimapMask: string
+  graphControlBg: string
+  graphControlHover: string
+  graphControlText: string
+  graphControlBorder: string
 }
 
 const VAR_NAMES: Record<keyof ThemeTokens, string> = {
@@ -36,6 +46,16 @@ const VAR_NAMES: Record<keyof ThemeTokens, string> = {
   warning: '--warning',
   danger: '--danger',
   info: '--info',
+  graphBackground: '--graph-background',
+  graphGrid: '--graph-grid',
+  graphEdge: '--graph-edge',
+  graphEdgeActive: '--graph-edge-active',
+  graphEdgeStrong: '--graph-edge-strong',
+  graphMinimapMask: '--graph-minimap-mask',
+  graphControlBg: '--graph-control-bg',
+  graphControlHover: '--graph-control-hover',
+  graphControlText: '--graph-control-text',
+  graphControlBorder: '--graph-control-border',
 }
 
 function readTokens(): ThemeTokens {
@@ -69,11 +89,13 @@ export function useThemeTokens(): ThemeTokens {
 /** Convert a resolved hex token into an rgba() string with the given alpha. */
 export function withAlpha(color: string, alpha: number): string {
   const hex = color.trim()
-  if (!/^#[0-9a-fA-F]{6}$/.test(hex)) {
-    return `rgba(128, 128, 128, ${alpha})`
+  if (!/^#[0-9a-fA-F]{6}(?:[0-9a-fA-F]{2})?$/.test(hex)) {
+    return 'rgba(0, 0, 0, 0)'
   }
   const r = parseInt(hex.slice(1, 3), 16)
   const g = parseInt(hex.slice(3, 5), 16)
   const b = parseInt(hex.slice(5, 7), 16)
-  return `rgba(${r}, ${g}, ${b}, ${alpha})`
+  const sourceAlpha = hex.length === 9 ? parseInt(hex.slice(7, 9), 16) / 255 : 1
+  const composed = sourceAlpha * Math.max(0, Math.min(1, Number.isFinite(alpha) ? alpha : 0))
+  return `rgba(${r}, ${g}, ${b}, ${composed})`
 }

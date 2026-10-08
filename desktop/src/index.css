@@ -1,25 +1,64 @@
+@import './styles/conversation.css';
+@import './styles/materials.css';
 @import "tailwindcss";
 
-/* Shadow ink is derived from the runtime --rose so elevation follows whichever
-   theme JSON is active; applyThemeToDom never writes these, so they are safe here. */
-:root {
-  --shadow-ink: color-mix(in srgb, var(--rose) 16%, #000);
-  --shadow-catch: color-mix(in srgb, #ffffff 8%, transparent);
-  /* Recessed layer. Tinting the well with --shadow-ink would *raise* the red channel
-     on a near-black surface, so it mixes toward black instead; dark has far less
-     headroom below surface-0 and needs to push harder to read as recessed. */
-  --well: color-mix(in srgb, var(--surface-0) 82%, #000);
-}
-
-:root[data-theme="light"] {
-  --shadow-ink: color-mix(in srgb, var(--rose) 30%, #000);
-  /* A white top light-catch on a white card is a no-op; keep the layer count
-     identical across themes so box-shadow stays interpolable during the cross-fade. */
-  --shadow-catch: transparent;
-  --well: color-mix(in srgb, var(--surface-0) 92%, #000);
-}
-
 @theme inline {
+  --color-on-accent: var(--on-accent);
+  --color-on-danger: var(--on-danger);
+  --color-on-chart: var(--on-chart);
+  --color-switch-thumb: var(--switch-thumb);
+  --color-overlay: var(--overlay);
+  --color-copy-success: var(--copy-success);
+  --color-activity-ping: var(--activity-ping);
+  --color-activity-dot: var(--activity-dot);
+  --color-permission-plan: var(--permission-plan);
+  --color-permission-edit: var(--permission-edit);
+  --color-permission-bypass: var(--permission-bypass);
+  --color-slider-thumb: var(--slider-thumb);
+  --color-slider-thumb-border: var(--slider-thumb-border);
+  --color-slider-passed: var(--slider-passed);
+  --color-slider-streak: var(--slider-streak);
+  --color-brand-zhipu: var(--brand-zhipu);
+  --color-brand-deepseek: var(--brand-deepseek);
+  --color-brand-anthropic: var(--brand-anthropic);
+  --color-brand-openai: var(--brand-openai);
+  --color-brand-kimi: var(--brand-kimi);
+  --color-brand-xiaomi: var(--brand-xiaomi);
+  --color-brand-qwen: var(--brand-qwen);
+  --color-brand-custom: var(--brand-custom);
+  --color-scrollbar-thumb: var(--scrollbar-thumb);
+  --color-scrollbar-hover: var(--scrollbar-hover);
+  --color-shadow-ink: var(--shadow-ink);
+  --color-shadow-catch: var(--shadow-catch);
+  --color-glass-highlight: var(--glass-highlight);
+  --color-band-1: var(--band-1);
+  --color-band-2: var(--band-2);
+  --color-band-3: var(--band-3);
+  --color-thinking-quiet: var(--thinking-quiet);
+  --color-md-heading: var(--md-heading);
+  --color-md-link: var(--md-link);
+  --color-md-code: var(--md-code);
+  --color-md-quote: var(--md-quote);
+  --color-md-quote-border: var(--md-quote-border);
+  --color-md-hr: var(--md-hr);
+  --color-md-list-marker: var(--md-list-marker);
+  --color-md-table-header: var(--md-table-header);
+  --color-tool-title: var(--tool-title);
+  --color-tool-output: var(--tool-output);
+  --color-tool-error: var(--tool-error);
+  --color-tool-error-border: var(--tool-error-border);
+  --color-graph-background: var(--graph-background);
+  --color-graph-grid: var(--graph-grid);
+  --color-graph-edge: var(--graph-edge);
+  --color-graph-edge-active: var(--graph-edge-active);
+  --color-graph-edge-strong: var(--graph-edge-strong);
+  --color-graph-minimap-mask: var(--graph-minimap-mask);
+  --color-graph-control-bg: var(--graph-control-bg);
+  --color-graph-control-surface: var(--graph-control-surface);
+  --color-graph-minimap-background: var(--graph-minimap-background);
+  --color-graph-control-hover: var(--graph-control-hover);
+  --color-graph-control-text: var(--graph-control-text);
+  --color-graph-control-border: var(--graph-control-border);
   --color-accent: var(--accent);
   --color-rose: var(--rose);
   --color-rose-lite: var(--rose-lite);
@@ -119,90 +158,6 @@
   --shadow-2xl: var(--shadow-e4);
 }
 
-/* Dark defaults. Runtime values are overwritten from the active theme JSON. */
-:root,
-:root[data-theme="dark"] {
-  --accent: #cb3862;
-  --rose: #cb3862;
-  --rose-lite: #e8698c;
-  --surface-0: #18181e;
-  --surface-1: #1e1e24;
-  --surface-2: #25252d;
-  --surface-3: #2c2c36;
-  --surface-hover: #232329;
-  --border-subtle: #2a2a33;
-  --border: #37373f;
-  --border-strong: #4a3d42;
-  --border-accent: #8f2545;
-  --text-main: #ffffff;
-  --muted: #bba8ad;
-  --dim: #a99398;
-  --disabled: #6e5f64;
-  --focus-ring: #e8698c;
-  --thinking-text: #c99bb4;
-
-  --success: #acd39c;
-  --warning: #e0b23e;
-  --danger: #e05252;
-  --info: #8fb8e8;
-  --success-surface: #1e2a22;
-  --warning-surface: #2f2716;
-  --danger-surface: #331d20;
-  --info-surface: #1c2531;
-  --success-border: #3c5a42;
-  --warning-border: #5c4a1f;
-  --danger-border: #5e3238;
-  --info-border: #34506e;
-
-  --chart-1: #cb3862;
-  --chart-2: #e0b23e;
-  --chart-3: #acd39c;
-  --chart-4: #3c9a80;
-  --chart-5: #4f70c4;
-  --chart-6: #c191d4;
-}
-
-:root[data-theme="light"] {
-  --surface-0: #faf4f6;
-  --surface-1: #ffffff;
-  --surface-2: #f3e9ee;
-  --surface-3: #e9dde4;
-  --surface-hover: #f7eef3;
-  --border-subtle: #ede0e6;
-  --border: #dcc8d1;
-  --border-strong: #c4a4b1;
-  --border-accent: #e0a9bd;
-  --text-main: #332028;
-  --muted: #8a7078;
-  --dim: #a89098;
-  --disabled: #b8a6ad;
-  --accent: #b12a55;
-  --rose: #b12a55;
-  --rose-lite: #cf4a76;
-  --focus-ring: #b12a55;
-  --thinking-text: #8d4470;
-
-  --success: #2f6b34;
-  --warning: #8a5d12;
-  --danger: #b3302f;
-  --info: #2c5c94;
-  --success-surface: #e8f3e9;
-  --warning-surface: #f8efdc;
-  --danger-surface: #f8e5e6;
-  --info-surface: #e7eff8;
-  --success-border: #b6d5b9;
-  --warning-border: #e0c68c;
-  --danger-border: #e8b6b7;
-  --info-border: #b3cbe6;
-
-  --chart-1: #b12a55;
-  --chart-2: #a56a1e;
-  --chart-3: #3f7a3f;
-  --chart-4: #2f7a68;
-  --chart-5: #4f5fa8;
-  --chart-6: #8d4470;
-}
-
 /* Theme switch cross-fade: applyThemeToDom toggles the class for the length of one switch. */
 html.theme-switching,
 html.theme-switching *,
@@ -225,7 +180,7 @@ html.theme-switching *::after {
   }
 }
 
-/* Brand atmosphere: the rose tint lives in background-color (which the cross-fade
+/* Dark-mode brand atmosphere: the rose tint lives in background-color (which the cross-fade
    above transitions) and only the shape lives in the mask, because a gradient in
    background-image cannot interpolate and would snap mid-switch. */
 .misaka-atmosphere {
@@ -240,6 +195,392 @@ html.theme-switching *::after {
   mask-image:
     radial-gradient(720px 420px at 16% -6%, #000 0%, transparent 66%),
     radial-gradient(640px 380px at 90% 106%, #000 0%, transparent 70%);
+}
+
+/* Keep light-mode canvases pure white; accents belong to local controls and states. */
+html[data-theme-mode="light"] .misaka-atmosphere {
+  display: none;
+}
+
+/* Thinking-strength slider. Same discipline as .misaka-atmosphere above: every
+   theme-dependent value is a background-color / border-color / box-shadow, because
+   those are the only properties the 240ms cross-fade transitions. The gradient and
+   the fill length are therefore both shapes -- clip-path / mask-image, holding nothing but
+   #000 and transparent -- never background-image, which would snap mid-switch. */
+.misaka-thinking-rail {
+  position: relative;
+  height: var(--rail-h, 24px);
+  outline: none;
+  touch-action: none; /* the drag owns the pointer; without this a wheel/trackpad
+                         gesture over the rail scrolls the model list behind it */
+  cursor: pointer;
+}
+
+.misaka-thinking-track {
+  position: absolute;
+  inset-inline: 0;
+  top: 50%;
+  height: var(--track-h, 6px);
+  transform: translateY(-50%);
+  border-radius: 9999px;
+  background-color: var(--well);
+}
+
+.misaka-thinking-fill {
+  position: absolute;
+  inset-inline: 0;
+  top: 50%;
+  height: var(--track-h, 6px);
+  transform: translateY(-50%);
+  border-radius: 9999px;
+  overflow: hidden;
+  background-color: var(--thinking-quiet);
+  /* Same pixel coordinate and easing as the handle, not the nearest preview stop.
+     The full-width gradient stays stable while only its clipping edge moves. */
+  clip-path: inset(0 calc(100% - var(--fill-x, 0px)) 0 0);
+  transition: clip-path 180ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+/* Solid theme inks blended by shaped masks. The plum and indigo peaks form one
+   seamless rose -> plum -> indigo -> rose period; only the moving rail uses repetition. */
+.misaka-thinking-band {
+  position: absolute;
+  top: 0;
+  left: -100%;
+  width: 300%;
+  height: 100%;
+  -webkit-mask-image: var(--band-mask, linear-gradient(90deg, #000, transparent));
+  mask-image: var(--band-mask, linear-gradient(90deg, #000, transparent));
+  -webkit-mask-size: 33.3333% 100%;
+  mask-size: 33.3333% 100%;
+  -webkit-mask-repeat: repeat-x;
+  mask-repeat: repeat-x;
+  -webkit-mask-position: 0 0;
+  mask-position: 0 0;
+  opacity: 0;
+}
+
+.misaka-thinking-band--1 {
+  background-color: var(--band-1);
+}
+.misaka-thinking-band--2 {
+  background-color: var(--band-2);
+  --band-mask: linear-gradient(90deg, transparent 0%, #000 33.3333%, transparent 66.6667%, transparent 100%);
+}
+.misaka-thinking-band--3 {
+  background-color: var(--band-3);
+  --band-mask: linear-gradient(90deg, transparent 0%, transparent 33.3333%, #000 66.6667%, transparent 100%);
+}
+
+/* Second-from-the-top: the ramp is there, still. */
+.misaka-thinking-slider[data-tier="near"] .misaka-thinking-fill {
+  background-color: var(--rose);
+}
+.misaka-thinking-slider[data-tier="near"] .misaka-thinking-band {
+  left: 0;
+  width: 100%;
+  -webkit-mask-size: 100% 100%;
+  mask-size: 100% 100%;
+  opacity: 1;
+}
+.misaka-thinking-slider[data-tier="near"] .misaka-thinking-band--2 {
+  --band-mask: linear-gradient(90deg, transparent, #000 50%, transparent);
+}
+.misaka-thinking-slider[data-tier="near"] .misaka-thinking-band--3 {
+  --band-mask: linear-gradient(90deg, transparent 50%, #000 100%);
+}
+
+/* Keep the top-tier clip too: rounding the preview to the last stop must not
+   suddenly paint the entire track before the handle has actually arrived. */
+.misaka-thinking-slider[data-tier="max"] .misaka-thinking-fill {
+  background-color: var(--rose);
+}
+.misaka-thinking-slider[data-tier="max"] .misaka-thinking-band {
+  opacity: 1;
+  animation: misaka-thinking-flow 1400ms linear infinite;
+}
+
+@keyframes misaka-thinking-flow {
+  from {
+    transform: translate3d(0, 0, 0);
+  }
+  /* Exactly one period (a third of the element, i.e. one rail width), so the last
+     frame coincides with the first and the loop has no seam. */
+  to {
+    transform: translate3d(33.3333%, 0, 0);
+  }
+}
+
+.misaka-thinking-thumb {
+  position: absolute;
+  top: 50%;
+  left: 0;
+  width: var(--thumb-box, 18px);
+  height: var(--thumb-box, 18px);
+  border-radius: 9999px;
+  /* Settings retain their themed handle; the compact dark handle is explicitly
+     white below, as a neutral control over the vivid flowing ink. */
+  background-color: var(--surface-1);
+  border: 1px solid var(--border-strong);
+  box-shadow: var(--shadow-e2);
+  transform: translate3d(var(--thumb-x, 0px), -50%, 0);
+  transition: transform 180ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+/* The top-tier glow is its own layer toggled by opacity, so the thumb's own shadow
+   keeps the same layer count across themes and tiers -- the cross-fade interpolates
+   a fixed-length box-shadow list and snaps otherwise. */
+.misaka-thinking-thumb::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  box-shadow: 0 6px 18px -6px color-mix(in srgb, var(--accent) 55%, transparent);
+  opacity: 0;
+  transition: opacity 200ms ease;
+}
+.misaka-thinking-slider[data-tier="max"] .misaka-thinking-thumb::after {
+  opacity: 1;
+}
+
+.misaka-thinking-slider[data-following] .misaka-thinking-thumb,
+.misaka-thinking-slider[data-following] .misaka-thinking-fill {
+  transition: none; /* 1:1 with the pointer while it is down */
+}
+
+/* Transparent hit strip: keeps the grabbable band a little taller than the rail without
+   growing the thumb, which would wreck the popover's density. Compact drops the padding
+   because its rail is already 32px tall. */
+.misaka-thinking-hit {
+  position: absolute;
+  inset-inline: 0;
+  top: calc(var(--hit-pad, 2px) * -1);
+  bottom: calc(var(--hit-pad, 2px) * -1);
+}
+
+.misaka-thinking-dot {
+  position: absolute;
+  top: 50%;
+  width: 3px;
+  height: 3px;
+  border-radius: 9999px;
+  transform: translate(-50%, -50%);
+  background-color: var(--disabled);
+}
+.misaka-thinking-dot.is-passed {
+  background-color: var(--surface-1);
+}
+.misaka-thinking-dot.is-current {
+  width: 4px;
+  height: 4px;
+  background-color: var(--text-main);
+}
+
+/* Compact: the reference picker uses a 26px capsule, a 30px thumb and a 36px grab band.
+   The hit strip extends another 4px per side. The component computes its stops
+   from the same numbers, so the two can never drift apart. */
+.misaka-thinking-slider[data-size="compact"] {
+  --rail-h: 36px;
+  --track-h: 26px;
+  --hit-pad: 4px;
+}
+/* On a capsule this thick a 3px round dot reads as dirt, not as a stop: it becomes a tick. */
+.misaka-thinking-slider[data-size="compact"] .misaka-thinking-dot {
+  width: 3px;
+  height: 3px;
+  opacity: 0.5;
+}
+.misaka-thinking-slider[data-size="compact"] .misaka-thinking-thumb {
+  /* Keep the enlarged handle neutral; the fill carries the current theme's accent. */
+  background-color: var(--slider-thumb);
+  border-color: color-mix(in srgb, var(--border) 60%, var(--slider-thumb));
+}
+.misaka-thinking-slider[data-size="compact"] .misaka-thinking-thumb::after {
+  display: none;
+}
+
+.misaka-thinking-slider[data-size="compact"] .misaka-thinking-dot.is-passed {
+  background-color: var(--slider-passed);
+}
+.misaka-model-picker {
+  display: flex;
+  flex-direction: column;
+  overflow-y: auto;
+}
+
+/* The model picker follows the reference's solid capsule, not the settings rail's
+   animated maximum-tier ramp. All pointer and keyboard geometry stays shared. */
+.misaka-model-picker .misaka-thinking-slider .misaka-thinking-track {
+  background-color: color-mix(in srgb, var(--muted) 20%, var(--surface-1));
+}
+.misaka-model-picker .misaka-thinking-slider .misaka-thinking-fill {
+  background-color: var(--accent);
+}
+html[data-theme-mode="dark"] .misaka-model-picker .misaka-thinking-heading {
+  color: var(--accent-soft);
+}
+.misaka-model-picker .misaka-thinking-slider[data-size="compact"] .misaka-thinking-band,
+.misaka-model-picker .misaka-thinking-slider[data-size="compact"] .misaka-thinking-streak {
+  display: none;
+  animation: none;
+}
+
+/* Grayed out / disabled default thinking slider */
+.misaka-thinking-slider[data-default] .misaka-thinking-rail,
+.misaka-thinking-slider .misaka-thinking-rail[aria-disabled="true"] {
+  cursor: not-allowed;
+}
+.misaka-thinking-slider[data-default] .misaka-thinking-fill,
+.misaka-model-picker .misaka-thinking-slider[data-default] .misaka-thinking-fill {
+  background-color: transparent;
+  clip-path: none;
+}
+.misaka-thinking-slider[data-default] .misaka-thinking-track,
+.misaka-model-picker .misaka-thinking-slider[data-default] .misaka-thinking-track {
+  background-color: color-mix(in srgb, var(--muted) 18%, var(--surface-1));
+}
+.misaka-thinking-slider[data-default] .misaka-thinking-thumb,
+.misaka-model-picker .misaka-thinking-slider[data-default] .misaka-thinking-thumb {
+  background-color: color-mix(in srgb, var(--muted) 25%, var(--surface-1));
+  border-color: color-mix(in srgb, var(--border) 70%, transparent);
+  box-shadow: none;
+}
+.misaka-thinking-slider[data-default] .misaka-thinking-dot,
+.misaka-model-picker .misaka-thinking-slider[data-default] .misaka-thinking-dot {
+  opacity: 0.35;
+  background-color: var(--disabled);
+}
+.misaka-thinking-slider[data-default] .misaka-thinking-dot.is-passed,
+.misaka-thinking-slider[data-default] .misaka-thinking-dot.is-current {
+  background-color: var(--disabled);
+  opacity: 0.35;
+}
+html[data-theme-mode="dark"] .misaka-model-picker .misaka-thinking-slider[data-default] .misaka-thinking-heading {
+  color: var(--muted);
+}
+
+.conversation-model-trigger,
+.conversation-welcome-card .conversation-model-trigger {
+  min-width: 112px;
+  justify-content: center;
+  padding: 6px 12px;
+  border-radius: 9999px;
+  border-color: transparent;
+  background-color: color-mix(in srgb, var(--surface-2) 65%, var(--surface-1));
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 400;
+  line-height: 18px;
+}
+.conversation-model-trigger:hover,
+.conversation-welcome-card .conversation-model-trigger:hover {
+  background-color: var(--surface-hover);
+  color: var(--text-main);
+}
+.misaka-picker-models {
+  max-height: 100%;
+}
+.misaka-picker-model-list {
+  max-height: 280px;
+  scrollbar-width: thin;
+}
+
+/* Speed streaks: two thin highlights that overtake the ramp, at the top tier only. Shapes as
+   well -- background-color so the theme cross-fade interpolates, mask-image for the soft ends
+   and the travel -- so nothing animates a length and nothing snaps mid-switch. */
+.misaka-thinking-streak {
+  position: absolute;
+  top: 26%;
+  left: -34%;
+  width: 34%;
+  height: 2px;
+  border-radius: 9999px;
+  background-color: var(--slider-streak);
+  -webkit-mask-image: linear-gradient(90deg, transparent, #000 42%, #000 58%, transparent);
+  mask-image: linear-gradient(90deg, transparent, #000 42%, #000 58%, transparent);
+  opacity: 0;
+}
+.misaka-thinking-streak--b {
+  top: 62%;
+  width: 24%;
+}
+
+.misaka-thinking-slider[data-tier="max"] .misaka-thinking-streak {
+  opacity: 1;
+  will-change: transform;
+}
+.misaka-thinking-slider[data-tier="max"] .misaka-thinking-streak--a {
+  animation: misaka-thinking-streak 1050ms linear infinite;
+}
+.misaka-thinking-slider[data-tier="max"] .misaka-thinking-streak--b {
+  /* Off the first streak's beat on purpose: two identical lines marching in step read as one
+     glitch rather than as speed. */
+  animation: misaka-thinking-streak 1400ms linear infinite;
+  animation-delay: -520ms;
+}
+
+@keyframes misaka-thinking-streak {
+  from {
+    transform: translate3d(0, 0, 0);
+  }
+  /* 392% of a 34%-wide streak is just over one rail width, so each pass clears the capsule
+     before it repeats and the loop never shows a jump. */
+  to {
+    transform: translate3d(392%, 0, 0);
+  }
+}
+
+/* A model switch in flight: the ladder shown is the local preview, so the rail says so rather
+   than pretending the drag is live. */
+.misaka-thinking-slider[data-busy] .misaka-thinking-rail {
+  opacity: 0.6;
+  cursor: progress;
+}
+
+/* Two-layer picker: the card stays put and its contents swap, so the motion is a short slide
+   in the direction of the travel rather than a re-open. */
+.misaka-picker-layer {
+  animation: misaka-picker-layer-in 160ms cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+@keyframes misaka-picker-layer-in {
+  from {
+    opacity: 0;
+    transform: translate3d(6px, 0, 0);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .misaka-thinking-slider[data-tier="max"] .misaka-thinking-band {
+    animation: none;
+    left: 0;
+    width: 100%;
+    -webkit-mask-size: 100% 100%;
+    mask-size: 100% 100%;
+  }
+  .misaka-thinking-slider[data-tier="max"] .misaka-thinking-band--2 {
+    --band-mask: linear-gradient(90deg, transparent, #000 50%, transparent);
+  }
+  .misaka-thinking-slider[data-tier="max"] .misaka-thinking-band--3 {
+    --band-mask: linear-gradient(90deg, transparent 50%, #000 100%);
+  }
+  /* The streaks only mean something while they move; parked mid-capsule they are smudges. */
+  .misaka-thinking-slider[data-tier="max"] .misaka-thinking-streak {
+    opacity: 0;
+    animation: none;
+  }
+  .misaka-picker-layer {
+    animation: none;
+  }
+  .misaka-thinking-thumb,
+  .misaka-thinking-fill,
+  .misaka-thinking-thumb::after {
+    transition: none;
+  }
 }
 
 /* Typography. Two independent roles on purpose: --font-size-ui is chrome and stays 13.5px
@@ -287,9 +628,44 @@ body {
   background: transparent;
 }
 ::-webkit-scrollbar-thumb {
-  background: var(--surface-3);
+  background: var(--scrollbar-thumb);
   border-radius: var(--radius-xs);
 }
 ::-webkit-scrollbar-thumb:hover {
-  background: var(--muted);
+  background: var(--scrollbar-hover);
+}
+
+/* Override every visible XYFlow color default, including its SVG-only inks.
+   Layout and stroke widths remain the library's responsibility. */
+.misaka-research-graph {
+  --xy-background-color: var(--graph-background);
+  --xy-background-pattern-color: var(--graph-grid);
+  --xy-edge-stroke: var(--graph-edge);
+  --xy-edge-stroke-selected: var(--graph-edge-active);
+  --xy-connectionline-stroke: var(--graph-edge);
+  --xy-attribution-background-color: var(--graph-control-bg);
+  --xy-minimap-background-color: var(--graph-minimap-background);
+  --xy-minimap-mask-background-color: var(--graph-minimap-mask);
+  --xy-minimap-mask-stroke-color: transparent;
+  --xy-minimap-node-background-color: var(--graph-edge-strong);
+  --xy-minimap-node-stroke-color: transparent;
+  --xy-node-color: var(--text-main);
+  --xy-node-border: 1px solid var(--border-subtle);
+  --xy-node-background-color: var(--surface-1);
+  --xy-node-group-background-color: color-mix(in srgb, var(--surface-2) 25%, transparent);
+  --xy-node-boxshadow-hover: var(--shadow-e1);
+  --xy-node-boxshadow-selected: 0 0 0 .5px var(--graph-edge-active);
+  --xy-handle-background-color: var(--border-strong);
+  --xy-handle-border-color: var(--surface-1);
+  --xy-selection-background-color: color-mix(in srgb, var(--graph-edge-active) 8%, transparent);
+  --xy-selection-border: 1px dotted color-mix(in srgb, var(--graph-edge-active) 80%, transparent);
+  --xy-controls-button-background-color: var(--graph-control-bg);
+  --xy-controls-button-background-color-hover: var(--graph-control-hover);
+  --xy-controls-button-color: var(--graph-control-text);
+  --xy-controls-button-color-hover: var(--graph-control-text);
+  --xy-controls-button-border-color: var(--graph-control-border);
+  --xy-controls-box-shadow: var(--shadow-e2);
+  --xy-edge-label-background-color: var(--surface-1);
+  --xy-edge-label-color: var(--text-main);
+  --xy-resize-background-color: var(--graph-edge-active);
 }

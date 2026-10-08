@@ -113,7 +113,8 @@ def _cfg():
 
 # The run limits /research takes as options, by flag.
 _OPTIONS = {"--depth": "max_depth", "--parallel": "parallel", "--sister-parallel": "sister_parallel",
-            "--followups": "max_followups", "--revisions": "max_revisions", "--max-nodes": "max_nodes"}
+            "--followups": "max_followups", "--revisions": "max_revisions", "--max-nodes": "max_nodes",
+            "--plan-approval": "plan_approval"}
 
 
 def _limits_text(limits):
@@ -172,6 +173,9 @@ def parse_command(raw):
     selected = {}
     while words:
         option, separator, value = words[0].partition("=")
+        if option == "--":
+            line = words[1].strip() if len(words) > 1 else ""
+            break
         if option in _OPTIONS:
             key = _OPTIONS[option]
             if key in selected:
@@ -181,7 +185,13 @@ def parse_command(raw):
                 value = words[0] if words else ""
             if not value:
                 raise ValueError(f"{option} requires an integer.\n{USAGE}")
-            selected[key] = value
+            if key == "plan_approval":
+                approval = value.strip().lower()
+                if approval not in {"required", "automatic"}:
+                    raise ValueError("Plan approval must be required or automatic.")
+                selected[key] = approval == "required"
+            else:
+                selected[key] = value
         elif "max_depth" not in selected and _positional_depth(words):
             selected["max_depth"] = int(words[0])
         else:
@@ -189,7 +199,7 @@ def parse_command(raw):
         line = words[1].strip() if len(words) > 1 else ""
         words = line.split(None, 1)
     limits = runs.normalize_limits(selected)
-    return {"action": "activate", "limits": {key: limits[key] for key in _OPTIONS.values()},
+    return {"action": "activate", "limits": {key: limits[key] for key in _OPTIONS.values() if key in limits},
             "explicit": explicit, "question": line}
 
 
@@ -230,8 +240,18 @@ def _status(con, target, workspace):
 class ResearchPart:
     """Last Order's human-only ``/research`` command and run drivers."""
 
+    def is_driving(self, run_id):
+        driver = getattr(self, "_drivers", {}).get(run_id)
+        return driver is not None and not driver.done()
+
+    def is_resuming(self, run_id):
+        """An accepted resume is still executing, not publishing its clarification exit."""
+        return self.is_driving(run_id) and run_id in getattr(self, "_resume_inputs", ())
+
     def __init__(self):
         drivers = {}     # this session's research drivers; another session's are not ours to stop
+        self._drivers = drivers
+        self._resume_inputs = set()
         con = _con()
         # In a pane, a fork node is a pane too (its own tab beside this one); elsewhere a
         # background process.
@@ -275,6 +295,7 @@ class ResearchPart:
                 result = await workflow.run(
                     con, dict(_cfg()), spawner, run_id=run_id, progress=progress, resume=resume, clarification=clarification,
                     origin_session=getattr(getattr(ctx, "sessionManager", None), "sessionId", None), session=self.session)
+                self._resume_inputs.discard(run_id)
                 if result["reason"] == "waiting_input":
                     questions = "\n".join(f"- {q}" for q in result.get("questions") or [])
                     content = (f"""Research run `{run_id}` needs clarification:
@@ -315,6 +336,7 @@ class ResearchPart:
                     {"deliverAs": "followUp", "triggerTurn": False},
                 )
             finally:
+                self._resume_inputs.discard(run_id)
                 release()
                 drivers.pop(run_id, None)
 
@@ -322,6 +344,8 @@ class ResearchPart:
             existing = drivers.get(run_id)
             if existing and not existing.done():
                 return False
+            if resume:
+                self._resume_inputs.add(run_id)
             drivers[run_id] = asyncio.create_task(drive(run_id, ctx, resume=resume, clarification=clarification))
             return True
 
@@ -371,11 +395,15 @@ class ResearchPart:
 
         def start_question(question, choice, ctx):
             """Persist the question, then let this window plan it as the run's root LO."""
+            from misaka.core.research.ingress import current_request_id
+
+            request_id = current_request_id.get()
             self.session.moments.send_message(
                 {"customType": "research-question", "display": True,
                  "content": f"Research question | {question}",
                  "details": {"question": question, **choice["limits"], "workspace": choice["workspace"],
-                             "plan_approval": choice["plan_approval"], "session": choice["session"] or {}}},
+                             "plan_approval": choice["plan_approval"], "session": choice["session"] or {},
+                             **({"requestId": request_id} if request_id else {})}},
                 {"deliverAs": "followUp", "triggerTurn": False},
             )
             task = asyncio.create_task(begin_safely(question, choice, ctx))
@@ -401,12 +429,12 @@ class ResearchPart:
                     ctx.ui.notify(USAGE, "info")
                     return
                 if spec["action"] == "status":
-                    if starts and not spec["target"]:
-                        ctx.ui.notify("Research startup in progress. This window will plan the root node.", "info")
-                    elif pending["choice"] is not None and not spec["target"]:
+                    if pending["choice"] is not None and not spec["target"]:
                         choice = pending["choice"]
                         ctx.ui.notify(f"Research mode is waiting for a question | {_limits_text(choice['limits'])} | "
                                       f"plan approval {'required' if choice['plan_approval'] else 'automatic'}.", "info")
+                    elif starts and not spec["target"]:
+                        ctx.ui.notify("Research startup in progress. This window will plan the root node.", "info")
                     else:
                         ctx.ui.notify(_status(con, spec["target"], _workspace(ctx)), "info")
                     return
@@ -420,8 +448,10 @@ class ResearchPart:
                         ctx.ui.notify("No active research run.", "info")
                         return
                     runs.request_stop(con, run["id"])
-                    # A waiting-input run has no driver left to observe this request.
-                    if not run["driver_lock"]:
+                    # A waiting-input run or an unattended dead driver has no live process to
+                    # observe this request. Re-enter the same persisted workflow to publish its
+                    # partial report and settle the stop without waiting for the lease TTL.
+                    if not runs.driver_is_live(run):
                         launch(run["id"], ctx)
                     ctx.ui.notify(
                         f"Stop request recorded for {run['id']}. Running tasks will stop or drain.",
@@ -444,7 +474,20 @@ class ResearchPart:
                             f"Research run {run['id']} belongs to the Last Order conversation {saved}; open that "
                             f"session and resume there. `/research resume {run['id']} --here` adopts this window "
                             "instead, and its Last Order will not remember the run's earlier turns.")
+                    previous_driver = drivers.get(run["id"])
+                    settling = (run["status"] in {"failed", "stopped"}
+                                or (run["status"] == "waiting_input" and not self.is_resuming(run["id"])))
+                    if (settling and previous_driver is not None
+                            and not previous_driver.done()):
+                        # The old driver may be publishing its final stopped/error
+                        # notice. Let that owner release its window before resuming.
+                        await asyncio.shield(asyncio.gather(previous_driver, return_exceptions=True))
                     if not launch(run["id"], ctx, resume=True, clarification=spec["clarification"]):
+                        if spec["clarification"]:
+                            # A second answer can race the persisted waiting_input
+                            # state while the first resume already owns a driver.
+                            # Deliver the prose to that coordinator, never discard it.
+                            await self.session.prompt(spec["clarification"], {"streamingBehavior": "steer"})
                         ctx.ui.notify(f"Research run {run['id']} is already running in this session.", "info")
                     else:
                         ctx.ui.notify(f"Resumed research run {run['id']}.", "info")
@@ -460,7 +503,11 @@ class ResearchPart:
                     pending["choice"] = None
                     ctx.ui.notify("Research mode closed.", "info")
                     return
-                choice = {"limits": spec["limits"], "plan_approval": planner.plan_waits_for_user(_cfg()),
+                selected_approval = spec["limits"].get("plan_approval")
+                approval = (selected_approval if selected_approval is not None
+                            else planner.plan_waits_for_user(_cfg()))
+                choice = {"limits": {key: value for key, value in spec["limits"].items()
+                                      if key != "plan_approval"}, "plan_approval": approval,
                           "session": {}, "workspace": _workspace(ctx)}
                 if spec.get("question"):
                     # `/research [--depth N] QUESTION`: no picker, no waiting for the next message.
@@ -587,7 +634,7 @@ class ResearchPart:
                     picked.update(context_threshold=_parse_threshold(answers.get(_THRESHOLD_QUESTION)),
                                   max_output_tokens=_parse_output(answers.get(_OUTPUT_QUESTION)))
                     limits = runs.normalize_limits({k: v for k, v in picked.items() if v is not None})
-                    choice.update(limits={key: limits[key] for key in _OPTIONS.values()},
+                    choice.update(limits={key: limits[key] for key in _OPTIONS.values() if key != "plan_approval"},
                                   session=session_overrides.clean(limits))
                 pending["choice"] = choice
                 ctx.ui.notify(
@@ -729,6 +776,6 @@ ROLES = {"last_order"}
 
 def part(spec):
     from misaka.core.research.wiring.node import node_identity
-    if spec.research_context or node_identity():  # an existing workflow already owns this session
+    if (spec.research_context and not getattr(spec, "research_host", False)) or node_identity():
         return None
     return ResearchPart()

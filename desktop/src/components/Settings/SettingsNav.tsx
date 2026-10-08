@@ -70,7 +70,7 @@ export const SettingsNav: React.FC = () => {
   const modelsBadge = visibleCount > 0 ? `${configuredCount}/${visibleCount}` : undefined
 
   return (
-    <aside className="w-56 shrink-0 h-full border-r border-border-subtle/60 flex flex-col select-none text-xs">
+    <aside className="misaka-glass-chrome relative w-56 shrink-0 h-full border-r border-border-subtle/60 flex flex-col select-none text-xs">
       {/* Search Input Box matching ZCode */}
       <div className="p-3 border-b border-border-subtle/70">
         <div className="relative flex items-center">

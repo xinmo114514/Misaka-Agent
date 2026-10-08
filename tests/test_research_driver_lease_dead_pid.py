@@ -40,6 +40,14 @@ def test_a_dead_driver_on_this_host_is_taken_over_at_once(run):
     assert runs.get(con, row["id"])["driver_lock"] == "driver:me:1:new"
 
 
+def test_desktop_stop_treats_a_dead_owner_as_unattended_before_its_ttl_expires(run, monkeypatch):
+    con, row = run
+    _hold(con, row["id"], f"driver:{socket.gethostname()}:{_dead_pid()}:abc123")
+    monkeypatch.setattr(runs, "_lease_holder_is_dead", lambda _lock: True)
+
+    assert runs.driver_is_live(runs.get(con, row["id"])) is False
+
+
 @pytest.mark.parametrize("lock", [
     f"driver:{socket.gethostname()}:{os.getpid()}:live",   # this very process
     "driver:some-other-host:1:foreign",                      # never judged from here

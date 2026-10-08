@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
 import io
 import json
 import os
 import subprocess
 import sys
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -127,6 +129,196 @@ class MockRuntimeHost:
 
     async def dispose(self) -> None:
         self.disposed = True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('mode', ['steer', 'followUp'])
+@pytest.mark.parametrize('running', [False, True])
+async def test_intervention_prompt_preserves_mode_and_acknowledges_acceptance(monkeypatch, mode, running):
+    import misaka.cli.desktop_bridge as bridge_mod
+    session = MockSession()
+    session.isStreaming = running
+    calls = []
+    output = io.StringIO()
+
+    async def prompt(text, options=None):
+        # The engine may start a background turn after the UI saw an idle session.
+        session.isStreaming = True
+        assert '"requestId":"intervention"' not in output.getvalue()
+        calls.append((text, options['streamingBehavior']))
+        options['preflightResult'](True)
+
+    session.prompt = prompt
+    monkeypatch.setattr(bridge_mod, 'writeRawStdout', output.write)
+    monkeypatch.setattr(sys, 'stdin', io.StringIO(json.dumps({
+        'type': 'prompt', 'requestId': 'intervention', 'text': '调整', 'streamingBehavior': mode,
+    }) + '\n' + json.dumps({'type': 'shutdown'}) + '\n'))
+    assert await run_desktop_bridge(MockRuntimeHost(session)) == 0
+    acks = [json.loads(line) for line in output.getvalue().splitlines() if json.loads(line).get('requestId') == 'intervention']
+    assert calls == [('调整', mode)]
+    assert len(acks) == 1 and acks[0]['ok'] is True
+
+
+@pytest.mark.asyncio
+async def test_prompt_preflight_failure_returns_correlated_failed_ack(monkeypatch):
+    import misaka.cli.desktop_bridge as bridge_mod
+    session = MockSession()
+    output = io.StringIO()
+
+    async def prompt(text, options=None):
+        if options and options.get('preflightResult'):
+            options['preflightResult'](False)
+        raise RuntimeError('input hook failed')
+
+    session.prompt = prompt
+    monkeypatch.setattr(bridge_mod, 'writeRawStdout', output.write)
+    monkeypatch.setattr(sys, 'stdin', io.StringIO(
+        json.dumps({'type': 'prompt', 'requestId': 'failed-prompt', 'text': 'test', 'streamingBehavior': 'steer'}) + '\n'
+        + json.dumps({'type': 'shutdown'}) + '\n'))
+    assert await run_desktop_bridge(MockRuntimeHost(session)) == 0
+    acks = [json.loads(line) for line in output.getvalue().splitlines() if json.loads(line).get('requestId') == 'failed-prompt']
+    assert len(acks) == 1
+    assert acks[0]['ok'] is False
+    assert acks[0]['error'] == 'input hook failed'
+
+
+@pytest.mark.asyncio
+async def test_error_after_acceptance_does_not_send_failed_ack(monkeypatch):
+    import misaka.cli.desktop_bridge as bridge_mod
+    session = MockSession()
+    output = io.StringIO()
+
+    async def prompt(text, options=None):
+        options['preflightResult'](True)
+        raise RuntimeError('provider failed after accepting the user message')
+
+    session.prompt = prompt
+    monkeypatch.setattr(bridge_mod, 'writeRawStdout', output.write)
+    monkeypatch.setattr(sys, 'stdin', io.StringIO(
+        json.dumps({'type': 'prompt', 'requestId': 'accepted', 'text': 'test', 'streamingBehavior': 'steer'}) + '\n'
+        + json.dumps({'type': 'shutdown'}) + '\n'))
+    assert await run_desktop_bridge(MockRuntimeHost(session)) == 0
+    acks = [json.loads(line) for line in output.getvalue().splitlines() if json.loads(line).get('requestId') == 'accepted']
+    assert len(acks) == 1 and acks[0]['ok'] is True
+
+
+@pytest.mark.asyncio
+async def test_eof_waits_for_original_run_after_follow_up_submission(monkeypatch):
+    import misaka.cli.desktop_bridge as bridge_mod
+    session = MockSession()
+    output = io.StringIO()
+    release = asyncio.Event()
+    queued = asyncio.Event()
+
+    async def prompt(text, options=None):
+        options['preflightResult'](True)
+        if text == 'first':
+            session.isStreaming = True
+            await release.wait()
+        else:
+            queued.set()
+
+    session.prompt = prompt
+    monkeypatch.setattr(bridge_mod, 'writeRawStdout', output.write)
+    monkeypatch.setattr(sys, 'stdin', io.StringIO(''.join(json.dumps(command) + '\n' for command in [
+        {'type': 'prompt', 'requestId': 'first', 'text': 'first', 'streamingBehavior': 'steer'},
+        {'type': 'prompt', 'requestId': 'next', 'text': 'next', 'streamingBehavior': 'followUp'},
+    ])))
+    bridge_task = asyncio.create_task(run_desktop_bridge(MockRuntimeHost(session)))
+    try:
+        await asyncio.wait_for(queued.wait(), 5)
+        await asyncio.sleep(0.05)
+        assert not bridge_task.done(), 'EOF must still wait for the original run'
+    finally:
+        release.set()
+        assert await asyncio.wait_for(bridge_task, 5) == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('mode', ['steer', 'followUp'])
+async def test_intervention_waits_for_initial_prompt_preflight(monkeypatch, mode):
+    import misaka.cli.desktop_bridge as bridge_mod
+    session = MockSession()
+    started = asyncio.Event()
+    release_preflight = asyncio.Event()
+    release_run = asyncio.Event()
+    second_called = asyncio.Event()
+    output = io.StringIO()
+    calls = []
+
+    async def prompt(text, options=None):
+        if text == 'initial':
+            started.set()
+            await release_preflight.wait()
+            options['preflightResult'](True)
+            session.isStreaming = True
+            await release_run.wait()
+        else:
+            calls.append((session.isStreaming, options['streamingBehavior']))
+            second_called.set()
+            options['preflightResult'](True)
+
+    session.prompt = prompt
+    monkeypatch.setattr(bridge_mod, 'writeRawStdout', output.write)
+    monkeypatch.setattr(sys, 'stdin', io.StringIO(''.join(json.dumps(command) + '\n' for command in [
+        {'type': 'prompt', 'requestId': 'first', 'text': 'initial', 'streamingBehavior': 'steer'},
+        {'type': 'prompt', 'requestId': 'second', 'text': 'intervention', 'streamingBehavior': mode},
+    ])))
+    task = asyncio.create_task(run_desktop_bridge(MockRuntimeHost(session)))
+    try:
+        await asyncio.wait_for(started.wait(), 5)
+        await asyncio.sleep(0.05)
+        assert not second_called.is_set(), 'Submission must not race the first prompt preparation'
+        release_preflight.set()
+        await asyncio.wait_for(second_called.wait(), 5)
+        assert calls == [(True, mode)]
+    finally:
+        release_preflight.set()
+        release_run.set()
+        assert await asyncio.wait_for(task, 5) == 0
+
+
+@pytest.mark.asyncio
+async def test_abort_cancels_preparing_and_waiting_submissions(monkeypatch):
+    import misaka.cli.desktop_bridge as bridge_mod
+    session = MockSession()
+    release = asyncio.Event()
+    cancelled = []
+    calls = []
+    output = io.StringIO()
+
+    async def prompt(text, options=None):
+        calls.append(text)
+        try:
+            await release.wait()
+            options['preflightResult'](True)
+        except asyncio.CancelledError:
+            cancelled.append(text)
+            raise
+
+    session.prompt = prompt
+    monkeypatch.setattr(bridge_mod, 'writeRawStdout', output.write)
+    monkeypatch.setattr(sys, 'stdin', io.StringIO(''.join(json.dumps(command) + '\n' for command in [
+        {'type': 'prompt', 'requestId': 'first', 'text': 'first', 'streamingBehavior': 'steer'},
+        {'type': 'prompt', 'requestId': 'second', 'text': 'second', 'streamingBehavior': 'followUp'},
+        {'type': 'abort', 'requestId': 'stop'},
+    ])))
+    task = asyncio.create_task(run_desktop_bridge(MockRuntimeHost(session)))
+    try:
+        for _ in range(100):
+            if '"requestId":"stop"' in output.getvalue():
+                break
+            await asyncio.sleep(0.01)
+        assert cancelled == ['first']
+        assert calls == ['first']
+        items = [json.loads(line) for line in output.getvalue().splitlines()]
+        acks = {item.get('requestId'): item for item in items if item.get('type') == 'ack'}
+        assert acks['first']['ok'] is False and acks['second']['ok'] is False
+        assert acks['stop']['ok'] is True
+        assert any(item.get('event', {}).get('type') == 'agent_settled' for item in items)
+    finally:
+        release.set()
+        assert await asyncio.wait_for(task, 5) == 0
 
 
 @pytest.mark.asyncio
@@ -416,6 +608,114 @@ async def test_switch_workspace_command_new_directory(monkeypatch: pytest.Monkey
 
 
 @pytest.mark.asyncio
+async def test_new_workspace_preview_ack_carries_history_version_without_preview_event(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    import misaka.cli.desktop_bridge as bridge_mod
+    workspace = tmp_path / "new-workspace"
+    workspace.mkdir()
+    runtime = MockRuntimeHost()
+    output = io.StringIO()
+    monkeypatch.setattr(bridge_mod, "writeRawStdout", output.write)
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps({
+        "type": "switch_workspace", "requestId": "new", "path": str(workspace), "preview": True,
+    }) + "\n" + json.dumps({"type": "shutdown"}) + "\n"))
+    assert await run_desktop_bridge(runtime) == 0
+    lines = [json.loads(line) for line in output.getvalue().splitlines()]
+    assert not any(item.get("event", {}).get("type") == "session_preview" for item in lines)
+    ack = next(item for item in lines if item.get("requestId") == "new" and item.get("type") == "ack")
+    assert isinstance(ack["historyVersion"], str) and ack["historyVersion"]
+    assert ack["messages"] == []
+
+
+@pytest.mark.asyncio
+async def test_workspace_lookup_does_not_create_bucket_when_new_session_is_cancelled(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    import misaka.cli.desktop_bridge as bridge_mod
+    from misaka.core.session_manager import encode_cwd
+    workspace = tmp_path / "new-workspace"
+    workspace.mkdir()
+    root = tmp_path / "sessions"
+    root.mkdir()
+    runtime = MockRuntimeHost()
+    runtime.session.sessionManager.getSessionDir = lambda: str(root)
+
+    async def cancelled_new_session(options: Any) -> dict[str, bool]:
+        return {"cancelled": True}
+
+    runtime.newSession = cancelled_new_session
+    output = io.StringIO()
+    monkeypatch.setattr(bridge_mod, "writeRawStdout", output.write)
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps({
+        "type": "switch_workspace", "requestId": "cancel", "path": str(workspace), "preview": True,
+    }) + "\n" + json.dumps({"type": "shutdown"}) + "\n"))
+    assert await run_desktop_bridge(runtime) == 0
+    assert not (root / encode_cwd(str(workspace))).exists()
+
+
+@pytest.mark.asyncio
+async def test_workspace_lookup_uses_cwd_bucket_without_listing_every_history(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    import misaka.cli.desktop_bridge as bridge_mod
+    from misaka.core.session_manager import CURRENT_SESSION_VERSION, SessionManager, encode_cwd
+    workspace = tmp_path / "target"
+    workspace.mkdir()
+    root = tmp_path / "sessions"
+    target_bucket = root / encode_cwd(str(workspace))
+    target_bucket.mkdir(parents=True)
+    path = target_bucket / "target.jsonl"
+    path.write_text(json.dumps({"type": "session", "version": CURRENT_SESSION_VERSION,
+                                "id": "target", "cwd": str(workspace), "timestamp": "2026-10-05T00:00:00Z"}) + "\n", encoding="utf-8")
+    runtime = MockRuntimeHost()
+    runtime.session.sessionManager.getSessionDir = lambda: str(root / encode_cwd(str(tmp_path)))
+
+    async def no_scan(*args, **kwargs):
+        raise AssertionError("full session summary enumeration is not needed for a cwd switch")
+
+    monkeypatch.setattr(SessionManager, "listAll", no_scan)
+    output = io.StringIO()
+    monkeypatch.setattr(bridge_mod, "writeRawStdout", output.write)
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps({
+        "type": "switch_workspace", "requestId": "target", "path": str(workspace),
+    }) + "\n" + json.dumps({"type": "shutdown"}) + "\n"))
+    assert await run_desktop_bridge(runtime) == 0
+    assert runtime.switch_session_calls == [str(path)]
+
+
+@pytest.mark.asyncio
+async def test_workspace_existing_history_previews_before_activation(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    import misaka.cli.desktop_bridge as bridge_mod
+    from misaka.core.session_manager import CURRENT_SESSION_VERSION, SessionManager, encode_cwd
+    workspace = tmp_path / "target"
+    workspace.mkdir()
+    root = tmp_path / "sessions"
+    bucket = root / encode_cwd(str(workspace))
+    bucket.mkdir(parents=True)
+    path = bucket / "target.jsonl"
+    path.write_text(json.dumps({"type": "session", "version": CURRENT_SESSION_VERSION,
+                                "id": "target", "cwd": str(workspace), "timestamp": "2026-10-05T00:00:00Z"}) + "\n", encoding="utf-8")
+    runtime = MockRuntimeHost()
+    runtime.session.sessionManager.getSessionDir = lambda: str(root / encode_cwd(str(tmp_path)))
+    output = io.StringIO()
+
+    async def switch(target: str) -> dict[str, bool]:
+        assert any(json.loads(line).get("event", {}).get("type") == "session_preview" for line in output.getvalue().splitlines())
+        runtime.session.sessionManager = SessionManager.open(target)
+        runtime.session.sessionId = "target"
+        runtime.session.sessionFile = target
+        await runtime.rebind_handler()
+        return {"cancelled": False}
+
+    runtime.switchSession = switch
+    monkeypatch.setattr(bridge_mod, "writeRawStdout", output.write)
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps({
+        "type": "switch_workspace", "requestId": "sw", "path": str(workspace), "preview": True,
+    }) + "\n" + json.dumps({"type": "shutdown"}) + "\n"))
+    assert await run_desktop_bridge(runtime) == 0
+    lines = [json.loads(line) for line in output.getvalue().splitlines()]
+    preview = next(item["event"] for item in lines if item.get("event", {}).get("type") == "session_preview")
+    assert preview["requestId"] == "sw" and preview["session"]["sessionId"] == "target"
+    ack = next(item for item in lines if item.get("type") == "ack" and item.get("requestId") == "sw")
+    assert ack["historyUnchanged"] is True and ack["historyVersion"] == preview["historyVersion"]
+
+
+@pytest.mark.asyncio
 async def test_switch_workspace_command_invalid_directory(monkeypatch: pytest.MonkeyPatch) -> None:
     session = MockSession()
     runtime = MockRuntimeHost(session)
@@ -436,6 +736,363 @@ async def test_switch_workspace_command_invalid_directory(monkeypatch: pytest.Mo
     ack = next(item for item in lines if item.get("requestId") == "sw2")
     assert ack.get("ok") is False
     assert "Invalid workspace path" in ack.get("error", "")
+
+
+@pytest.mark.asyncio
+async def test_opt_in_load_previews_read_only_before_switch_and_acknowledges_unchanged(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    import misaka.cli.desktop_bridge as bridge_mod
+    from misaka.core.session_manager import CURRENT_SESSION_VERSION, SessionManager
+
+    path = tmp_path / "history.jsonl"
+    path.write_text("\n".join(json.dumps(entry) for entry in [
+        {"type": "session", "version": CURRENT_SESSION_VERSION, "id": "target", "cwd": str(tmp_path), "timestamp": "2026-10-05T00:00:00Z"},
+        {"type": "message", "id": "first", "parentId": None, "timestamp": "2026-10-05T00:00:01Z", "message": {"role": "user", "content": [{"type": "text", "text": "visible"}], "timestamp": 1000}},
+    ]) + "\n", encoding="utf-8")
+    output = io.StringIO()
+    runtime = MockRuntimeHost()
+    runtime.lastSwitchTimings = {"abortMs": 1.5, "shutdownMs": 2.0, "disposeMs": 0.1, "prepareMs": 10.0, "bindMs": 3.0}
+
+    async def switch(target: str) -> dict[str, bool]:
+        envelopes = [json.loads(line) for line in output.getvalue().splitlines()]
+        assert any(item.get("event", {}).get("type") == "session_preview" for item in envelopes)
+        runtime.session.sessionManager = SessionManager.open(target)
+        runtime.session.sessionId = "target"
+        runtime.session.sessionFile = target
+        await runtime.rebind_handler()
+        return {"cancelled": False}
+
+    runtime.switchSession = switch
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps({"type": "load_session", "requestId": "load-1", "path": str(path), "preview": True}) + "\n" + json.dumps({"type": "shutdown", "requestId": "bye"}) + "\n"))
+    monkeypatch.setattr(bridge_mod, "writeRawStdout", output.write)
+    assert await run_desktop_bridge(runtime) == 0
+    lines = [json.loads(line) for line in output.getvalue().splitlines()]
+    preview = next(item["event"] for item in lines if item.get("event", {}).get("type") == "session_preview")
+    assert preview["requestId"] == "load-1"
+    assert preview["session"]["sessionId"] == "target"
+    assert preview["messages"][0]["content"] == "visible"
+    assert isinstance(preview["historyVersion"], str)
+    start = next(item["event"] for item in lines if item.get("event", {}).get("type") == "session_started")
+    assert start["requestId"] == "load-1"
+    ack = next(item for item in lines if item.get("requestId") == "load-1" and item.get("type") == "ack")
+    assert ack["historyUnchanged"] is True
+    assert ack["historyVersion"] == preview["historyVersion"]
+    assert "messages" not in ack and "messages" not in ack["data"]
+    assert all(isinstance(value, (int, float)) for value in ack["timings"].values())
+    assert {"queueMs", "fileMs", "historyMs", "runtimeMs"} <= ack["timings"].keys()
+    assert ack["timings"]["prepareMs"] == 10.0
+
+
+@pytest.mark.asyncio
+async def test_opt_in_load_sends_changed_history_after_runtime_startup(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    import misaka.cli.desktop_bridge as bridge_mod
+    from misaka.core.session_manager import CURRENT_SESSION_VERSION, SessionManager
+    path = tmp_path / "history.jsonl"
+    path.write_text(json.dumps({"type": "session", "version": CURRENT_SESSION_VERSION,
+                                "id": "target", "cwd": str(tmp_path), "timestamp": "2026-10-05T00:00:00Z"}) + "\n", encoding="utf-8")
+    runtime = MockRuntimeHost()
+    output = io.StringIO()
+
+    async def switch(target: str) -> dict[str, bool]:
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps({"type": "message", "id": "new", "parentId": None,
+                                     "message": {"role": "user", "content": "new from startup", "timestamp": 10}}) + "\n")
+        runtime.session.sessionManager = SessionManager.open(target)
+        runtime.session.sessionId = "target"
+        runtime.session.sessionFile = target
+        await runtime.rebind_handler()
+        return {"cancelled": False}
+
+    runtime.switchSession = switch
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps({"type": "load_session", "requestId": "changed", "path": str(path), "preview": True}) + "\n" + json.dumps({"type": "shutdown"}) + "\n"))
+    monkeypatch.setattr(bridge_mod, "writeRawStdout", output.write)
+    assert await run_desktop_bridge(runtime) == 0
+    lines = [json.loads(line) for line in output.getvalue().splitlines()]
+    preview = next(item["event"] for item in lines if item.get("event", {}).get("type") == "session_preview")
+    ack = next(item for item in lines if item.get("type") == "ack" and item.get("requestId") == "changed")
+    assert preview["messages"] == []
+    assert ack["messages"][0]["content"] == "new from startup"
+    assert ack["historyVersion"] != preview["historyVersion"]
+    assert "historyUnchanged" not in ack
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("command_type", ["load_session", "switch_workspace"])
+async def test_append_during_preview_never_marks_stale_snapshot_unchanged(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, command_type: str,
+) -> None:
+    import misaka.cli.desktop_bridge as bridge_mod
+    from misaka.core.session_manager import CURRENT_SESSION_VERSION, SessionManager
+
+    path = tmp_path / "history.jsonl"
+    path.write_text(json.dumps({"type": "session", "version": CURRENT_SESSION_VERSION,
+                                "id": "target", "cwd": str(tmp_path), "timestamp": "2026-10-05T00:00:00Z"}) + "\n", encoding="utf-8")
+    runtime = MockRuntimeHost()
+    output = io.StringIO()
+    real_serialize = bridge_mod._serialize_session_entries
+    calls = 0
+
+    def append_while_serializing(entries: list[Any]) -> list[dict[str, Any]]:
+        nonlocal calls
+        calls += 1
+        projected = real_serialize(entries)
+        if calls == 1:
+            with path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps({"type": "message", "id": "late", "parentId": None,
+                                         "message": {"role": "user", "content": "appended during preview", "timestamp": 20}}) + "\n")
+        return projected
+
+    async def switch(target: str) -> dict[str, bool]:
+        runtime.session.sessionManager = SessionManager.open(target)
+        runtime.session.sessionId = "target"
+        runtime.session.sessionFile = target
+        await runtime.rebind_handler()
+        return {"cancelled": False}
+
+    runtime.switchSession = switch
+    monkeypatch.setattr(bridge_mod, "_serialize_session_entries", append_while_serializing)
+    monkeypatch.setattr(bridge_mod, "writeRawStdout", output.write)
+    command = {"type": command_type, "requestId": "race", "path": str(path) if command_type == "load_session" else str(tmp_path), "preview": True}
+    if command_type == "switch_workspace":
+        command["sessionPath"] = str(path)
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(command) + "\n" + json.dumps({"type": "shutdown"}) + "\n"))
+    assert await run_desktop_bridge(runtime) == 0
+    lines = [json.loads(line) for line in output.getvalue().splitlines()]
+    preview = next(item["event"] for item in lines if item.get("event", {}).get("type") == "session_preview")
+    ack = next(item for item in lines if item.get("type") == "ack" and item.get("requestId") == "race")
+    assert preview["messages"] == []
+    assert ack["messages"][0]["content"] == "appended during preview"
+    assert "historyUnchanged" not in ack
+
+
+@pytest.mark.asyncio
+async def test_queued_switches_coalesce_only_adjacent_pending_requests(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    import misaka.cli.desktop_bridge as bridge_mod
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    output = io.StringIO()
+    runtime = MockRuntimeHost()
+    started = asyncio.Event()
+    release = asyncio.Event()
+    calls: list[str] = []
+
+    async def new_session(options: Any) -> dict[str, bool]:
+        calls.append(options["cwd"])
+        if len(calls) == 1:
+            started.set()
+            await release.wait()
+        return {"cancelled": False}
+
+    runtime.newSession = new_session
+    commands = [
+        {"type": "switch_workspace", "requestId": "first", "path": str(workspace)},
+        {"type": "switch_workspace", "requestId": "old", "path": str(workspace)},
+        {"type": "switch_workspace", "requestId": "latest", "path": str(workspace)},
+        {"type": "shutdown", "requestId": "bye"},
+    ]
+    monkeypatch.setattr(sys, "stdin", io.StringIO("".join(json.dumps(item) + "\n" for item in commands)))
+    monkeypatch.setattr(bridge_mod, "writeRawStdout", output.write)
+    task = asyncio.create_task(run_desktop_bridge(runtime))
+    await asyncio.wait_for(started.wait(), timeout=5)
+    for _ in range(100):
+        if '"requestId":"old"' in output.getvalue():
+            break
+        await asyncio.sleep(0.01)
+    release.set()
+    assert await asyncio.wait_for(task, timeout=5) == 0
+    lines = [json.loads(line) for line in output.getvalue().splitlines()]
+    old = next(item for item in lines if item.get("type") == "ack" and item.get("requestId") == "old")
+    assert old["ok"] is False and old["cancelled"] is True
+    assert len(calls) == 2
+    assert [item["requestId"] for item in lines if item.get("type") == "ack" and item.get("requestId") in {"first", "latest"}] == ["first", "latest"]
+
+
+@pytest.mark.asyncio
+async def test_queued_prompt_starts_on_old_session_before_switch(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    import misaka.cli.desktop_bridge as bridge_mod
+    from misaka.core.session_manager import CURRENT_SESSION_VERSION
+    path = tmp_path / "target.jsonl"
+    path.write_text(json.dumps({"type": "session", "version": CURRENT_SESSION_VERSION,
+                                "id": "target", "cwd": str(tmp_path), "timestamp": "2026-10-05T00:00:00Z"}) + "\n", encoding="utf-8")
+    runtime = MockRuntimeHost()
+    old_session = runtime.session
+    calls: list[str] = []
+
+    async def old_prompt(text: str, options: Any = None) -> None:
+        calls.append("old prompt")
+
+    old_session.prompt = old_prompt
+
+    async def switch(target: str) -> dict[str, bool]:
+        calls.append("switch")
+        runtime.session = MockSession("target")
+        runtime.session.prompt = lambda *args, **kwargs: calls.append("new prompt")
+        await runtime.rebind_handler()
+        return {"cancelled": False}
+
+    runtime.switchSession = switch
+    output = io.StringIO()
+    monkeypatch.setattr(bridge_mod, "writeRawStdout", output.write)
+
+    async def immediate_read(fn, *args, **kwargs):
+        return fn(*args, **kwargs)
+
+    monkeypatch.setattr(bridge_mod.asyncio, "to_thread", immediate_read)
+    monkeypatch.setattr(sys, "stdin", io.StringIO("".join(json.dumps(item) + "\n" for item in [
+        {"type": "prompt", "requestId": "p", "text": "belongs to old"},
+        {"type": "load_session", "requestId": "load", "path": str(path)},
+        {"type": "shutdown"},
+    ])))
+    assert await run_desktop_bridge(runtime) == 0
+    assert calls[:2] == ["old prompt", "switch"]
+
+
+@pytest.mark.asyncio
+async def test_two_queued_prompts_reject_second_before_streaming_flag(monkeypatch: pytest.MonkeyPatch) -> None:
+    import misaka.cli.desktop_bridge as bridge_mod
+    runtime = MockRuntimeHost()
+    started = asyncio.Event()
+    release = asyncio.Event()
+    calls: list[str] = []
+
+    async def prompt(text: str, options: Any = None) -> None:
+        calls.append(text)
+        started.set()
+        await release.wait()
+
+    runtime.session.prompt = prompt
+    output = io.StringIO()
+    monkeypatch.setattr(bridge_mod, "writeRawStdout", output.write)
+
+    async def immediate_read(fn, *args, **kwargs):
+        return fn(*args, **kwargs)
+
+    monkeypatch.setattr(bridge_mod.asyncio, "to_thread", immediate_read)
+    monkeypatch.setattr(sys, "stdin", io.StringIO("".join(json.dumps(item) + "\n" for item in [
+        {"type": "prompt", "requestId": "first", "text": "first"},
+        {"type": "prompt", "requestId": "second", "text": "second"},
+        {"type": "shutdown", "requestId": "bye"},
+    ])))
+    task = asyncio.create_task(run_desktop_bridge(runtime))
+    await asyncio.wait_for(started.wait(), timeout=5)
+    for _ in range(100):
+        if '"requestId":"second"' in output.getvalue():
+            break
+        await asyncio.sleep(0.01)
+    release.set()
+    assert await asyncio.wait_for(task, timeout=5) == 0
+    acks = {item.get("requestId"): item for item in map(json.loads, output.getvalue().splitlines()) if item.get("type") == "ack"}
+    assert acks["first"]["ok"] is True
+    assert acks["second"]["ok"] is False
+    assert calls == ["first"]
+
+
+@pytest.mark.asyncio
+async def test_prepare_attachments_command_returns_prepared_file_results(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    file_path = tmp_path / "fixture.md"
+    file_path.write_text("fixture text", encoding="utf-8")
+    runtime = MockRuntimeHost()
+    output = io.StringIO()
+    command = {"type": "prepare_attachments", "requestId": "prepare", "paths": [str(file_path)]}
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(command) + "\n" + json.dumps({"type": "shutdown"}) + "\n"))
+    import misaka.cli.desktop_bridge as bridge_mod
+    monkeypatch.setattr(bridge_mod, "writeRawStdout", output.write)
+
+    assert await run_desktop_bridge(runtime) == 0
+    ack = next(item for item in map(json.loads, output.getvalue().splitlines()) if item.get("requestId") == "prepare")
+    assert ack["ok"] is True
+    assert ack["data"]["attachments"][0]["text"].endswith("fixture text\n</file>\n")
+
+
+@pytest.mark.asyncio
+async def test_explicit_missing_workspace_session_does_not_create_new_session(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    import misaka.cli.desktop_bridge as bridge_mod
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    runtime = MockRuntimeHost()
+    output = io.StringIO()
+    monkeypatch.setattr(bridge_mod, "writeRawStdout", output.write)
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps({
+        "type": "switch_workspace", "requestId": "missing", "path": str(workspace),
+        "sessionPath": str(tmp_path / "not-there.jsonl"), "preview": True,
+    }) + "\n" + json.dumps({"type": "shutdown"}) + "\n"))
+    assert await run_desktop_bridge(runtime) == 0
+    ack = next(item for item in map(json.loads, output.getvalue().splitlines()) if item.get("requestId") == "missing")
+    assert ack["ok"] is False
+    assert runtime.new_session_calls == [] and runtime.switch_session_calls == []
+
+
+@pytest.mark.asyncio
+async def test_explicit_missing_load_session_fails_before_runtime_switch(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    import misaka.cli.desktop_bridge as bridge_mod
+    runtime = MockRuntimeHost()
+    output = io.StringIO()
+    monkeypatch.setattr(bridge_mod, "writeRawStdout", output.write)
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps({
+        "type": "load_session", "requestId": "missing", "path": str(tmp_path / "no.jsonl"),
+    }) + "\n" + json.dumps({"type": "shutdown"}) + "\n"))
+    assert await run_desktop_bridge(runtime) == 0
+    ack = next(item for item in map(json.loads, output.getvalue().splitlines()) if item.get("requestId") == "missing")
+    assert ack["ok"] is False and runtime.switch_session_calls == []
+
+
+@pytest.mark.asyncio
+async def test_explicit_workspace_session_rejects_another_cwd(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    import misaka.cli.desktop_bridge as bridge_mod
+    from misaka.core.session_manager import CURRENT_SESSION_VERSION
+    workspace = tmp_path / "workspace"
+    other = tmp_path / "other"
+    workspace.mkdir()
+    other.mkdir()
+    path = tmp_path / "other.jsonl"
+    path.write_text(json.dumps({"type": "session", "version": CURRENT_SESSION_VERSION, "id": "other", "cwd": str(other), "timestamp": "2026-10-05T00:00:00Z"}) + "\n", encoding="utf-8")
+    runtime = MockRuntimeHost()
+    output = io.StringIO()
+    monkeypatch.setattr(bridge_mod, "writeRawStdout", output.write)
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps({
+        "type": "switch_workspace", "requestId": "wrong", "path": str(workspace),
+        "sessionPath": str(path), "preview": True,
+    }) + "\n" + json.dumps({"type": "shutdown"}) + "\n"))
+    assert await run_desktop_bridge(runtime) == 0
+    ack = next(item for item in map(json.loads, output.getvalue().splitlines()) if item.get("requestId") == "wrong")
+    assert ack["ok"] is False
+    assert runtime.switch_session_calls == []
+
+
+@pytest.mark.asyncio
+async def test_pending_switch_does_not_coalesce_across_settings_command(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    import misaka.cli.desktop_bridge as bridge_mod
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    runtime = MockRuntimeHost()
+    started, release = asyncio.Event(), asyncio.Event()
+    calls: list[str] = []
+
+    async def new_session(options: Any) -> dict[str, bool]:
+        calls.append(options["cwd"])
+        if len(calls) == 1:
+            started.set()
+            await release.wait()
+        return {"cancelled": False}
+
+    runtime.newSession = new_session
+    output = io.StringIO()
+    monkeypatch.setattr(bridge_mod, "writeRawStdout", output.write)
+    commands = [
+        {"type": "switch_workspace", "requestId": "first", "path": str(workspace)},
+        {"type": "switch_workspace", "requestId": "second", "path": str(workspace)},
+        {"type": "get_stats", "requestId": "settings"},
+        {"type": "switch_workspace", "requestId": "third", "path": str(workspace)},
+        {"type": "shutdown", "requestId": "bye"},
+    ]
+    monkeypatch.setattr(sys, "stdin", io.StringIO("".join(json.dumps(item) + "\n" for item in commands)))
+    task = asyncio.create_task(run_desktop_bridge(runtime))
+    await asyncio.wait_for(started.wait(), timeout=5)
+    await asyncio.sleep(0.05)
+    release.set()
+    assert await asyncio.wait_for(task, timeout=5) == 0
+    lines = [json.loads(line) for line in output.getvalue().splitlines()]
+    assert len(calls) == 3
+    assert [item["requestId"] for item in lines if item.get("type") == "ack" and item.get("requestId") in {"first", "second", "settings", "third"}] == ["first", "second", "settings", "third"]
 
 
 @pytest.mark.asyncio
@@ -602,6 +1259,389 @@ def test_serialize_session_entries_keeps_research_progress() -> None:
     assert [item["role"] for item in out if item["role"] != "custom"] == ["user", "assistant"]
 
 
+def test_serialize_session_entries_preserves_ordered_assistant_blocks_and_metadata() -> None:
+    """Reopening must not group reasoning, prose and tools into a different visual order.
+
+    This catches replacing the ordered projection with the old three independent accumulators,
+    and catches assigning block indices after filtering instead of using persisted content indices.
+    """
+    from misaka.cli.desktop_bridge import _serialize_session_entries
+
+    result_content = [
+        {"type": "text", "text": "contents"},
+        {"type": "image", "data": "raw-image-data", "mimeType": "image/png"},
+    ]
+    entries = [{
+        "type": "message",
+        "id": "answer",
+        "timestamp": "2026-10-05T00:00:03+00:00",
+        "message": {
+            "role": "assistant",
+            "content": [
+                {"type": "thinking", "thinking": "inspect first"},
+                {"type": "text", "text": "Before. "},
+                {"type": "toolCall", "id": "call-read", "name": "read", "arguments": {"path": "a.md"}},
+                {"type": "text", "text": "After."},
+            ],
+            "usage": {"input": 11, "output": 7, "totalTokens": 18},
+            "stopReason": "toolUse",
+            "errorMessage": "provider note",
+            "timestamp": 1234,
+        },
+    }, {
+        "type": "message",
+        "id": "result",
+        "message": {
+            "role": "toolResult",
+            "toolCallId": "call-read",
+            "toolName": "read",
+            "content": result_content,
+            "details": {"bytes": 8},
+            "isError": False,
+            "timestamp": 1235,
+        },
+    }]
+
+    out = _serialize_session_entries(entries)
+    assert len(out) == 1
+    message = out[0]
+    assert message["id"] == "msg-answer-0"
+    assert message["entryId"] == "answer"
+    assert message["timestamp"] == 1234
+    assert message["stopReason"] == "toolUse"
+    assert message["errorMessage"] == "provider note"
+    assert message["tokens"] == {"input": 11, "output": 7, "total": 18}
+    assert [block["type"] for block in message["blocks"]] == ["thinking", "text", "toolCall", "text"]
+    assert [block["id"] for block in message["blocks"]] == [
+        "msg-answer-0:block:0",
+        "msg-answer-0:block:1",
+        "msg-answer-0:block:2",
+        "msg-answer-0:block:3",
+    ]
+    assert [block["contentIndex"] for block in message["blocks"]] == [0, 1, 2, 3]
+    assert message["blocks"][0] == {
+        "type": "thinking", "id": "msg-answer-0:block:0", "contentIndex": 0,
+        "thinking": "inspect first", "isStreaming": False,
+    }
+    assert message["blocks"][1] == {
+        "type": "text", "id": "msg-answer-0:block:1", "contentIndex": 1,
+        "text": "Before. ", "isStreaming": False,
+    }
+    assert message["content"] == "Before. After."
+    assert message["thinking"] == "inspect first"
+
+    tool_block = message["blocks"][2]
+    tool_call = tool_block["toolCall"]
+    assert tool_block["id"] == "msg-answer-0:block:2"
+    assert tool_call == {
+        "id": "call-read",
+        "name": "read",
+        "arguments": {"path": "a.md"},
+        "status": "success",
+        "result": result_content,
+        "details": {"bytes": 8},
+    }
+    assert message["toolCalls"][0] is tool_call, "legacy and ordered projections share one canonical tool object"
+
+
+def test_serialize_session_entries_associates_results_and_never_invents_success() -> None:
+    """Each persisted result updates only its call; incomplete and aborted calls stay honest."""
+    from misaka.cli.desktop_bridge import _serialize_session_entries
+
+    entries = [
+        {"type": "message", "id": "a1", "message": {
+            "role": "assistant", "timestamp": 10, "stopReason": "toolUse", "content": [
+                {"type": "toolCall", "id": "ok", "name": "first", "arguments": {"n": 1}},
+                {"type": "toolCall", "id": "waiting", "name": "second", "arguments": {"n": 2}},
+            ],
+        }},
+        {"type": "message", "id": "r1", "message": {
+            "role": "toolResult", "toolCallId": "ok", "toolName": "first",
+            "content": [{"type": "text", "text": "done"}], "details": {"attempt": 1},
+            "isError": False, "timestamp": 11,
+        }},
+        {"type": "message", "id": "a2", "message": {
+            "role": "assistant", "timestamp": 12, "stopReason": "toolUse", "content": [
+                {"type": "text", "text": "next"},
+                {"type": "toolCall", "id": "bad", "name": "third", "arguments": {}},
+            ],
+        }},
+        {"type": "message", "id": "r2", "message": {
+            "role": "toolResult", "toolCallId": "bad", "toolName": "third",
+            "content": [{"type": "text", "text": "stderr"}], "details": {"exitCode": 2},
+            "error": "command failed", "isError": True, "timestamp": 13,
+        }},
+        {"type": "message", "id": "a3", "message": {
+            "role": "assistant", "timestamp": 14, "stopReason": "aborted", "errorMessage": "Stopped",
+            "content": [{"type": "toolCall", "id": "stopped", "name": "fourth", "arguments": {}}],
+        }},
+    ]
+
+    out = _serialize_session_entries(entries)
+    calls = {
+        call["id"]: call
+        for message in out
+        for call in message.get("toolCalls", [])
+    }
+    assert calls["ok"] == {
+        "id": "ok", "name": "first", "arguments": {"n": 1}, "status": "success",
+        "result": [{"type": "text", "text": "done"}], "details": {"attempt": 1},
+    }
+    assert calls["bad"] == {
+        "id": "bad", "name": "third", "arguments": {}, "status": "error",
+        "result": [{"type": "text", "text": "stderr"}], "details": {"exitCode": 2},
+        "error": "command failed",
+    }
+    assert calls["waiting"]["status"] == "cancelled"
+    assert calls["stopped"]["status"] == "cancelled"
+    assert "result" not in calls["waiting"] and "result" not in calls["stopped"]
+
+    incomplete = _serialize_session_entries(entries[:1])
+    assert [call["status"] for call in incomplete[0]["toolCalls"]] == ["pending", "pending"]
+    assert all("result" not in call for call in incomplete[0]["toolCalls"])
+
+    reopened = _serialize_session_entries(entries)
+    assert reopened == out, "the same persisted transcript must reopen with identical content and states"
+
+def test_serialize_session_entries_provider_error_cancels_unfinished_calls() -> None:
+    """A durable provider error closes its unfinished tools just like the live reducer."""
+    from misaka.cli.desktop_bridge import _serialize_session_entries
+
+    entries = [{
+        "type": "message",
+        "id": "provider-error",
+        "timestamp": "2026-10-05T00:00:09+00:00",
+        "message": {
+            "role": "assistant",
+            "timestamp": 2009,
+            "content": [
+                {"type": "thinking", "thinking": "Trying the request."},
+                {"type": "text", "text": "Starting lookup."},
+                {"type": "toolCall", "id": "failed-before-result", "name": "lookup", "arguments": {"q": "x"}},
+            ],
+            "stopReason": "error",
+            "errorMessage": "Provider connection closed",
+        },
+    }]
+
+    out = _serialize_session_entries(entries)
+    assert len(out) == 1
+    message = out[0]
+    assert [block["type"] for block in message["blocks"]] == ["thinking", "text", "toolCall"]
+    assert message["thinking"] == "Trying the request."
+    assert message["content"] == "Starting lookup."
+    assert message["stopReason"] == "error"
+    assert message["errorMessage"] == "Provider connection closed"
+    assert message["toolCalls"][0]["status"] == "cancelled"
+    assert "result" not in message["toolCalls"][0]
+    assert message["blocks"][2]["toolCall"] is message["toolCalls"][0]
+
+def test_persisted_fixture_reopens_with_the_same_completed_turn_as_live_events() -> None:
+    """The approved shared turn has one canonical content sequence live and after reopen."""
+    from misaka.cli.desktop_bridge import _serialize_session_entries
+
+    fixture = json.loads(
+        (Path(__file__).parent / "fixtures" / "desktop_conversation.json").read_text(encoding="utf-8")
+    )
+    reopened = _serialize_session_entries(fixture["entries"])
+    assistants = [message for message in reopened if message["role"] == "assistant"]
+    live_assistants = [
+        envelope["event"]["message"]
+        for envelope in fixture["events"]
+        if envelope["event"].get("type") == "message_end"
+        and envelope["event"].get("message", {}).get("role") == "assistant"
+    ]
+
+    expected_text = [
+        "先读取文件。读取请求已发出。",
+        "读取完成，继续检索。",
+        "总结：\n\n| 文件 | 状态 |\n| --- | --- |\n| fixture.md | 已读取 |",
+    ]
+    assert [message["content"] for message in assistants] == expected_text
+    assert [
+        "".join(block.get("text", "") for block in message["content"] if block.get("type") == "text")
+        for message in live_assistants
+    ] == expected_text
+    assert [[block["type"] for block in message["blocks"]] for message in assistants] == [
+        ["thinking", "text", "toolCall", "text"],
+        ["text", "toolCall"],
+        ["text"],
+    ]
+    assert [[block["type"] for block in message["content"]] for message in live_assistants] == [
+        ["thinking", "text", "toolCall", "text"],
+        ["text", "toolCall"],
+        ["text"],
+    ]
+    assert assistants[0]["toolCalls"][0] == {
+        "id": "call-a", "name": "read", "arguments": {"path": "fixture.md"},
+        "status": "success", "result": [{"type": "text", "text": "文件内容"}],
+        "details": {"lines": 2},
+    }
+    assert assistants[1]["toolCalls"][0] == {
+        "id": "call-b", "name": "grep", "arguments": {"query": "fixture"},
+        "status": "error", "result": [{"type": "text", "text": "未找到匹配项"}],
+        "details": {"matches": 0}, "error": "未找到匹配项",
+    }
+    assert assistants[2]["tokens"] == {"input": 10, "output": 20, "total": 30}
+    assert [message["stopReason"] for message in assistants] == ["toolUse", "toolUse", "stop"]
+
+
+def test_serialize_session_entries_preserves_images_on_user_messages() -> None:
+    from misaka.cli.desktop_bridge import _serialize_session_entries
+
+    image = {"type": "image", "mimeType": "image/png", "data": "cG5n"}
+    entries = [{
+        "type": "message", "id": "user-image", "timestamp": 1,
+        "message": {"role": "user", "timestamp": 1, "content": [
+            {"type": "text", "text": "请查看此图片"}, image,
+        ]},
+    }]
+    assert _serialize_session_entries(entries)[0] == {
+        "id": "msg-user-image-0", "entryId": "user-image", "role": "user",
+        "content": "请查看此图片", "images": [image], "timestamp": 1,
+    }
+
+def test_shared_fixture_tool_start_matches_the_real_jsonl_wire_projection() -> None:
+    """The live fixture records the bounded wire delta, while reopen uses the full snapshot."""
+    from misaka.cli.desktop_bridge import _serialize_event
+
+    fixture = json.loads(
+        (Path(__file__).parent / "fixtures" / "desktop_conversation.json").read_text(encoding="utf-8")
+    )
+    expected = next(
+        envelope for envelope in fixture["events"]
+        if envelope["event"].get("assistantMessageEvent", {}).get("type") == "toolcall_start"
+    )
+    first_assistant = fixture["entries"][1]["message"]
+    raw_event = {
+        "type": "message_update",
+        "message": {"role": "assistant", "usage": None},
+        "assistantMessageEvent": {
+            "type": "toolcall_start",
+            "contentIndex": 2,
+            "partial": first_assistant,
+        },
+    }
+
+    actual = json.loads(_serialize_event(expected["seq"], fixture["sessionId"], raw_event))
+    assert actual == expected
+    assert "partial" not in actual["event"]["assistantMessageEvent"]
+    assert actual["event"]["assistantMessageEvent"]["id"] == "call-a"
+    assert actual["event"]["assistantMessageEvent"]["toolName"] == "read"
+
+
+@pytest.mark.asyncio
+async def test_delete_active_session_starts_a_new_session_before_removing_its_file(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    import misaka.cli.desktop_bridge as bridge_mod
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    old_file = tmp_path / "active.jsonl"
+    old_file.write_text("{}\n", encoding="utf-8")
+    runtime = MockRuntimeHost()
+    runtime.session.sessionFile = str(old_file)
+    runtime.session.sessionManager.getCwd = lambda: str(workspace)
+    output = io.StringIO()
+    monkeypatch.setattr(bridge_mod, "writeRawStdout", output.write)
+
+    async def replace_session(options: Any = None) -> dict[str, bool]:
+        runtime.new_session_calls.append(options)
+        fresh = MockSession("fresh-session")
+        fresh.sessionFile = str(tmp_path / "fresh.jsonl")
+        fresh.sessionManager.getCwd = lambda: str(workspace)
+        runtime.session = fresh
+        assert runtime.rebind_handler is not None
+        await runtime.rebind_handler(fresh)
+        return {"cancelled": False}
+
+    runtime.newSession = replace_session
+    monkeypatch.setattr(sys, "stdin", io.StringIO("".join(json.dumps(item) + "\n" for item in [
+        {"type": "delete_session", "requestId": "delete-active", "path": str(old_file)},
+        {"type": "shutdown", "requestId": "bye"},
+    ])))
+
+    assert await run_desktop_bridge(runtime) == 0
+
+    lines = [json.loads(line) for line in output.getvalue().splitlines()]
+    ack = next(item for item in lines if item.get("requestId") == "delete-active")
+    started = next(item["event"] for item in lines if item.get("event", {}).get("type") == "session_started")
+    assert runtime.new_session_calls == [{"cwd": str(workspace), "carryOverContext": False}]
+    assert old_file.exists() is False
+    assert ack["ok"] is True and ack["data"]["path"] == str(old_file)
+    assert ack["data"]["session"]["file"] == str(tmp_path / "fresh.jsonl")
+    assert started["requestId"] == "delete-active" and started["file"] == str(tmp_path / "fresh.jsonl")
+
+
+@pytest.mark.asyncio
+async def test_delete_active_session_refuses_to_replace_a_running_task(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    import misaka.cli.desktop_bridge as bridge_mod
+
+    old_file = tmp_path / "active.jsonl"
+    old_file.write_text("{}\n", encoding="utf-8")
+    runtime = MockRuntimeHost()
+    runtime.session.sessionFile = str(old_file)
+    runtime.session.isStreaming = True
+    output = io.StringIO()
+    monkeypatch.setattr(bridge_mod, "writeRawStdout", output.write)
+    monkeypatch.setattr(sys, "stdin", io.StringIO(
+        json.dumps({"type": "delete_session", "requestId": "busy-delete", "path": str(old_file)}) + "\n"
+        + json.dumps({"type": "shutdown"}) + "\n"
+    ))
+
+    assert await run_desktop_bridge(runtime) == 0
+
+    ack = next(item for item in map(json.loads, output.getvalue().splitlines()) if item.get("requestId") == "busy-delete")
+    assert ack["ok"] is False and "停止" in ack["error"]
+    assert old_file.exists() and runtime.new_session_calls == []
+
+
+@pytest.mark.asyncio
+async def test_delete_active_session_retains_file_if_unlink_fails_after_replacement(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    import misaka.cli.desktop_bridge as bridge_mod
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    old_file = tmp_path / "active.jsonl"
+    old_file.write_text("{}\n", encoding="utf-8")
+    runtime = MockRuntimeHost()
+    runtime.session.sessionFile = str(old_file)
+    runtime.session.sessionManager.getCwd = lambda: str(workspace)
+    output = io.StringIO()
+    monkeypatch.setattr(bridge_mod, "writeRawStdout", output.write)
+
+    async def replace_session(options: Any = None) -> dict[str, bool]:
+        fresh = MockSession("fresh-session")
+        fresh.sessionFile = str(tmp_path / "fresh.jsonl")
+        fresh.sessionManager.getCwd = lambda: str(workspace)
+        runtime.session = fresh
+        assert runtime.rebind_handler is not None
+        await runtime.rebind_handler(fresh)
+        return {"cancelled": False}
+
+    runtime.newSession = replace_session
+    original_remove = bridge_mod.os.remove
+
+    def fail_active_unlink(path: str) -> None:
+        if os.path.realpath(path) == os.path.realpath(old_file):
+            raise PermissionError("file is busy")
+        original_remove(path)
+
+    monkeypatch.setattr(bridge_mod.os, "remove", fail_active_unlink)
+    monkeypatch.setattr(sys, "stdin", io.StringIO(
+        json.dumps({"type": "delete_session", "requestId": "partial-delete", "path": str(old_file)}) + "\n"
+        + json.dumps({"type": "shutdown"}) + "\n"
+    ))
+
+    assert await run_desktop_bridge(runtime) == 0
+
+    lines = [json.loads(line) for line in output.getvalue().splitlines()]
+    ack = next(item for item in lines if item.get("requestId") == "partial-delete")
+    started = next(item["event"] for item in lines if item.get("event", {}).get("type") == "session_started")
+    assert ack["ok"] is False and "file is busy" in ack["error"]
+    assert ack.get("data", {}).get("session", {}).get("file") == str(tmp_path / "fresh.jsonl")
+    assert started["file"] == str(tmp_path / "fresh.jsonl") and old_file.exists()
+
+
 def test_serialize_research_run_reports_who_owns_it(tmp_path, monkeypatch) -> None:
     """The desktop cannot offer an intervention without knowing who holds the run."""
     import sqlite3
@@ -717,3 +1757,133 @@ def test_a_dead_driver_lease_is_not_driving(tmp_path, monkeypatch) -> None:
     # Another machine's live-looking pid is not judged from here; its TTL holds the run.
     foreign = row_for("driver:not-this-host:2:nonce")
     assert foreign["driving"] is True, "a foreign lease is left to its TTL, never judged by pid"
+
+
+@pytest.mark.asyncio
+async def test_research_detail_and_global_activity_commands_keep_workspace_scope(monkeypatch, tmp_path):
+    from contextlib import closing
+    from misaka.core.platform import tasks
+    from misaka.core.research import runs
+    import misaka.cli.desktop_bridge as bridge_module
+
+    workspace = tmp_path / "project"
+    other_workspace = tmp_path / "other"
+    workspace.mkdir()
+    other_workspace.mkdir()
+    board = tmp_path / "board.db"
+    with closing(tasks.connect(str(board))) as con:
+        runs.init(con)
+        run = runs.create(con, workspace=str(workspace), question="Scoped desktop details")
+        runs.set_state(con, run["id"], status="waiting_input", phase="waiting_input")
+        node = runs.root(con, run["id"])
+    monkeypatch.setattr(bridge_module, "_open_research_readonly", lambda: tasks.connect(str(board)))
+    output = io.StringIO()
+    session = MockSession()
+    session.moments = type("Moments", (), {"parts": []})()
+    commands = [
+        {"type": "get_active_research_runs", "requestId": "active"},
+        {"type": "get_research_details", "requestId": "details", "runId": run["id"], "workspace": str(workspace)},
+        {"type": "get_research_node", "requestId": "node", "runId": run["id"],
+         "nodeId": node["id"], "workspace": str(other_workspace)},
+        {"type": "shutdown", "requestId": "bye"},
+    ]
+    monkeypatch.setattr(sys, "stdin", io.StringIO("".join(json.dumps(item) + "\n" for item in commands)))
+    monkeypatch.setattr(bridge_module, "writeRawStdout", output.write)
+
+    assert await run_desktop_bridge(MockRuntimeHost(session)) == 0
+
+    acknowledgements = {
+        item["requestId"]: item
+        for item in map(json.loads, output.getvalue().splitlines())
+        if item.get("type") == "ack"
+    }
+    assert acknowledgements["active"]["data"]["runs"][0]["id"] == run["id"]
+    assert acknowledgements["details"]["ok"], acknowledgements["details"]
+    detail = acknowledgements["details"]["data"]
+    assert detail["run"]["id"] == run["id"]
+    assert detail["pending_questions"] == []
+    assert acknowledgements["node"]["data"]["detail"] is None
+
+
+@pytest.mark.asyncio
+async def test_normal_conversation_bridge_cannot_start_an_independent_research_run(monkeypatch):
+    import misaka.cli.desktop_bridge as bridge_module
+
+    session = MockSession()
+    session.moments = type("Moments", (), {"parts": []})()
+    output = io.StringIO()
+    commands = [
+        {"type": "start_research", "requestId": "not-research", "question": "topic", "limits": {}},
+        {"type": "shutdown"},
+    ]
+    monkeypatch.setattr(sys, "stdin", io.StringIO("".join(json.dumps(item) + "\n" for item in commands)))
+    monkeypatch.setattr(bridge_module, "writeRawStdout", output.write)
+
+    assert await run_desktop_bridge(MockRuntimeHost(session)) == 0
+    ack = next(item for item in map(json.loads, output.getvalue().splitlines()) if item.get("requestId") == "not-research")
+    assert ack["ok"] is False
+    assert "independent research session" in ack["error"]
+
+
+@pytest.mark.asyncio
+async def test_ordinary_session_cannot_compact_a_live_research_root(monkeypatch, tmp_path):
+    import sqlite3
+    from contextlib import closing
+    from misaka.core.platform import tasks
+    from misaka.core.research import runs
+    import misaka.cli.desktop_bridge as bridge_module
+
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+    board = tmp_path / "board.db"
+    root_session = workspace / "root.jsonl"
+    with closing(tasks.connect(str(board))) as con:
+        runs.init(con)
+        run = runs.create(con, workspace=str(workspace), question="Live project research")
+        runs.set_state(con, run["id"], status="active", root_session=str(root_session))
+    def open_readonly():
+        con = sqlite3.connect(board.as_uri() + "?mode=ro", uri=True)
+        con.row_factory = sqlite3.Row
+        con.execute("PRAGMA query_only=ON")
+        return con
+
+    monkeypatch.setattr(bridge_module, "_open_research_readonly", open_readonly)
+    session = MockSession()
+    session.sessionManager.sessionFile = str(root_session)
+    output = io.StringIO()
+    commands = [
+        {"type": "compact_session", "requestId": "compact-live-root"},
+        {"type": "shutdown"},
+    ]
+    monkeypatch.setattr(sys, "stdin", io.StringIO("".join(json.dumps(item) + "\n" for item in commands)))
+    monkeypatch.setattr(bridge_module, "writeRawStdout", output.write)
+
+    assert await run_desktop_bridge(MockRuntimeHost(session)) == 0
+    ack = next(item for item in map(json.loads, output.getvalue().splitlines())
+               if item.get("requestId") == "compact-live-root")
+    assert ack["ok"] is False
+    assert "Stop the owning research run" in ack["error"]
+
+
+def test_session_mutation_guard_detects_active_research_root_and_node_sessions(tmp_path):
+    from contextlib import closing
+    from misaka.core.platform import tasks
+    from misaka.core.research import runs
+    from misaka.cli.desktop_bridge import session_belongs_to_active_research
+
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+    root_path = workspace / "root.jsonl"
+    node_path = workspace / "node.jsonl"
+    with closing(tasks.connect(str(tmp_path / "board.db"))) as con:
+        runs.init(con)
+        run = runs.create(con, workspace=str(workspace), question="Protect live research")
+        root = runs.root(con, run["id"])
+        node = runs.create_node(con, run["id"], question="Branch", parents=[root["id"]])
+        runs.set_state(con, run["id"], status="waiting_input", root_session=str(root_path))
+        runs.set_node(con, node["id"], session_file=str(node_path))
+
+        assert session_belongs_to_active_research(con, str(root_path))
+        assert session_belongs_to_active_research(con, str(node_path))
+        runs.set_state(con, run["id"], status="done")
+        assert session_belongs_to_active_research(con, str(root_path)) is False

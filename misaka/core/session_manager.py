@@ -8,9 +8,11 @@ import hashlib
 import json
 import os
 import re
+import threading
 import uuid
+from collections import OrderedDict
 from collections.abc import Callable, Iterator, Mapping
-from dataclasses import asdict, dataclass, field, is_dataclass
+from dataclasses import asdict, dataclass, field, is_dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal, NotRequired, Protocol, TypedDict, runtime_checkable
@@ -1444,7 +1446,49 @@ def _session_modified_date(entries: list[FileEntry], header: SessionHeader, stat
     return datetime.fromtimestamp(stats_mtime, UTC)
 
 
+_SUMMARY_CACHE_LIMIT = 256
+_SUMMARY_CACHE_BYTE_LIMIT = 32 * 1024 * 1024
+_summary_cache: OrderedDict[tuple[str, int, int, int], SessionInfo] = OrderedDict()
+_summary_cache_lock = threading.Lock()
+
+
+def _summary_weight(info: SessionInfo) -> int:
+    # Python strings can use up to four bytes per code point; allow space for metadata.
+    return 512 + 4 * (len(info.allMessagesText) + len(info.firstMessage) + len(info.name or ""))
+
+
+def _summary_revision(path: str) -> tuple[str, int, int, int]:
+    stat = os.stat(path)
+    return (os.path.realpath(path), stat.st_mtime_ns, stat.st_ctime_ns, stat.st_size)
+
+
 def _build_session_info_sync(file_path: str) -> SessionInfo | None:
+    try:
+        revision = _summary_revision(file_path)
+    except OSError:
+        return None
+    with _summary_cache_lock:
+        cached = _summary_cache.get(revision)
+        if cached is not None:
+            _summary_cache.move_to_end(revision)
+            return replace(cached)
+    info = _build_session_info_uncached(file_path)
+    if info is not None:
+        try:
+            unchanged = revision == _summary_revision(file_path)
+        except OSError:
+            unchanged = False
+        if unchanged and _summary_weight(info) <= _SUMMARY_CACHE_BYTE_LIMIT:
+            with _summary_cache_lock:
+                _summary_cache[revision] = replace(info)
+                _summary_cache.move_to_end(revision)
+                while (len(_summary_cache) > _SUMMARY_CACHE_LIMIT
+                       or sum(_summary_weight(item) for item in _summary_cache.values()) > _SUMMARY_CACHE_BYTE_LIMIT):
+                    _summary_cache.popitem(last=False)
+    return info
+
+
+def _build_session_info_uncached(file_path: str) -> SessionInfo | None:
     try:
         path = Path(file_path)
         content = path.read_text(encoding="utf-8")

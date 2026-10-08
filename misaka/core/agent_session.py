@@ -989,6 +989,8 @@ class AgentSession:
         """
         if not await self._modelRegistry.checkConfiguredAuth(model):
             raise RuntimeError(f"No API key for {model.provider}/{model.id}")
+        from misaka.ai.thinking_compat import clear_thinking_feedback
+        clear_thinking_feedback(model)
         current = self.model
         thinking_level = self._get_thinking_level_for_model_switch(model)
         if persist:
@@ -1037,6 +1039,10 @@ class AgentSession:
         """
         model = self.model
         clamped = level if model is None else clamp_thinking_level(model, level)
+        if model is not None:
+            from misaka.ai.thinking_compat import clear_thinking_feedback
+            clear_thinking_feedback(model)
+            clamped = clamp_thinking_level(model, level)
         previous_level = self.agent.state.thinkingLevel
         self.agent.state.thinkingLevel = clamped
         if persist:
@@ -1068,7 +1074,10 @@ class AgentSession:
         return list(get_supported_thinking_levels(self.model))
 
     def supportsThinking(self) -> bool:
-        return bool(self.model and self.model.reasoning)
+        if not self.model or not self.model.reasoning:
+            return False
+        from misaka.ai.thinking_compat import thinking_capability
+        return thinking_capability(self.model)["status"] != "default"
 
     def cycleThinkingLevel(self, persist: bool = False) -> ThinkingLevel | None:
         if not self.supportsThinking():

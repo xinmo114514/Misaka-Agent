@@ -117,6 +117,10 @@ def plan_receipt(payload, *, forks):
 
 class Start(Params):
     summary: str = Field("", description="One or two lines on what was agreed with the user, for the record.")
+    expected_plan_id: str | None = Field(
+        None, description="Optional desktop approval guard: the exact plan version shown to the user.")
+    expected_reconcile_round: int | None = Field(
+        None, description="Optional desktop approval guard: the exact reconciliation round shown to the user.")
 
 
 class Withdraw(Params):
@@ -347,6 +351,8 @@ def review_tools(con, run, node, *, validate, session_file, round=1, forks=False
             plan = runs.action(con, run["id"], node["id"], runs.plan_key(round))
             if plan is None:
                 raise ValueError("There is no recorded plan to start; record one with misaka_research_assign first.")
+            if payload.get("expected_plan_id") and payload["expected_plan_id"] != plan["tool_call_id"]:
+                raise ValueError("This plan changed since it was displayed. Refresh and approve the current version.")
             runs.replace_action(con, run, node, runs.start_key(round),
                                 {"plan_tool_call_id": plan["tool_call_id"], "summary": payload["summary"]},
                                 session_file=path, tool_call_id=call_id)
@@ -429,8 +435,10 @@ def reconcile_review_tools(con, run, *, round, validate, session_file):
     """While a reconciliation waits for the user's go-ahead: revise it (the earlier go-ahead no
     longer counts) or start it once the user has agreed in conversation."""
     async def start(call_id, raw, _signal, _on_update, ctx):
-        Start.model_validate(raw)
+        payload = Start.model_validate(raw)
         _run_owner(session_file, ctx)
+        if payload.expected_reconcile_round is not None and payload.expected_reconcile_round != round:
+            raise ValueError("This reconciliation changed since it was displayed. Refresh and approve the current version.")
         current = runs.reconcile(con, run["id"], round)
         if current is None or current["applied_at"] is not None:
             raise ValueError("No reconciliation is waiting for the user's go-ahead right now.")

@@ -1,5 +1,6 @@
-import React, { useState } from 'react'
+import React, { useEffect, useRef, useState } from 'react'
 import { Check, Copy, Code2 } from 'lucide-react'
+import { clipboardErrorMessage, copyTextToClipboard } from '../../lib/clipboard'
 
 interface CodeBlockProps {
   language: string
@@ -8,14 +9,34 @@ interface CodeBlockProps {
 
 export const CodeBlock: React.FC<CodeBlockProps> = ({ language, code }) => {
   const [copied, setCopied] = useState(false)
+  const [copying, setCopying] = useState(false)
+  const [copyError, setCopyError] = useState<string | null>(null)
+  const copyingRef = useRef(false)
+  const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+
+  useEffect(() => () => {
+    if (timerRef.current) clearTimeout(timerRef.current)
+  }, [])
 
   const handleCopy = async () => {
+    if (copyingRef.current) return
+    copyingRef.current = true
+    setCopying(true)
+    setCopied(false)
+    setCopyError(null)
+    if (timerRef.current) clearTimeout(timerRef.current)
     try {
-      await navigator.clipboard.writeText(code)
+      await copyTextToClipboard(code)
       setCopied(true)
-      setTimeout(() => setCopied(false), 2000)
-    } catch {
-      // fallback
+      timerRef.current = setTimeout(() => {
+        setCopied(false)
+        timerRef.current = null
+      }, 2000)
+    } catch (error) {
+      setCopyError(`复制失败：${clipboardErrorMessage(error)}`)
+    } finally {
+      copyingRef.current = false
+      setCopying(false)
     }
   }
 
@@ -29,13 +50,16 @@ export const CodeBlock: React.FC<CodeBlockProps> = ({ language, code }) => {
         </div>
         <button
           onClick={handleCopy}
-          className="flex items-center gap-1 px-2 py-0.5 rounded text-[11px] hover:bg-surface-3 hover:text-text-main transition-colors text-dim cursor-pointer"
-          title="复制全部代码"
+          disabled={copying}
+          className="flex items-center gap-1 px-2 py-0.5 rounded text-[11px] hover:bg-surface-3 hover:text-text-main transition-colors text-dim cursor-pointer disabled:opacity-50 disabled:cursor-wait"
+          title={copying ? '正在复制代码' : '复制全部代码'}
         >
-          {copied ? (
+          {copying ? (
+            <span role="status">复制中…</span>
+          ) : copied ? (
             <>
               <Check className="w-3.5 h-3.5 text-success" />
-              <span className="text-success font-medium">已复制</span>
+              <span role="status" className="text-success font-medium">已复制</span>
             </>
           ) : (
             <>
@@ -45,6 +69,7 @@ export const CodeBlock: React.FC<CodeBlockProps> = ({ language, code }) => {
           )}
         </button>
       </div>
+      {copyError && <div role="alert" className="px-3.5 py-1.5 text-[11px] text-danger">{copyError}</div>}
 
       {/* Code content */}
       <div className="p-3.5 overflow-x-auto font-mono text-[length:var(--font-size-code)] leading-relaxed text-text-main/90 selection:bg-accent/30">

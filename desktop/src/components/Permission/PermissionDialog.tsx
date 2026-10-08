@@ -69,8 +69,8 @@ export const PermissionDialog: React.FC = () => {
   }
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm animate-in fade-in duration-200">
-      <div className="w-full max-w-lg bg-card border border-border-subtle shadow-e4 rounded-2xl p-5 flex flex-col gap-4 text-text-main">
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-overlay backdrop-blur-sm animate-in fade-in duration-200">
+      <div className="misaka-glass-popover relative w-full max-w-lg bg-card border border-border-subtle shadow-e4 rounded-2xl p-5 flex flex-col gap-4 text-text-main">
         {/* Header */}
         <div className="flex items-start justify-between gap-3">
           <div className="flex items-center gap-2.5">
@@ -130,7 +130,7 @@ export const PermissionDialog: React.FC = () => {
           <button
             type="button"
             onClick={handleAllowSession}
-            className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium bg-accent hover:opacity-90 text-white transition-colors cursor-pointer shadow-e2"
+            className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium bg-accent hover:opacity-90 text-on-accent transition-colors cursor-pointer shadow-e2"
           >
             <ShieldCheck className="w-3.5 h-3.5" />
             <span>本会话始终允许</span>

@@ -3,11 +3,13 @@ reconciliation, closing, and the views written into the project. Structure only 
 here judges what a node found."""
 import json
 from contextlib import closing
+from types import SimpleNamespace
 
 import pytest
 
 from misaka.core.platform import tasks
 from misaka.core.research import graph, runs, workflow
+from misaka.core.research import commands
 
 
 @pytest.fixture
@@ -235,6 +237,26 @@ def test_a_revised_reconciliation_needs_a_new_go_ahead(board, tmp_path):
     runs.record_reconcile(board, run, 1, {**payload, "summary": "revised"}, session_file=str(tmp_path / "s.jsonl"),
                           tool_call_id="second")
     assert not runs.reconcile_approved(board, run["id"], 1)
+
+
+@pytest.mark.asyncio
+async def test_desktop_reconcile_approval_rejects_a_round_the_user_did_not_review(board, tmp_path):
+    run, _root = _run(board, tmp_path)
+    session_file = str(tmp_path / "root.jsonl")
+    runs.record_reconcile(
+        board, run, 1,
+        {"nodes": [], "joins": [], "not_pursued": [], "relations": [], "summary": "reviewed round"},
+        session_file=session_file, tool_call_id="reconcile-1",
+    )
+    start = commands.reconcile_review_tools(
+        board, run, round=1, validate=lambda value: value, session_file=session_file,
+    )[-1]
+    ctx = SimpleNamespace(sessionManager=SimpleNamespace(sessionFile=session_file))
+
+    with pytest.raises(ValueError, match="changed since it was displayed"):
+        await start.execute("button", {"expected_reconcile_round": 2}, None, None, ctx)
+
+    assert runs.reconcile_approved(board, run["id"], 1) is False
 
 
 def test_a_stopped_run_accepts_no_reconciliation(board, tmp_path):

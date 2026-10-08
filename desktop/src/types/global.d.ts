@@ -1,5 +1,8 @@
+import type { ResolvedThemeData } from '../theme/types'
+
 export interface BridgeEventEnvelope {
   seq: number
+  streamId?: string
   sessionId: string
   event: {
     type: string
@@ -23,24 +26,7 @@ export interface BridgeAPI {
   on: (handler: (message: BridgeMessage) => void) => () => void
 }
 
-export interface ThemeData {
-  name: string
-  colors: Record<string, string>
-  desktop?: {
-    surface0?: string
-    surface1?: string
-    surface2?: string
-    surface3?: string
-    surfaceHover?: string
-    borderSubtle?: string
-    border?: string
-    borderStrong?: string
-    borderAccent?: string
-    disabled?: string
-    focusRing?: string
-    chart?: string[]
-  }
-}
+export interface ThemeData extends ResolvedThemeData {}
 
 /** Outcome of window.theme.setTheme: `name` is the theme actually in effect. */
 export interface ThemeSetResult {
@@ -50,6 +36,7 @@ export interface ThemeSetResult {
 }
 
 export interface ThemeAPI {
+  listThemes: () => Promise<import('../theme/types').ThemeSummary[]>
   onChange: (handler: (themeData: ThemeData) => void) => () => void
   /** Resolves to null for an unsupported name or an unreadable theme file. */
   getTheme: (name?: string) => Promise<ThemeData | null>
@@ -59,13 +46,39 @@ export interface ThemeAPI {
 export interface AppAPI {
   getVersion: () => Promise<string>
   pickDirectory: () => Promise<string | null>
-  openPath: (targetPath: string) => Promise<boolean>
-  showItemInFolder: (targetPath: string) => Promise<void>
+  pickFiles: () => Promise<string[]>
+  openPath: (targetPath: string) => Promise<PathActionResult>
+  openExternal: (url: string) => Promise<boolean>
+  showItemInFolder: (targetPath: string) => Promise<PathActionResult>
+  startResearchBridge: (input: { cwd: string; sessionFile?: string | null }) => Promise<{
+    enabled: boolean
+    session: { sessionId: string; file: string; cwd: string }
+    stats: { totalMessages?: number; [key: string]: unknown }
+    contextUsage: { tokens?: number; contextWindow?: number; percent?: number; [key: string]: unknown }
+    messages?: import('./session').ChatMessage[]
+    historyVersion?: string | null
+    lastEventSeq?: number
+    streamId?: string
+    isStreaming?: boolean
+    isIdle?: boolean
+    run?: { id: string; status: string; phase: string } | null
+    team?: import('./research').DesktopResearchTeam | null
+    modelBinding?: import('./research').ResearchModelBinding | null
+  }>
+  setResearchActive: (state: boolean | { active: boolean; pendingCount: number }) => void
+  onRequestClose?: (handler: () => void) => () => void
+  confirmClose?: (action: 'tray' | 'quit') => Promise<void>
+}
+
+export interface PathActionResult {
+  ok: boolean
+  error?: string
 }
 
 declare global {
   interface Window {
     bridge: BridgeAPI
+    researchBridge: BridgeAPI
     theme: ThemeAPI
     app: AppAPI
   }

@@ -566,3 +566,62 @@ async def test_skill_preflight_keeps_unaccepted_next_turn_notifications(host, mo
         await host.session.prompt('/agent-reach inspect')
     assert [text_of(m) for m in host.session._pendingNextTurnMessages] == (
         ['before', 'during'] if fail_preflight else ['during'])
+
+
+async def test_desktop_delivery_modes_are_consumed_after_tool_then_after_current_task(host):
+    """Exercise the desktop's prompt options against the real session and agent loop."""
+    from misaka.agent.types import AgentTool, AgentToolResult
+    from misaka.ai.types import TextContent, ToolCall
+
+    tool_started = asyncio.Event()
+    release_tool = asyncio.Event()
+    contexts = []
+    tool_finished = []
+
+    async def execute(call_id, args, signal, on_update, *rest):
+        tool_started.set()
+        await release_tool.wait()
+        assert not signal or not signal.aborted
+        tool_finished.append(call_id)
+        return AgentToolResult(content=[TextContent(text='tool finished')], details={})
+
+    tool = AgentTool(name='fixture_hold', label='fixture_hold', description='Offline held tool',
+                     parameters={'type': 'object', 'properties': {}}, execute=execute)
+    host.session.registerCustomTools([tool])
+    # This host intentionally starts with tools=[], an empty admission whitelist.
+    host.session.setDisallowedToolsByName([], alwaysAllowed=['fixture_hold'])
+    host.session.setActiveToolsByName(['fixture_hold'])
+    assert host.session.getActiveToolNames() == ['fixture_hold']
+
+    def stream(model, context, options=None):
+        contexts.append([text_of(m) for m in context.messages if read_field(m, 'role') == 'user'])
+        first = len(contexts) == 1
+        if not first:
+            assert tool_finished == ['held-call'], [(read_field(m, 'role'), text_of(m)) for m in context.messages]
+        message = AssistantMessage(
+            content=[ToolCall(id='held-call', name='fixture_hold', arguments={})] if first
+                    else [TextContent(text='fixture answer')],
+            api=model.api, provider=model.provider, model=model.id,
+            stopReason='toolUse' if first else 'stop', timestamp=len(contexts),
+            usage={'input': 0, 'output': 0, 'cacheRead': 0, 'cacheWrite': 0, 'totalTokens': 0,
+                   'cost': {'input': 0, 'output': 0, 'cacheRead': 0, 'cacheWrite': 0, 'total': 0}})
+        output = AssistantMessageEventStream()
+        output.push(DoneEvent(reason='toolUse' if first else 'stop', message=message))
+        output.end(message)
+        return output
+
+    host.session.agent.streamFn = stream
+    run = asyncio.create_task(host.session.prompt('original', {'streamingBehavior': 'steer'}))
+    try:
+        await asyncio.wait_for(tool_started.wait(), 5)
+        await host.session.prompt('steering', {'streamingBehavior': 'steer'})
+        await host.session.prompt('follow-up', {'streamingBehavior': 'followUp'})
+        assert contexts == [['original']] and tool_finished == []
+        assert host.session.getSteeringMessages() == ['steering']
+        assert host.session.getFollowUpMessages() == ['follow-up']
+    finally:
+        release_tool.set()
+        await asyncio.wait_for(run, 5)
+    assert contexts == [['original'], ['original', 'steering'], ['original', 'steering', 'follow-up']]
+    assert host.session.getSteeringMessages() == []
+    assert host.session.getFollowUpMessages() == []

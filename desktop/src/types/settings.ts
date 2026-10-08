@@ -18,17 +18,32 @@ export interface ModelProviderInfo {
   isOAuth?: boolean
 }
 
+export interface ThinkingCapability {
+  status: 'known' | 'unknown' | 'default'
+  source: 'model' | 'generic' | 'service'
+  levels: string[]
+  adjustable: boolean
+}
+
 export interface ModelDetail {
   id: string
   name: string
   provider: string
   api?: string
   reasoning: boolean
+  supportsThinking?: boolean
   input: string[]
   contextWindow: number
   maxTokens: number
   configured: boolean
   thinkingLevelMap?: Record<string, string | null>
+  /**
+   * The ladder this model actually offers, resolved by the bridge from
+   * `get_supported_thinking_levels`. Authoritative over `thinkingLevelMap`, which the
+   * front end has to interpret itself.
+   */
+  thinkingLevels?: string[]
+  thinkingCapability?: ThinkingCapability
   source?: 'builtin' | 'custom'
 }
 
@@ -165,3 +180,5 @@ export interface UpdateCheckResult {
 }
 
 export type FontSizeOption = 'compact' | 'standard' | 'spacious'
+
+export type CloseWindowAction = 'ask' | 'tray' | 'quit'

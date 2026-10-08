@@ -1,6 +1,16 @@
 node_modules/
 dist/
+dist-e2e/
 dist-electron/
 *.local
 .DS_Store
 .preview/
+
+# Local browser acceptance output
+test-results/
+playwright-report/
+preview-artifacts/
+test-results-model-picker/
+
+test-results-*/
+*.log

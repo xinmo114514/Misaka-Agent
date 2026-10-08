@@ -1,28 +1,38 @@
-import React, { useState, useRef, useEffect, useMemo } from 'react'
+import React, { useState, useRef, useEffect, useLayoutEffect, useMemo, useCallback } from 'react'
 import {
   Plus,
   ArrowUp,
   Square,
+  Loader2,
   ShieldCheck,
   ChevronDown,
   Check,
-  Settings,
-  Star,
-  Brain,
   BookOpen,
   FileEdit,
   Zap,
+  FileImage,
+  RotateCw,
+  X,
+  Network,
 } from 'lucide-react'
 import { useSessionStore } from '../../store/useSessionStore'
 import { useSettingsStore } from '../../store/useSettingsStore'
+import { ModelPickerPopover } from './ModelPickerPopover'
+import { MisakaLogo } from '../MisakaLogo'
 import type { PermissionMode } from '../../types/session'
+import { startComposerResearch } from '../../lib/startComposerResearch'
+import { newRequestId } from '../../lib/bridge'
+import { executeResearchControl } from '../../lib/researchBridge'
 
 interface ComposerProps {
   onOpenModelSettings?: () => void
+  welcome?: boolean
+  workspaceControl?: React.ReactNode
+  onResearchStarted?: () => void
 }
 
 const PERMISSION_MODE_OPTIONS: {
-  id: PermissionMode
+  id: PermissionMode | 'research'
   label: string
   icon: React.ComponentType<{ className?: string }>
   badgeColor: string
@@ -39,107 +49,252 @@ const PERMISSION_MODE_OPTIONS: {
     id: 'plan',
     label: '只读规划',
     icon: BookOpen,
-    badgeColor: 'text-sky-400',
+    badgeColor: 'text-permission-plan',
     desc: '严格只读，禁止改动文件，文献研读/大纲论证专用',
   },
   {
     id: 'acceptEdits',
     label: '自动编辑',
     icon: FileEdit,
-    badgeColor: 'text-emerald-400',
+    badgeColor: 'text-permission-edit',
     desc: '工作区内文件自由读写修改，无需逐次审批',
   },
   {
     id: 'bypassPermissions',
     label: '完全放行',
     icon: Zap,
-    badgeColor: 'text-rose-400',
+    badgeColor: 'text-permission-bypass',
     desc: '完全自主执行，跳过所有权限询问（无阻执行）',
+  },
+  {
+    id: 'research',
+    label: '研究模式',
+    icon: Network,
+    badgeColor: 'text-accent',
+    desc: '直接输入课题发起研究，完全放行权限，计划与分支汇总自动审批',
   },
 ]
 
-export const Composer: React.FC<ComposerProps> = ({ onOpenModelSettings }) => {
-  const [text, setText] = useState('')
+export const Composer: React.FC<ComposerProps> = ({ onOpenModelSettings, welcome = false, workspaceControl, onResearchStarted }) => {
+  const text = useSessionStore(s => s.draft)
+  const setText = useSessionStore(s => s.setDraft)
+  const attachments = useSessionStore(s => s.attachments)
+  const prepareAttachments = useSessionStore(s => s.prepareAttachments)
+  const retryAttachment = useSessionStore(s => s.retryAttachment)
+  const removeAttachment = useSessionStore(s => s.removeAttachment)
+  const clearAttachments = useSessionStore(s => s.clearAttachments)
   const [showPicker, setShowPicker] = useState(false)
-  const [pickerSearch, setPickerSearch] = useState('')
   const [showModePicker, setShowModePicker] = useState(false)
+  const [showSendMenu, setShowSendMenu] = useState(false)
+  const [isPickingFiles, setIsPickingFiles] = useState(false)
+  const [attachmentNotice, setAttachmentNotice] = useState<string | null>(null)
+  const [researchStarting, setResearchStarting] = useState(false)
+  const [researchError, setResearchError] = useState<string | null>(null)
+  const researchStartingRef = useRef(false)
+  const sendMenuRef = useRef<HTMLDivElement>(null)
+  const sendMenuTriggerRef = useRef<HTMLButtonElement>(null)
   const textareaRef = useRef<HTMLTextAreaElement>(null)
+  const formRef = useRef<HTMLFormElement>(null)
+  const composing = useRef(false)
   const pickerRef = useRef<HTMLDivElement>(null)
+  // The pill owns focus when the popover closes on the keyboard: the popover is an
+  // unmounted element by then, so the handoff has to be explicit.
+  const pickerTriggerRef = useRef<HTMLButtonElement>(null)
   const modePickerRef = useRef<HTMLDivElement>(null)
 
-  const isStreaming = useSessionStore((s) => s.isStreaming)
+  const isStreaming = useSessionStore(s => s.agentMode === 'research' && s.researchBinding ? s.researchConversation.isStreaming : s.isStreaming)
+  const isSessionLoading = useSessionStore(s => s.isSessionLoading)
+  const sessionLoadError = useSessionStore(s => s.sessionLoadError)
+  const isAborting = useSessionStore(s => s.agentMode === 'research' && s.researchBinding ? s.researchConversation.isAborting : s.isAborting)
+  const sessionOperation = useSessionStore(s => s.sessionOperation)
+  const isCompacting = useSessionStore(s => s.isCompacting)
+  const retainedEditorText = useSessionStore(s => s.retainedEditorText)
+  const takeRetainedEditorText = useSessionStore(s => s.takeRetainedEditorText)
+  const runSlashCommand = useSessionStore(s => s.runSlashCommand)
   const sendMessage = useSessionStore((s) => s.sendMessage)
-  const abortGeneration = useSessionStore((s) => s.abortGeneration)
+  const ordinaryAbort = useSessionStore(s => s.abortGeneration)
+  const abortGeneration = useCallback(() => {
+    const state = useSessionStore.getState()
+    if (state.agentMode === 'research' && state.researchBinding?.runId) {
+      void executeResearchControl('stop_research', { runId: state.researchBinding.runId, workspace: state.researchBinding.workspace, sessionFile: state.researchBinding.sessionFile }).catch(error => setResearchError(String(error)))
+    } else ordinaryAbort()
+  }, [ordinaryAbort])
   const permissionMode = useSessionStore((s) => s.permissionMode)
   const setPermissionMode = useSessionStore((s) => s.setPermissionMode)
+  const agentMode = useSessionStore(s => s.agentMode)
+  const setAgentMode = useSessionStore(s => s.setAgentMode)
+  const currentWorkspace = useSessionStore(s => s.currentWorkspace)
+  const isResearch = agentMode === 'research'
+  const researchBinding = useSessionStore(s => s.researchBinding)
+  const researchConnectionError = useSessionStore(s => s.researchConnectionError)
+  const researchCard = useSessionStore(s => s.researchBinding?.runId ? s.researchCards[s.researchBinding.runId] : undefined)
 
-  const models = useSettingsStore((s) => s.models)
   const currentModel = useSettingsStore((s) => s.currentModel)
+  const models = useSettingsStore(s => s.models)
   const thinkingLevel = useSettingsStore((s) => s.thinkingLevel)
-  const availableThinkingLevels = useSettingsStore((s) => s.availableThinkingLevels)
-  const defaultProvider = useSettingsStore((s) => s.defaultProvider)
-  const defaultModel = useSettingsStore((s) => s.defaultModel)
-  const setSessionModel = useSettingsStore((s) => s.setSessionModel)
-  const setThinkingLevel = useSettingsStore((s) => s.setThinkingLevel)
 
-  const modelDisplayName = currentModel ? currentModel.name : '选择模型'
-  const currentThinkingLabel = thinkingLevel ? thinkingLevel.toUpperCase() : 'OFF'
+  const modelDisplayName = currentModel ? (currentModel.name || currentModel.modelId) : '选择模型'
+
+  const supportsImageInput = Boolean(currentModel && models.find(model => model.provider === currentModel.provider && model.id === currentModel.modelId)?.input.includes('image'))
+
+  const handleAddAttachments = async () => {
+    if (isPickingFiles) return
+    setIsPickingFiles(true)
+    setAttachmentNotice(null)
+    try {
+      const paths = await window.app?.pickFiles()
+      if (paths?.length) await prepareAttachments(paths)
+    } catch (error) {
+      setAttachmentNotice(error instanceof Error ? error.message : '打开附件选择窗口失败')
+    } finally {
+      setIsPickingFiles(false)
+    }
+  }
+
+  const formatBytes = (bytes: number) => bytes < 1024 ? `${bytes} B` : `${(bytes / 1024 / (bytes < 1024 * 1024 ? 1 : 1024)).toFixed(1)} ${bytes < 1024 * 1024 ? 'KiB' : 'MiB'}`
 
   const currentModeConfig = useMemo(() => {
     return (
-      PERMISSION_MODE_OPTIONS.find((opt) => opt.id === permissionMode) ||
+      PERMISSION_MODE_OPTIONS.find((opt) => opt.id === (isResearch ? 'research' : permissionMode)) ||
       PERMISSION_MODE_OPTIONS[0]
     )
-  }, [permissionMode])
+  }, [permissionMode, isResearch])
 
   const CurrentModeIcon = currentModeConfig.icon
 
-  // Only display models from providers where API credentials have been configured
-  // Sorted in English alphabetical order (case-insensitive A-Z)
-  const availableModels = useMemo(() => {
-    return models
-      .filter((m) => m.configured)
-      .sort((a, b) => (a.name || a.id).localeCompare(b.name || b.id, 'en', { sensitivity: 'base' }))
-  }, [models])
-
-  const filteredPickerModels = useMemo(() => {
-    if (!pickerSearch.trim()) return availableModels
-    const q = pickerSearch.toLowerCase()
-    return availableModels.filter(
-      (m) =>
-        m.name.toLowerCase().includes(q) ||
-        m.id.toLowerCase().includes(q) ||
-        m.provider.toLowerCase().includes(q),
-    )
-  }, [availableModels, pickerSearch])
-
   useEffect(() => {
     const handleClickOutside = (e: MouseEvent) => {
-      if (pickerRef.current && !pickerRef.current.contains(e.target as Node)) {
-        setShowPicker(false)
-      }
       if (modePickerRef.current && !modePickerRef.current.contains(e.target as Node)) {
         setShowModePicker(false)
       }
     }
-    if (showPicker || showModePicker) {
+    if (showModePicker) {
       document.addEventListener('mousedown', handleClickOutside)
     }
     return () => {
       document.removeEventListener('mousedown', handleClickOutside)
     }
-  }, [showPicker, showModePicker])
+  }, [showModePicker])
+
+  useLayoutEffect(() => {
+    const form = formRef.current
+    const viewport = form?.closest<HTMLElement>('[data-conversation-viewport]')
+    if (!form || !viewport) return
+    const measure = () => viewport.style.setProperty('--composer-height', `${Math.ceil(form.getBoundingClientRect().height)}px`)
+    measure()
+    const observer = typeof ResizeObserver !== 'undefined' ? new ResizeObserver(measure) : null
+    observer?.observe(form)
+    return () => observer?.disconnect()
+  }, [])
+
+  useEffect(() => {
+    if (!showSendMenu && !showModePicker && (!isStreaming || isSessionLoading || isAborting)) return
+    const stopOnEscape = (event: KeyboardEvent) => {
+      if (event.key !== 'Escape' || event.defaultPrevented || event.isComposing || composing.current) return
+      if (showSendMenu) {
+        event.preventDefault()
+        setShowSendMenu(false)
+        sendMenuTriggerRef.current?.focus()
+      } else if (showModePicker) {
+        event.preventDefault()
+        setShowModePicker(false)
+        modePickerRef.current?.querySelector<HTMLButtonElement>('button')?.focus()
+      } else if (!isSessionLoading && !isAborting) abortGeneration()
+    }
+    document.addEventListener('keydown', stopOnEscape)
+    return () => document.removeEventListener('keydown', stopOnEscape)
+  }, [isStreaming, isSessionLoading, isAborting, abortGeneration, showSendMenu, showModePicker])
+
+  useEffect(() => {
+    if (!showSendMenu) return
+    if (!isStreaming || isSessionLoading || sessionLoadError || isAborting) {
+      setShowSendMenu(false)
+      return
+    }
+    sendMenuRef.current?.querySelector<HTMLButtonElement>('[role="menuitem"]')?.focus()
+    const outside = (event: MouseEvent) => {
+      if (!sendMenuRef.current?.contains(event.target as Node)) setShowSendMenu(false)
+    }
+    document.addEventListener('mousedown', outside)
+    return () => document.removeEventListener('mousedown', outside)
+  }, [showSendMenu, isStreaming, isSessionLoading, sessionLoadError, isAborting])
+
+  const submitText = (mode: 'steer' | 'followUp' = 'steer') => {
+    if (researchStartingRef.current) return
+    if (isPickingFiles || attachments.some(item => item.status !== 'ready') || isSessionLoading || sessionLoadError || isAborting || sessionOperation || isCompacting || composing.current) return
+    if (!text.trim() && !attachments.length) return
+    const attachedText = attachments.map(item => item.text).filter(Boolean)
+    const messageText = [text.trim(), ...attachedText].filter(Boolean).join('\n\n')
+    const images = attachments.flatMap(item => item.images)
+    if (images.length && !supportsImageInput) {
+      setAttachmentNotice('当前模型不支持图片输入，请切换到支持图片的模型。附件仍保留在草稿中。')
+      return
+    }
+    if (isResearch && researchBinding && /^\/(?:tree|compact)(?:\s|$)/.test(text.trim())) {
+      setResearchError('研究对话的原会话由协调 Agent 持有；请先停止研究，再从普通对话入口执行会话操作。')
+      return
+    }
+    if (!attachments.length && runSlashCommand(text)) {
+      setText('')
+      setShowSendMenu(false)
+      if (textareaRef.current) { textareaRef.current.style.height = 'auto'; textareaRef.current.focus() }
+      return
+    }
+    if (isResearch) {
+      if (isStreaming && !researchBinding) {
+        setResearchError('请先结束或停止当前对话，再开始研究。')
+        return
+      }
+      if (images.length) {
+        setResearchError('研究消息请使用文字或文本附件；图片仍保留在草稿中。')
+        return
+      }
+      const requestId = newRequestId('research_input')
+      researchStartingRef.current = true
+      setResearchStarting(true)
+      setResearchError(null)
+      void startComposerResearch({ question: messageText, workspace: researchBinding?.workspace || currentWorkspace,
+        model: currentModel, thinkingLevel, binding: researchBinding, requestId,
+        onBound: host => {
+          useSessionStore.getState().bindResearchConversation(host)
+          useSessionStore.getState().queueResearchMessage(requestId, messageText)
+        },
+        onAccepted: () => useSessionStore.getState().acceptResearchMessage(requestId),
+      }).then(host => {
+        useSessionStore.getState().bindResearchConversation(host)
+        if (useSessionStore.getState().draft === text) setText('')
+        for (const attachment of attachments) removeAttachment(attachment.path)
+        setAttachmentNotice(null)
+        setShowSendMenu(false)
+        useSessionStore.getState().fetchResearchRuns()
+        onResearchStarted?.()
+      }).catch(error => {
+        const message = error instanceof Error ? error.message : String(error)
+        useSessionStore.getState().failResearchMessage(requestId, message)
+        setResearchError(message)
+      }).finally(() => {
+        researchStartingRef.current = false
+        setResearchStarting(false)
+      })
+      return
+    }
+    if (images.length) sendMessage(messageText, mode, images)
+    else sendMessage(messageText, mode)
+    setText('')
+    clearAttachments()
+    setAttachmentNotice(null)
+    setShowSendMenu(false)
+    if (textareaRef.current) {
+      textareaRef.current.style.height = 'auto'
+      textareaRef.current.focus()
+    }
+  }
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    if (composing.current || e.nativeEvent.isComposing || e.keyCode === 229) return
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault()
-      if (text.trim() && !isStreaming) {
-        sendMessage(text)
-        setText('')
-        if (textareaRef.current) {
-          textareaRef.current.style.height = 'auto'
-        }
-      }
+      submitText(e.altKey && isStreaming ? 'followUp' : 'steer')
     }
   }
 
@@ -151,263 +306,234 @@ export const Composer: React.FC<ComposerProps> = ({ onOpenModelSettings }) => {
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault()
-    if (isStreaming) {
-      abortGeneration()
-    } else if (text.trim()) {
-      sendMessage(text)
-      setText('')
-      if (textareaRef.current) {
-        textareaRef.current.style.height = 'auto'
-      }
-    }
+    submitText()
   }
 
   const hasText = text.trim().length > 0
+  const hasContent = hasText || attachments.length > 0
+  const hasPendingAttachment = isPickingFiles || attachments.some(item => item.status === 'preparing')
+  const hasAttachmentError = attachments.some(item => item.status === 'error')
+  const hasUnsupportedImageModel = attachments.some(item => item.images.length > 0) && !supportsImageInput
+  const pendingLabel = researchStarting ? '研究启动中' : sessionLoadError ? '会话尚未就绪' : isSessionLoading ? '会话加载中' : isAborting ? '停止中' : sessionOperation ? '会话操作中' : isCompacting ? '压缩中' : ''
+  const sendDisabled = Boolean(pendingLabel) || !hasContent || hasPendingAttachment || hasAttachmentError || hasUnsupportedImageModel
+  const sendLabel = isStreaming ? '干预当前运行 (Enter)' : isResearch ? (researchBinding?.runId ? '发送研究消息 (Enter)' : '开始研究 (Enter)') : '发送指令 (Enter)'
 
   return (
-    <div className="absolute bottom-6 left-0 right-0 px-6 sm:px-12 md:px-20 lg:px-28 pointer-events-none z-10">
-      <form
-        onSubmit={handleSubmit}
-        className="pointer-events-auto max-w-4xl mx-auto rounded-2xl bg-card border border-border-subtle shadow-e3 p-3 flex flex-col gap-2.5 transition-all focus-within:border-border-accent/70 focus-within:ring-1 focus-within:ring-focus-ring/40 relative"
-      >
-        {/* Main Textarea */}
-        <textarea
-          ref={textareaRef}
-          value={text}
-          onChange={handleInput}
-          onKeyDown={handleKeyDown}
-          placeholder="给 Misaka 发送研究任务或指令..."
-          rows={1}
-          className="w-full bg-transparent border-0 outline-none text-text-main placeholder-dim text-[13.5px] leading-relaxed resize-none px-2 py-1 max-h-44"
-        />
-
-        {/* Bottom Toolbar */}
-        <div className="flex items-center justify-between pt-1 border-t border-border-subtle/50 text-xs select-none">
-          {/* Left Controls: Plus + Mode Picker */}
-          <div className="flex items-center gap-2">
-            <button
-              type="button"
-              className="w-7 h-7 rounded-lg flex items-center justify-center hover:bg-surface-2 text-dim hover:text-text-main transition-colors cursor-pointer"
-              title="附加上下文或附件"
-            >
-              <Plus className="w-4 h-4" />
-            </button>
-
-            {/* Interactive Mode Picker Pill */}
-            <div className="relative" ref={modePickerRef}>
-              <button
-                type="button"
-                onClick={() => setShowModePicker(!showModePicker)}
-                className="flex items-center gap-1.5 px-2.5 py-1 rounded-md text-[11px] font-medium bg-surface-2/60 hover:bg-surface-2 border border-border-subtle transition-colors cursor-pointer"
-                title="点击切换 Agent 权限模式"
-              >
-                <CurrentModeIcon className={"w-3.5 h-3.5 " + currentModeConfig.badgeColor} />
-                <span className={currentModeConfig.badgeColor}>{currentModeConfig.label}</span>
-                <ChevronDown className="w-3 h-3 text-dim" />
-              </button>
-
-              {/* Mode Selection Popover */}
-              {showModePicker && (
-                <div className="absolute bottom-full left-0 mb-2 w-72 rounded-xl bg-card border border-border-subtle shadow-e3 p-2 z-50 text-xs space-y-1">
-                  <div className="px-2 py-1 text-[11px] font-semibold text-text-main border-b border-border-subtle">
-                    选择 Agent 权限模式
-                  </div>
-                  {PERMISSION_MODE_OPTIONS.map((opt) => {
-                    const OptIcon = opt.icon
-                    const isSelected = permissionMode === opt.id
-                    return (
-                      <button
-                        key={opt.id}
-                        type="button"
-                        onClick={() => {
-                          setPermissionMode(opt.id)
-                          setShowModePicker(false)
-                        }}
-                        className={
-                          "w-full flex items-start gap-2.5 p-2 rounded-lg text-left transition-colors cursor-pointer " +
-                          (isSelected ? "bg-surface-2" : "hover:bg-surface-2/60")
-                        }
-                      >
-                        <OptIcon className={"w-4 h-4 mt-0.5 shrink-0 " + opt.badgeColor} />
-                        <div className="flex-1 min-w-0">
-                          <div className="flex items-center justify-between">
-                            <span className="font-medium text-text-main text-xs">{opt.label}</span>
-                            {isSelected && <Check className="w-3.5 h-3.5 text-accent shrink-0" />}
-                          </div>
-                          <p className="text-[10.5px] text-muted mt-0.5 leading-normal">{opt.desc}</p>
-                        </div>
-                      </button>
-                    )
-                  })}
-                </div>
-              )}
-            </div>
+    <div className={'conversation-composer-dock pointer-events-none z-10' + (welcome ? ' conversation-composer-dock--welcome' : '')}>
+      {welcome && (
+        <div className="flex flex-col items-center pointer-events-auto select-none">
+          <div className="mb-4 flex items-center justify-center rounded-2xl shadow-e2 transition-transform hover:scale-105">
+            <MisakaLogo size={60} />
           </div>
+          <h1 className="conversation-welcome-title">欢迎使用 Misaka-Agent</h1>
+        </div>
+      )}
+      <div className={welcome ? 'conversation-welcome-card pointer-events-auto' : 'conversation-composer-shell'}>
+        {welcome && <div className="conversation-welcome-workspace">{workspaceControl}</div>}
+        <form
+          ref={formRef}
+          onSubmit={handleSubmit}
+          className="conversation-composer misaka-glass-panel pointer-events-auto flex flex-col gap-2.5 relative"
+        >
+          {retainedEditorText && <div className="flex items-center justify-between gap-3 rounded-lg border border-border-subtle bg-surface-2/60 px-3 py-2 text-xs text-muted" role="status">
+            <span className="min-w-0 truncate" title={retainedEditorText}>所选消息已返回：{retainedEditorText}</span>
+            <button type="button" className="shrink-0 text-accent hover:underline" onClick={() => {
+              const held = takeRetainedEditorText()
+              if (held) setText(text.trim() ? `${text}\n\n${held}` : held)
+            }}>恢复到草稿</button>
+          </div>}
+          {/* Main Textarea */}
+          <textarea
+            ref={textareaRef}
+            value={text}
+            onChange={handleInput}
+            onKeyDown={handleKeyDown}
+            onCompositionStart={() => { composing.current = true }}
+            onCompositionEnd={() => { composing.current = false }}
+            aria-label="给 Misaka 发送任务"
+            placeholder={isResearch ? (researchBinding?.runId ? '补充要求、回答澄清或追问研究报告…' : '输入研究课题，Enter 开始研究…') : welcome ? "向 Misaka-Agent 提问或描述任务…" : "给 Misaka 发送研究任务或指令..."}
+            rows={1}
+            className="w-full bg-transparent border-0 outline-none text-text-main placeholder-dim text-[length:var(--font-size-body)] leading-[1.75] resize-none px-2 py-1 max-h-44"
+          />
 
-          {/* Right Controls: Model Pill + Submit Button */}
-          <div className="flex items-center gap-2.5">
-            {/* Interactive Model & Thinking Level Selector Pill */}
-            <div className="relative" ref={pickerRef}>
+          {attachments.length > 0 && <div className="flex flex-wrap gap-1.5" aria-label="待发送附件">
+            {attachments.map(attachment => <div key={attachment.path} className="inline-flex max-w-full items-center gap-1.5 rounded-lg border border-border-subtle bg-surface-2/60 px-2 py-1 text-[11px] text-muted">
+              <FileImage className="h-3.5 w-3.5 shrink-0 text-accent" />
+              <span className="max-w-48 truncate" title={attachment.name}>{attachment.name}</span>
+              {attachment.status === 'preparing' ? <span role="status" className="shrink-0 text-dim">处理中…</span>
+                : attachment.error ? <span role="status" className="max-w-64 truncate text-danger" title={attachment.error}>{attachment.error}</span>
+                  : <span className="shrink-0 text-dim">{formatBytes(attachment.size)}</span>}
+              {attachment.status === 'error' && <button type="button" onClick={() => void retryAttachment(attachment.path)} className="shrink-0 rounded p-0.5 hover:bg-surface-3" aria-label={`重试附件 ${attachment.name}`} title="重试处理"><RotateCw className="h-3 w-3" /></button>}
+              <button type="button" onClick={() => removeAttachment(attachment.path)} className="shrink-0 rounded p-0.5 hover:bg-surface-3" aria-label={`移除附件 ${attachment.name}`} title="移除附件"><X className="h-3 w-3" /></button>
+            </div>)}
+          </div>}
+          {(attachmentNotice || hasUnsupportedImageModel) && <div role="status" className="text-[11px] text-warning">
+            {attachmentNotice || '当前模型不支持图片输入，请切换到支持图片的模型。附件仍保留在草稿中。'}
+          </div>}
+          {(researchError || researchConnectionError && isResearch) && <div role="alert" className="text-[11px] text-danger">{researchError || researchConnectionError}</div>}
+          {researchStarting && !researchBinding?.runId && <div role="status" className="text-[11px] text-dim">正在准备研究团队…</div>}
+
+          {/* Bottom Toolbar */}
+          <div className="conversation-composer-toolbar flex items-center justify-between pt-1 border-t border-border-subtle/50 text-xs select-none">
+            {/* Left Controls: Plus + Mode Picker */}
+            <div className="flex items-center gap-2">
               <button
                 type="button"
-                onClick={() => setShowPicker(!showPicker)}
-                className="flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-surface-2/60 hover:bg-surface-2 border border-border-subtle text-[11.5px] text-muted hover:text-text-main transition-colors cursor-pointer font-medium"
-                title="点击切换模型与思考级别"
+                onClick={() => void handleAddAttachments()}
+                disabled={isPickingFiles}
+                aria-label="添加附件"
+                className="w-7 h-7 rounded-lg flex items-center justify-center hover:bg-surface-2 text-dim hover:text-text-main transition-colors cursor-pointer"
+                title={isPickingFiles ? '正在选择附件…' : '附加上下文或附件'}
               >
-                <span className="truncate max-w-[140px]">{modelDisplayName}</span>
-                <span className="text-dim text-[10.5px]">({currentThinkingLabel})</span>
-                <ChevronDown className="w-3 h-3 text-dim" />
+                <Plus className="w-4 h-4" />
               </button>
 
-              {/* Floating Quick Model Picker Popover */}
-              {showPicker && (
-                <div className="absolute bottom-full right-0 mb-2 w-80 rounded-xl bg-card border border-border-subtle shadow-e3 p-2.5 z-50 text-xs space-y-2.5">
-                  <div className="px-1 py-0.5 flex items-center justify-between border-b border-border-subtle/80 pb-1.5">
-                    <div className="flex items-center gap-1.5">
-                      <span className="font-semibold text-text-main text-[12px]">切换会话模型</span>
-                      <span className="text-[10px] px-1.5 py-0.2 rounded-full bg-accent/15 text-rose-lite border border-accent/30 font-medium">
-                        {availableModels.length} 个可用
-                      </span>
-                    </div>
-                    <button
-                      type="button"
-                      onClick={() => {
-                        setShowPicker(false)
-                        onOpenModelSettings?.()
-                      }}
-                      className="flex items-center gap-1 text-[11px] text-dim hover:text-accent cursor-pointer transition-colors"
-                    >
-                      <Settings className="w-3 h-3" />
-                      <span>配置凭据</span>
-                    </button>
-                  </div>
+              {/* Interactive Mode Picker Pill */}
+              <div className="relative" ref={modePickerRef}>
+                <button
+                  type="button"
+                  onClick={() => setShowModePicker(!showModePicker)}
+                  className="conversation-permission-trigger flex items-center gap-1.5 px-2.5 py-1 rounded-md text-[11px] font-medium bg-surface-2/60 hover:bg-surface-2 border border-border-subtle transition-colors cursor-pointer"
+                  aria-expanded={showModePicker}
+                  aria-haspopup="menu"
+                disabled={researchStarting || isSessionLoading || Boolean(sessionLoadError) || Boolean(sessionOperation) || isCompacting}
+                  title="点击切换 Agent 模式"
+                >
+                  <CurrentModeIcon className={"w-3.5 h-3.5 " + currentModeConfig.badgeColor} />
+                  <span className={currentModeConfig.badgeColor}>{currentModeConfig.label}</span>
+                  <ChevronDown className="w-3 h-3 text-dim" />
+                </button>
 
-                  {/* Thinking levels pill selector */}
-                  <div className="px-1 py-0.5 space-y-1">
-                    <div className="text-[10.5px] text-dim flex items-center gap-1">
-                      <Brain className="w-3 h-3" />
-                      <span>思考强度 (Thinking)</span>
+                {/* Mode Selection Popover */}
+                {showModePicker && (
+                  <div className="conversation-permission-popover misaka-glass-popover absolute bottom-full left-0 mb-2 w-72 max-h-[min(24rem,calc(100dvh-10rem))] overflow-y-auto rounded-xl bg-card border border-border-subtle shadow-e3 p-2 z-50 text-xs space-y-1">
+                    <div className="px-2 py-1 text-[11px] font-semibold text-text-main border-b border-border-subtle">
+                      选择 Agent 模式
                     </div>
-                    <div className="grid grid-cols-4 gap-1 bg-surface-2 p-0.5 rounded-lg border border-border-subtle text-[10.5px]">
-                      {availableThinkingLevels.map((lvl) => (
+                    {PERMISSION_MODE_OPTIONS.map((opt) => {
+                      const OptIcon = opt.icon
+                      const isSelected = isResearch ? opt.id === 'research' : permissionMode === opt.id
+                      return (
                         <button
-                          key={lvl}
-                          type="button"
-                          onClick={() => setThinkingLevel(lvl)}
-                          className={
-                            "py-0.5 rounded text-center font-medium transition-all cursor-pointer " +
-                            (thinkingLevel === lvl
-                              ? "bg-accent text-white shadow-xs"
-                              : "text-dim hover:text-text-main")
-                          }
-                        >
-                          {lvl.toUpperCase()}
-                        </button>
-                      ))}
-                    </div>
-                  </div>
-
-                  {/* Model Search Input */}
-                  {availableModels.length > 5 && (
-                    <div className="px-1">
-                      <input
-                        type="text"
-                        value={pickerSearch}
-                        onChange={(e) => setPickerSearch(e.target.value)}
-                        placeholder="搜索可用模型..."
-                        className="w-full bg-surface-2 text-text-main placeholder-dim px-2.5 py-1 rounded-md border border-border-subtle outline-none focus:border-accent text-[11.5px]"
-                      />
-                    </div>
-                  )}
-
-                  {/* Model list */}
-                  <div className="max-h-56 overflow-y-auto space-y-0.5 pr-1 divide-y divide-border-subtle/30">
-                    {availableModels.length === 0 ? (
-                      <div className="p-4 text-center space-y-2">
-                        <p className="text-dim text-[11.5px]">未检测到已配置凭据的可用模型</p>
-                        <p className="text-[10.5px] text-muted leading-relaxed">
-                          请在「设置 - 模型与供应商」中录入 API Key，配置后模型将在此列出。
-                        </p>
-                        <button
+                          key={opt.id}
                           type="button"
                           onClick={() => {
-                            setShowPicker(false)
-                            onOpenModelSettings?.()
+                            if (opt.id === 'research') setAgentMode('research')
+                            else setPermissionMode(opt.id)
+                            setResearchError(null)
+                            setShowModePicker(false)
                           }}
-                          className="px-3 py-1 rounded-md bg-accent hover:opacity-90 text-white text-[11px] font-medium transition-colors cursor-pointer"
+                          className={
+                            "w-full flex items-start gap-2.5 p-2 rounded-lg text-left transition-colors cursor-pointer " +
+                            (isSelected ? "bg-surface-2" : "hover:bg-surface-2/60")
+                          }
                         >
-                          前往配置模型
-                        </button>
-                      </div>
-                    ) : filteredPickerModels.length === 0 ? (
-                      <div className="p-3 text-center text-dim text-xs">
-                        未匹配到模型
-                      </div>
-                    ) : (
-                      filteredPickerModels.map((m) => {
-                        const isCurrent = currentModel?.provider === m.provider && currentModel?.modelId === m.id
-                        const isDefault = defaultProvider === m.provider && defaultModel === m.id
-
-                        return (
-                          <div
-                            key={m.provider + ":" + m.id}
-                            className={
-                              "flex items-center justify-between p-1.5 rounded-lg transition-colors cursor-pointer " +
-                              (isCurrent ? "bg-accent/15 text-text-main" : "hover:bg-surface-2/70 text-muted")
-                            }
-                            onClick={() => {
-                              setSessionModel(m.provider, m.id)
-                              setShowPicker(false)
-                            }}
-                          >
-                            <div className="truncate pr-2 min-w-0">
-                              <div className="flex items-center gap-1.5">
-                                <span className="font-medium text-[12px] text-text-main truncate">{m.name}</span>
-                                {m.reasoning && (
-                                  <span className="text-[9.5px] px-1 rounded bg-info-surface text-info border border-info-border">
-                                    思考
-                                  </span>
-                                )}
-                              </div>
-                              <div className="text-[10px] text-dim font-mono truncate">
-                                {m.provider}/{m.id}
-                              </div>
+                          <OptIcon className={"w-4 h-4 mt-0.5 shrink-0 " + opt.badgeColor} />
+                          <div className="flex-1 min-w-0">
+                            <div className="flex items-center justify-between">
+                              <span className="font-medium text-text-main text-xs">{opt.label}</span>
+                              {isSelected && <Check className="w-3.5 h-3.5 text-accent shrink-0" />}
                             </div>
-
-                            <div className="flex items-center gap-1.5 shrink-0">
-                              {isDefault && (
-                                <span title="默认模型"><Star className="w-3 h-3 text-warning fill-warning" /></span>
-                              )}
-                              {isCurrent && <Check className="w-3.5 h-3.5 text-accent" />}
-                            </div>
+                            <p className="text-[10.5px] text-muted mt-0.5 leading-normal">{opt.desc}</p>
                           </div>
-                        )
-                      })
-                    )}
+                        </button>
+                      )
+                    })}
                   </div>
-                </div>
-              )}
+                )}
+              </div>
             </div>
 
-            {/* Circular Submit / Stop Action Button */}
-            <button
-              type="submit"
-              disabled={!hasText && !isStreaming}
-              className={
-                "w-8 h-8 rounded-full flex items-center justify-center transition-all cursor-pointer shadow-sm " +
-                (isStreaming
-                  ? "bg-danger hover:opacity-90 text-white active:scale-95"
-                  : hasText
-                  ? "bg-accent hover:opacity-90 text-white active:scale-95 shadow-cta"
-                  : "bg-surface-2 text-dim opacity-50 cursor-not-allowed")
-              }
-              title={isStreaming ? "中止生成 (Esc)" : "发送指令 (Enter)"}
-            >
-              {isStreaming ? <Square className="w-3.5 h-3.5 fill-current" /> : <ArrowUp className="w-4 h-4 stroke-[2.5]" />}
-            </button>
+            {isResearch && researchBinding && <button type="button" disabled={researchStarting || isStreaming || !researchCard || ['active', 'stopping', 'waiting_input'].includes(researchCard.status)} onClick={() => { useSessionStore.getState().clearResearchConversation(); setResearchError(null) }} className="text-[11px] text-muted hover:text-accent disabled:opacity-40" title="保留当前报告并开启新的研究对话">新研究</button>}
+
+            {/* Right Controls: Model Pill + Submit Button */}
+            <div className="flex items-center gap-2.5">
+              {/* Interactive Model & Thinking Level Selector Pill */}
+              <div className="relative" ref={pickerRef}>
+                <button
+                  type="button"
+                  ref={pickerTriggerRef}
+                  onClick={() => setShowPicker(!showPicker)}
+                  aria-expanded={showPicker}
+                  aria-haspopup="dialog"
+                disabled={isSessionLoading || Boolean(sessionLoadError)}
+                  aria-label="模型与思考深度"
+                  aria-description={modelDisplayName}
+                  className={
+                    'conversation-model-trigger flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-surface-2/60 hover:bg-surface-hover border border-border-subtle text-[11.5px] text-muted hover:text-text-main transition-colors cursor-pointer font-medium ' +
+                    (showPicker ? 'text-text-main border-border-accent/60' : '')
+                  }
+                  title="模型与思考深度"
+                >
+                  <span className="truncate max-w-[140px]">{modelDisplayName}</span>
+                  <ChevronDown
+                    className={'w-3 h-3 text-dim transition-transform ' + (showPicker ? 'rotate-180' : '')}
+                  />
+                </button>
+
+                {showPicker && (
+                  <ModelPickerPopover
+                    triggerRef={pickerTriggerRef}
+                    onOpenModelSettings={onOpenModelSettings}
+                    onClose={() => setShowPicker(false)}
+                  />
+                )}
+              </div>
+
+              {pendingLabel && !isAborting && <span className="text-[11px] text-dim" role="status">{pendingLabel}</span>}
+              <div className="conversation-send-controls relative flex items-center gap-1" ref={sendMenuRef}>
+              <button
+                type="submit"
+                disabled={sendDisabled}
+                className={
+                  "conversation-send-button w-8 h-8 rounded-full flex items-center justify-center transition-all cursor-pointer shadow-sm " +
+                  (pendingLabel
+                    ? "bg-surface-2 text-dim cursor-wait"
+                    : hasContent
+                    ? "misaka-luminous bg-accent hover:opacity-90 text-on-accent active:scale-95 shadow-cta"
+                    : "bg-surface-2 text-dim opacity-50 cursor-not-allowed")
+                }
+                aria-label={isAborting ? sendLabel : pendingLabel || sendLabel}
+                title={isStreaming ? '干预当前运行：在当前工具执行后的处理边界生效 (Enter)' : sendLabel}
+              >
+                <ArrowUp className="w-4 h-4 stroke-[2.5]" />
+              </button>
+              {isStreaming && <>
+                <button type="button" ref={sendMenuTriggerRef} aria-label="发送选项" aria-haspopup="menu" aria-expanded={showSendMenu}
+                  disabled={sendDisabled} onClick={() => setShowSendMenu(!showSendMenu)}
+                  className="conversation-send-options w-7 h-8 rounded-md flex items-center justify-center text-muted hover:bg-surface-2 disabled:opacity-40">
+                  <ChevronDown className="w-3.5 h-3.5" />
+                </button>
+                {showSendMenu && <div role="menu" aria-label="发送选项" className="conversation-send-menu misaka-glass-popover absolute bottom-full right-0 mb-2 w-64 max-w-[80vw] rounded-xl bg-card border border-border-subtle shadow-e3 p-2 z-50"
+                  onKeyDown={event => {
+                    const items = Array.from(event.currentTarget.querySelectorAll<HTMLButtonElement>('[role="menuitem"]'))
+                    if (['ArrowDown', 'ArrowUp', 'Home', 'End'].includes(event.key)) {
+                      event.preventDefault()
+                      const current = items.indexOf(document.activeElement as HTMLButtonElement)
+                      const index = event.key === 'Home' ? 0 : event.key === 'End' ? items.length - 1 : (current + (event.key === 'ArrowDown' ? 1 : -1) + items.length) % items.length
+                      items[index]?.focus()
+                    } else if (event.key === 'Tab') setShowSendMenu(false)
+                  }}>
+                  <button type="button" role="menuitem" disabled={sendDisabled} onClick={() => submitText('steer')} className="w-full rounded-lg p-2 text-left hover:bg-surface-2">
+                    <span className="block text-xs text-text-main">干预当前运行 · Enter</span>
+                    <span className="block text-[11px] text-muted mt-1">在当前工具执行后的处理边界生效</span>
+                  </button>
+                  <button type="button" role="menuitem" disabled={sendDisabled} onClick={() => submitText('followUp')} className="w-full rounded-lg p-2 text-left hover:bg-surface-2">
+                    <span className="block text-xs text-text-main">后续排队 · Alt+Enter</span>
+                    <span className="block text-[11px] text-muted mt-1">等待当前任务结束后处理</span>
+                  </button>
+                </div>}
+              </>}
+              </div>
+              {isStreaming && <button type="button" onClick={abortGeneration} disabled={Boolean(pendingLabel)}
+                aria-label={isAborting ? '停止中' : '中止生成 (Esc)'} title={isAborting ? '停止中' : '中止生成 (Esc)'}
+                className="conversation-stop-button h-8 min-w-8 px-2 rounded-full flex items-center justify-center gap-1 bg-danger text-on-danger hover:opacity-90 disabled:opacity-50 disabled:cursor-wait">
+                {isAborting ? <><Loader2 className="w-4 h-4 animate-spin" /><span className="text-[11px]">停止中</span></> : <Square className="w-3.5 h-3.5 fill-current" />}
+              </button>}
+            </div>
           </div>
-        </div>
-      </form>
+        </form>
+      </div>
     </div>
   )
 }

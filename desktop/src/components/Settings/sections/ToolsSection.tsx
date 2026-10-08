@@ -67,7 +67,7 @@ export const ToolsSection: React.FC = () => {
   return (
     <div className="space-y-6">
       {/* Header Banner */}
-      <div className="p-4 rounded-xl bg-card shadow-e1 border border-border-subtle flex items-start justify-between gap-4">
+      <div className="misaka-glass-panel relative p-4 rounded-xl bg-card shadow-e1 border border-border-subtle flex items-start justify-between gap-4">
         <div>
           <h2 className="text-sm font-semibold text-text-main flex items-center gap-2">
             <Wrench className="w-4 h-4 text-accent" />
@@ -115,7 +115,7 @@ export const ToolsSection: React.FC = () => {
                 onClick={() => setSelectedCategory(cat)}
                 className={`px-2.5 py-1 rounded-md text-xs font-medium transition-colors cursor-pointer shrink-0 ${
                   isSelected
-                    ? 'bg-accent text-white shadow-xs'
+                    ? 'bg-accent text-on-accent shadow-xs'
                     : 'bg-surface-1 text-muted hover:text-text-main border border-border-subtle'
                 }`}
               >
@@ -127,7 +127,7 @@ export const ToolsSection: React.FC = () => {
       </div>
 
       {/* Tools List */}
-      <div className="rounded-xl border border-border-subtle bg-card shadow-e1 divide-y divide-border-subtle overflow-hidden">
+      <div className="misaka-glass-panel relative rounded-xl border border-border-subtle bg-card shadow-e1 divide-y divide-border-subtle overflow-hidden">
         {isLoadingTools && tools.length === 0 ? (
           <div className="p-8 text-center text-xs text-muted">
             <RefreshCw className="w-5 h-5 mx-auto mb-2 text-accent animate-spin" />
@@ -254,7 +254,7 @@ export const ToolsSection: React.FC = () => {
 
       {/* Slash Commands Support Footer */}
       {slashCommands.length > 0 && (
-        <div className="p-4 rounded-xl bg-card shadow-e1 border border-border-subtle">
+        <div className="misaka-glass-panel relative p-4 rounded-xl bg-card shadow-e1 border border-border-subtle">
           <div className="text-xs font-semibold text-text-main flex items-center gap-1.5 mb-2">
             <Sparkles className="w-3.5 h-3.5 text-accent" />
             <span>可用快捷斜杠指令 (Slash Commands)</span>

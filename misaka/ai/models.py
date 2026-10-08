@@ -84,7 +84,7 @@ def calculate_cost(model: Model, usage: Usage) -> UsageCost:
     return usage.cost
 
 
-def get_supported_thinking_levels(model: Model) -> list[ModelThinkingLevel]:
+def _catalog_supported_thinking_levels(model: Model) -> list[ModelThinkingLevel]:
     if not model.reasoning:
         return ["off"]
 
@@ -104,6 +104,14 @@ def get_supported_thinking_levels(model: Model) -> list[ModelThinkingLevel]:
             continue
         supported.append(level)
     return supported
+
+
+def get_supported_thinking_levels(model: Model) -> list[ModelThinkingLevel]:
+    from misaka.ai.thinking_compat import get_thinking_feedback
+    feedback = get_thinking_feedback(model)
+    if feedback:
+        return list(feedback.levels) if feedback.status == "known" else ["off"]
+    return _catalog_supported_thinking_levels(model)
 
 
 def clamp_thinking_level(model: Model, level: ModelThinkingLevel) -> ModelThinkingLevel:

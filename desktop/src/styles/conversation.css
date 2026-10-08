@@ -1,0 +1,140 @@
+/* Conversation-only styling: no global shadcn tokens. In particular --muted
+   remains the application's foreground token, not Streamdown's surface token. */
+[data-conversation-viewport] { --conversation-width: 840px; --conversation-gutter: clamp(20px, 4vw, 48px); --composer-height: 104px; }
+.conversation-timeline { position: relative; flex: 1; min-height: 0; min-width: 0; display: flex; flex-direction: column; height: 100%; overflow: hidden; }
+.conversation-scroll { flex: 1; min-height: 0; overflow: auto; overscroll-behavior: contain; overflow-anchor: none; padding: 28px var(--conversation-gutter, 24px) 0; }
+.conversation-content { width: 100%; max-width: var(--conversation-width, 840px); margin: 0 auto; min-height: 100%; }
+.conversation-content > [data-message-anchor] + [data-message-anchor] { margin-top: 22px; }
+.conversation-virtual-content { position: relative; width: 100%; }
+.conversation-virtual-row { position: absolute; top: 0; left: 0; width: 100%; padding-bottom: 22px; }
+.conversation-load-status { display: flex; align-items: center; justify-content: center; gap: 8px; padding: 6px 12px; font-size: 12px; color: var(--muted); background: var(--surface-1); border-bottom: 1px solid var(--border-subtle); }
+.conversation-load-status button { color: var(--accent); cursor: pointer; text-decoration: underline; }
+.conversation-composer-spacer { height: calc(var(--composer-height, 104px) + 52px); flex-shrink: 0; }
+.conversation-assistant-message { padding: 8px 0; color: var(--text-main); min-width: 0; }
+.conversation-user-message { margin-left: auto; max-width: 85%; padding: 13px 17px; border: 1px solid var(--border-subtle); border-radius: 14px; background: color-mix(in srgb, var(--surface-1) 88%, var(--accent) 3%); color: var(--text-main); }
+.conversation-message-body { min-width: 0; }
+.conversation-message-body > * + * { margin-top: 16px; }
+.conversation-message-actions { margin-top: 14px; padding-top: 3px; opacity: .72; }
+.conversation-message-actions:hover, .conversation-message-actions:focus-within { opacity: 1; }
+.conversation-message-error { margin-top: 12px; color: var(--danger); font-size: var(--font-size-prose-sm); }
+.conversation-empty { min-height: 48vh; display: flex; align-items: center; justify-content: center; flex-direction: column; gap: 12px; text-align: center; }
+.conversation-empty-icon { width: 46px; height: 46px; border-radius: 12px; display: grid; place-items: center; border: 1px solid var(--border-subtle); background: var(--surface-1); }
+.conversation-jump-bottom { position: absolute; bottom: calc(var(--composer-height, 104px) + 36px); left: 50%; transform: translateX(-50%); z-index: 20; display: flex; gap: 6px; align-items: center; border-radius: 20px; padding: 7px 13px; font-size: 12px; color: var(--text-main); border: 1px solid var(--border-subtle); background: var(--surface-1); box-shadow: 0 2px 8px color-mix(in srgb, var(--shadow-ink) 30%, transparent); cursor: pointer; }
+.conversation-jump-bottom:hover { background: var(--surface-hover); }
+
+/* The execution lane reads like a transcript, not stacked raised cards. */
+.conversation-execution-group { margin: 12px 0; color: var(--muted); min-width: 0; }
+.conversation-group-toggle, .conversation-row-toggle { display: flex; align-items: center; width: 100%; min-height: 34px; gap: 8px; text-align: left; background: transparent; border-radius: 6px; padding: 5px 7px; font-size: 12px; cursor: pointer; }
+.conversation-group-toggle:hover, .conversation-row-toggle:hover { background: color-mix(in srgb, var(--surface-hover) 70%, transparent); }
+.conversation-row-icon { width: 14px; height: 14px; flex-shrink: 0; }
+.conversation-row-meta { font-size: 11px; color: var(--dim); margin-left: 3px; }
+.conversation-group-summary { min-width: 0; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; color: var(--dim); }
+.conversation-group-body { margin: 4px 0 0 13px; padding-left: 15px; border-left: 1px solid var(--border-subtle); }
+.conversation-execution-row { min-width: 0; }
+.conversation-execution-row + .conversation-execution-row { margin-top: 2px; }
+.conversation-tool-name { font-family: var(--font-mono, monospace); color: var(--tool-title); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.conversation-tool-status { display: flex; align-items: center; gap: 4px; font-size: 10.5px; margin-left: auto; white-space: nowrap; }
+.conversation-status-icon { width: 12px; height: 12px; }
+.conversation-chevron { width: 13px; height: 13px; margin-left: auto; flex-shrink: 0; color: var(--dim); transition: transform .15s ease; }
+.conversation-chevron.is-expanded { transform: rotate(90deg); }
+.conversation-tool-status + .conversation-chevron { margin-left: 1px; }
+.conversation-tool-details { padding: 8px 12px 14px 22px; font-size: var(--font-size-prose-sm); }
+.conversation-tool-details > div + div { margin-top: 10px; }
+.conversation-tool-details h4 { margin: 0 0 5px; font-size: 11px; font-weight: 500; color: var(--dim); }
+.conversation-tool-details pre { padding: 10px 12px; border-radius: 6px; background: var(--well); border: 1px solid var(--border-subtle); overflow: auto; max-height: 360px; white-space: pre-wrap; overflow-wrap: anywhere; font-family: var(--font-mono, monospace); font-size: var(--font-size-code); line-height: 1.65; color: var(--tool-output); margin: 0; }
+.conversation-tool-error pre { color: var(--tool-error); border-color: var(--tool-error-border); }
+.conversation-thinking-content { padding: 8px 12px 12px 22px; white-space: pre-wrap; overflow-wrap: anywhere; color: var(--thinking-text); font-size: var(--font-size-prose-sm); line-height: 1.75; }
+.conversation-tool-details[hidden], .conversation-thinking-content[hidden], .conversation-group-body[hidden] { display: none; }
+
+.conversation-markdown { min-width: 0; overflow-wrap: anywhere; color: var(--text-main); font-size: var(--font-size-body); line-height: 1.75; }
+.conversation-markdown > * + * { margin-top: 12px; }
+.conversation-markdown p { margin: 0 0 10px; line-height: 1.75; }
+.conversation-markdown p:last-child { margin-bottom: 0; }
+.conversation-markdown h1, .conversation-markdown h2, .conversation-markdown h3, .conversation-markdown h4 { color: var(--md-heading); font-weight: 650; line-height: 1.5; margin: 22px 0 10px; }
+.conversation-markdown h1 { font-size: calc(var(--font-size-body) * 1.5); }
+.conversation-markdown h2 { font-size: calc(var(--font-size-body) * 1.3); }
+.conversation-markdown h3 { font-size: calc(var(--font-size-body) * 1.15); }
+.conversation-markdown h4 { font-size: var(--font-size-body); }
+.conversation-markdown > :first-child { margin-top: 0; }
+.conversation-markdown ul, .conversation-markdown ol { padding-left: 1.65em; margin: 10px 0; }
+.conversation-markdown ul { list-style: disc; }
+.conversation-markdown ol { list-style: decimal; }
+.conversation-markdown li { padding-left: .2em; margin: 4px 0; }
+.conversation-markdown li ul, .conversation-markdown li ol { margin: 4px 0; }
+.conversation-markdown li p { margin-bottom: 4px; }
+.conversation-markdown li::marker { color: var(--md-list-marker); }
+.conversation-markdown li:has(> input[type='checkbox']) { list-style: none; }
+.conversation-markdown input[type='checkbox'] { margin: 0 .6em 0 -1.2em; accent-color: var(--accent); }
+.conversation-markdown a { color: var(--md-link); text-decoration: underline; text-underline-offset: 3px; }
+.conversation-markdown blockquote { padding: 6px 0 6px 14px; margin: 14px 0; border-left: 2px solid var(--md-quote-border); color: var(--md-quote); }
+.conversation-markdown hr { margin: 20px 0; border: 0; border-top: 1px solid var(--md-hr); }
+.conversation-inline-code { padding: .12em .38em; border-radius: 4px; font-family: var(--font-mono, monospace); color: var(--md-code); background: var(--surface-2); font-size: .94em; }
+.conversation-table-scroll { max-width: 100%; overflow: auto; border: 1px solid var(--border-subtle); border-radius: 8px; margin: 16px 0; }
+.conversation-table-scroll table { border-collapse: collapse; width: 100%; min-width: max-content; font-size: var(--font-size-prose-sm); line-height: 1.65; }
+.conversation-table-scroll th, .conversation-table-scroll td { padding: 9px 13px; border-bottom: 1px solid var(--border-subtle); text-align: left; max-width: 420px; }
+.conversation-table-scroll th { font-weight: 600; background: var(--md-table-header); }
+.conversation-table-scroll tr:last-child td { border-bottom: 0; }
+.conversation-table-scroll tbody tr:hover { background: color-mix(in srgb, var(--surface-hover) 40%, transparent); }
+.conversation-markdown pre { tab-size: 2; }
+
+.conversation-composer-dock { position: absolute; bottom: 24px; left: 0; right: 0; padding: 0 var(--conversation-gutter, 24px); }
+.conversation-composer { margin: 0 auto; width: 100%; max-width: var(--conversation-width, 840px); padding: 12px; border-radius: 16px; border: 1px solid var(--border-subtle); background: var(--surface-1); color: var(--text-main); box-shadow: 0 4px 16px color-mix(in srgb, var(--shadow-ink) 24%, transparent); transition: border-color .15s, box-shadow .15s; }
+.conversation-composer:focus-within { border-color: var(--border-accent); box-shadow: 0 3px 14px color-mix(in srgb, var(--shadow-ink) 26%, transparent), 0 0 0 1px color-mix(in srgb, var(--focus-ring) 25%, transparent); }
+/* Empty conversations pair the greeting with the same live composer, not a second input. */
+[data-conversation-viewport][data-welcome] { overflow-y: auto; container-type: inline-size; }
+[data-welcome] > .conversation-timeline { display: none; }
+.conversation-composer-dock--welcome {
+  position: relative; inset: auto; width: 100%; flex: 1; min-height: min-content;
+  display: flex; flex-direction: column; align-items: center;
+  padding: clamp(72px, 20vh, 180px) 24px 100px;
+}
+.conversation-welcome-title {
+  margin: 0 0 40px; font-size: clamp(24px, 3cqi, 30px); line-height: 1.4;
+  font-weight: 400; letter-spacing: -.025em; text-align: center; color: var(--text-main); pointer-events: auto;
+}
+.conversation-welcome-card {
+  width: 100%; max-width: 672px; min-width: 0; border-radius: 20px;
+  background: color-mix(in srgb, var(--surface-2) 65%, var(--surface-0));
+}
+.conversation-welcome-workspace { position: relative; z-index: 12; padding: 8px 14px; min-height: 40px; display: flex; align-items: center; }
+.conversation-welcome-workspace > div > button {
+  background: transparent; border-color: transparent; box-shadow: none; padding: 2px 4px;
+}
+.conversation-welcome-workspace > div > button > span { font-weight: 400; max-width: min(400px, 60cqi); }
+.conversation-welcome-workspace > div > button > svg { color: var(--dim); }
+.conversation-welcome-workspace button:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: 2px; }
+.conversation-welcome-card .conversation-composer { max-width: none; border-radius: 18px; padding: 12px; gap: 20px; box-shadow: 0 3px 12px color-mix(in srgb, var(--shadow-ink) 12%, transparent); }
+.conversation-welcome-card textarea { min-height: 28px; }
+.conversation-welcome-card .conversation-composer-toolbar { border-top: 0; padding-top: 0; gap: 8px; flex-wrap: wrap; }
+.conversation-welcome-card .conversation-composer-toolbar > div:last-child { margin-left: auto; min-width: 0; }
+.conversation-welcome-card .conversation-permission-trigger,
+.conversation-welcome-card .conversation-model-trigger { background: transparent; border-color: transparent; color: var(--text-main); font-weight: 400; }
+.conversation-welcome-card .conversation-permission-trigger > span,
+.conversation-welcome-card .conversation-permission-trigger > svg:first-child { color: var(--text-main); }
+.conversation-welcome-card .conversation-permission-trigger:hover,
+.conversation-welcome-card .conversation-model-trigger:hover { background: var(--surface-hover); }
+.conversation-welcome-card .conversation-send-button { border-radius: 8px; box-shadow: none; flex-shrink: 0; }
+@container (max-width: 520px) {
+  .conversation-composer-dock--welcome { padding-inline: 16px; }
+  .conversation-welcome-card .conversation-model-trigger { padding-inline: 4px; }
+  .conversation-welcome-card .conversation-model-trigger > span:first-child { max-width: 110px; }
+}
+@media (max-height: 650px) {
+  .conversation-composer-dock--welcome { padding-top: 48px; padding-bottom: 140px; }
+  .conversation-welcome-card .conversation-permission-popover { max-height: 180px; overflow-y: auto; }
+}
+.conversation-timeline button:focus-visible, .conversation-composer button:focus-visible, .conversation-markdown a:focus-visible, .conversation-table-scroll:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: 3px; }
+.conversation-composer-toolbar { gap: 8px; flex-wrap: wrap; }
+.conversation-composer-toolbar > div:last-child { margin-left: auto; min-width: 0; flex-wrap: wrap; justify-content: flex-end; }
+.conversation-send-controls, .conversation-stop-button { flex-shrink: 0; }
+@media (max-width: 600px) {
+  [data-conversation-viewport] { --conversation-gutter: 16px; }
+  .conversation-scroll { padding-top: 18px; }
+  .conversation-user-message { max-width: 95%; }
+  .conversation-composer-dock { bottom: 14px; }
+  .conversation-composer { padding: 10px; }
+  .conversation-group-summary { max-width: 45%; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .conversation-chevron, .conversation-composer { transition: none; }
+}

@@ -145,6 +145,21 @@ async def test_lane_d_approves_a_plan_through_the_real_gate(board, tmp_path, mon
     assert recorded["payload"]["plan_tool_call_id"] == "tc-plan"
 
 
+async def test_plan_approval_rejects_a_stale_plan_revision(board, tmp_path, monkeypatch):
+    run, node = owned_run(board)
+    control = make_control(board.window, review_tools_for(board, run, node), tmp_path / "record.json")
+    monkeypatch.setattr(session_control, "for_session", lambda _session: control)
+    session = SimpleNamespace(sessionManager=SimpleNamespace(sessionFile=board.window))
+
+    with pytest.raises(ValueError, match="changed since it was displayed"):
+        await desktop_intervene.invoke(
+            session, runs, board.con, run_id=run["id"], action="approve_plan", node_id=node["id"],
+            payload={"summary": "Approve", "expected_plan_id": "stale-plan-call"},
+        )
+
+    assert runs.action(board.con, run["id"], node["id"], runs.start_key(1)) is None
+
+
 async def test_lane_d_refuses_a_tool_the_owner_has_not_published(board, tmp_path, monkeypatch):
     """An action the driver did not offer must fail loudly, not record anything.
 

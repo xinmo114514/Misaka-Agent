@@ -216,6 +216,11 @@ class SessionControl:
         if not self.accepting:
             raise ValueError("The original owner is finishing; no further input is accepted.")
         self._check_input_owner()
+        if operation == "stats":
+            from misaka.modes.jsonl import to_jsonable
+
+            return {"stats": to_jsonable(self.session.getSessionStats()),
+                    "contextUsage": to_jsonable(self.session.getContextUsage())}
         if operation in {"pause", "resume"}:
             self.paused = operation == "pause"
             self.catalog.refresh()

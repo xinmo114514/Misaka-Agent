@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import os
 import stat
+import time
 import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
@@ -139,6 +140,7 @@ class AgentSessionRuntime:
         self._modelFallbackMessage = modelFallbackMessage
         self.rebindSession: Callable[[AgentSessionLike], Awaitable[None]] | None = None
         self.beforeSessionInvalidate: Callable[[], None] | None = None
+        self.lastSwitchTimings: dict[str, float] = {}
 
     @property
     def services(self) -> AgentSessionServices:
@@ -215,7 +217,9 @@ class AgentSessionRuntime:
                               *, carryTo: SessionManager | None = None) -> None:
         # Settle any active response first so the aborted turn (including tool
         # results) is persisted to the outgoing session before it is replaced.
+        started = time.perf_counter()
         await self.session.abort()
+        self.lastSwitchTimings["abortMs"] = round((time.perf_counter() - started) * 1000, 3)
         if carryTo is not None:
             result = await self.session.extensionRunner.emit({
                 "type": "session_context_carry", "sessionManager": carryTo,
@@ -228,11 +232,15 @@ class AgentSessionRuntime:
             "targetSessionFile": targetSessionFile,
             **({"contextCarried": True} if carryTo is not None else {}),
         }
+        started = time.perf_counter()
         await self.session.moments.session_shutdown(shutdown_event)  # MISAKA fork
         await emit_session_shutdown_event(self.session.extensionRunner, shutdown_event)
+        self.lastSwitchTimings["shutdownMs"] = round((time.perf_counter() - started) * 1000, 3)
         if self.beforeSessionInvalidate is not None:
             self.beforeSessionInvalidate()
+        started = time.perf_counter()
         self.session.dispose()
+        self.lastSwitchTimings["disposeMs"] = round((time.perf_counter() - started) * 1000, 3)
 
     def apply(self, result: CreateAgentSessionRuntimeResult) -> None:
         self._session = result.session
@@ -254,6 +262,7 @@ class AgentSessionRuntime:
         sessionPath: str,
         options: dict[str, Any] | None = None,
     ) -> dict[str, bool]:
+        self.lastSwitchTimings = {}
         before_result = await self.emitBeforeSwitch("resume", sessionPath)
         if before_result["cancelled"]:
             return before_result
@@ -266,6 +275,7 @@ class AgentSessionRuntime:
         )
         assert_session_cwd_exists(session_manager, self.cwd)
         await self.teardownCurrent("resume", session_manager.getSessionFile())
+        started = time.perf_counter()
         self.apply(
             await self.createRuntime(
                 {
@@ -289,7 +299,10 @@ class AgentSessionRuntime:
                 }
             )
         )
+        self.lastSwitchTimings["prepareMs"] = round((time.perf_counter() - started) * 1000, 3)
+        started = time.perf_counter()
         await self.finishSessionReplacement(options.get("withSession") if options else None)
+        self.lastSwitchTimings["bindMs"] = round((time.perf_counter() - started) * 1000, 3)
         return {"cancelled": False}
 
     async def newSession(self, options: dict[str, Any] | None = None) -> dict[str, bool]:
@@ -312,7 +325,12 @@ class AgentSessionRuntime:
         previous_session_file = self.session.sessionFile
         current_session_dir = self.session.sessionManager.getSessionDir()
         if target_cwd != self.cwd and current_session_dir:
-            from misaka.core.session_manager import get_session_dir_for_cwd, sessions_root_of
+
+            from misaka.core.session_manager import (
+                get_session_dir_for_cwd,
+                sessions_root_of,
+            )
+
             root = sessions_root_of(current_session_dir)
             session_dir = get_session_dir_for_cwd(target_cwd, root) if root else current_session_dir
         else:

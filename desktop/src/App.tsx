@@ -1,12 +1,12 @@
 import React, { useEffect, useRef, useState } from 'react'
 import { Group, Panel, Separator } from 'react-resizable-panels'
+import type { PanelImperativeHandle } from 'react-resizable-panels'
 import {
   ArrowLeft,
   ArrowRight,
   Folder,
   FolderPlus,
   MoreHorizontal,
-  Network,
   MessageSquare,
   Settings as SettingsIcon,
   Pencil,
@@ -16,32 +16,80 @@ import {
   ChevronRight,
   Check,
   Copy,
+  LoaderCircle,
+  X,
+  ListTree,
+  Archive,
+  PanelLeftClose,
+  PanelLeftOpen,
 } from 'lucide-react'
 import { useTheme } from './theme/useTheme'
-import { addSink, installBridge } from './lib/bridge'
+import { addSink, installBridge, onEvent, request } from './lib/bridge'
+import { addResearchSink, installResearchBridge } from './lib/researchBridge'
 import { normalizeWorkspacePath, projectNameForCwd, useSessionStore } from './store/useSessionStore'
 import { useSettingsStore } from './store/useSettingsStore'
+import { clipboardErrorMessage, copyTextToClipboard } from './lib/clipboard'
+import { readSidebarVisible, saveSidebarVisible } from './lib/sidebarPreference'
 import { Sidebar } from './components/Sidebar/Sidebar'
 import { Timeline } from './components/Timeline/Timeline'
 import { Composer } from './components/Composer/Composer'
 import { PermissionDialog } from './components/Permission/PermissionDialog'
 import { ResearchGraphCanvas } from './components/ResearchGraph/ResearchGraphCanvas'
+import { ResearchTaskDrawer } from './components/Timeline/ResearchTaskDrawer'
+import { ResearchGraphModal } from './components/Timeline/ResearchGraphModal'
+import { ResearchHistoryDialog } from './components/Timeline/ResearchHistoryDialog'
+import { SessionTreePanel } from './components/SessionTree/SessionTreePanel'
+import { CompactDialog } from './components/SessionTree/CompactDialog'
+import { SessionRenameDialog } from './components/SessionRenameDialog'
+import { SessionDeleteDialog } from './components/SessionDeleteDialog'
 import { SettingsPage } from './components/Settings/SettingsPage'
+import { CloseConfirmDialog } from './components/CloseConfirmDialog'
 
 export default function App() {
   useTheme()
   const [viewMode, setViewMode] = useState<'timeline' | 'graph' | 'settings'>('timeline')
-  const [sidebarVisible, setSidebarVisible] = useState(true)
-  const currentTitle = useSessionStore((s) => s.currentTitle)
+  const [closeConfirmOpen, setCloseConfirmOpen] = useState(false)
+  const [copyNotice, setCopyNotice] = useState<{ kind: 'pending' | 'success' | 'error'; text: string } | null>(null)
+  const [exportNotice, setExportNotice] = useState<{ kind: 'pending' | 'success' | 'error'; text: string; path?: string } | null>(null)
+  const [isExporting, setIsExporting] = useState(false)
+  const copyFeedbackTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const copyingRef = useRef(false)
+  const [sidebarVisible, setSidebarVisible] = useState(readSidebarVisible)
+  const sidebarPanelRef = useRef<PanelImperativeHandle | null>(null)
+  const toggleSidebar = () => setSidebarVisible(visible => {
+    const next = !visible
+    saveSidebarVisible(next)
+    return next
+  })
+  const currentTitle = useSessionStore(s => s.agentMode === 'research' && s.researchBinding ? s.researchCards[s.researchBinding.runId || '']?.question || '研究对话' : s.currentTitle)
   const currentWorkspace = useSessionStore((s) => s.currentWorkspace)
   const recentWorkspaces = useSessionStore((s) => s.recentWorkspaces)
   const switchWorkspace = useSessionStore((s) => s.switchWorkspace)
   const openWorkspaceDialog = useSessionStore((s) => s.openWorkspaceDialog)
   const handleBridgeMessage = useSessionStore((s) => s.handleBridgeMessage)
+  const handleResearchBridgeMessage = useSessionStore(s => s.handleResearchBridgeMessage)
+  const researchTeamModelBinding = useSessionStore(s => s.researchModelBinding)
+  const researchTeamSessionId = useSessionStore(s => s.researchBinding?.sessionId)
+  const researchScene = useSessionStore(s => s.agentMode === 'research')
+  const applyResearchModelBinding = useSettingsStore(s => s.applyResearchModelBinding)
   const fetchSessions = useSessionStore((s) => s.fetchSessions)
   const fetchSettingsData = useSettingsStore((s) => s.fetchInitialData)
+  const exportCurrentSession = useSettingsStore((s) => s.exportCurrentSession)
   const handleSettingsBridgeMessage = useSettingsStore((s) => s.handleBridgeMessage)
   const setActiveSettingsSection = useSettingsStore((s) => s.setActiveSection)
+
+  useEffect(() => {
+    if (researchScene && researchTeamSessionId && researchTeamModelBinding) {
+      applyResearchModelBinding(researchTeamSessionId, researchTeamModelBinding)
+    }
+  }, [researchScene, researchTeamSessionId, researchTeamModelBinding, applyResearchModelBinding])
+
+  useEffect(() => {
+    const panel = sidebarPanelRef.current
+    if (!panel) return
+    if (sidebarVisible) panel.expand()
+    else panel.collapse()
+  }, [sidebarVisible])
 
   // Global keyboard shortcuts (Ctrl+K, Ctrl+,, Ctrl+N, Ctrl+B)
   useEffect(() => {
@@ -80,7 +128,7 @@ export default function App() {
       // Ctrl + B : Toggle Sidebar
       if (isCmdOrCtrl && (e.key === 'b' || e.key === 'B')) {
         e.preventDefault()
-        setSidebarVisible((v) => !v)
+        toggleSidebar()
         return
       }
     }
@@ -97,18 +145,97 @@ export default function App() {
     // register its own `window.bridge.on`, which meant a reply could be answered twice.
     const stopSession = addSink(handleBridgeMessage)
     const stopSettings = addSink(handleSettingsBridgeMessage)
+    const stopResearch = addResearchSink(handleResearchBridgeMessage)
+    // The engine clamps a requested level to what the model supports and can change the
+    // level on its own (a model switch, the TUI, /think). Mirror what it settled on.
+    const stopThinking = onEvent('thinking_level_changed', (ev: { level?: unknown }) => {
+      if (typeof ev?.level === 'string') useSettingsStore.setState({ thinkingLevel: ev.level })
+    })
     const dispose = installBridge()
+    const disposeResearch = installResearchBridge()
     return () => {
       stopSession()
       stopSettings()
+      stopResearch()
+      stopThinking()
       dispose()
+      disposeResearch()
     }
-  }, [handleBridgeMessage, handleSettingsBridgeMessage, fetchSettingsData, fetchSessions])
+  }, [handleBridgeMessage, handleResearchBridgeMessage, handleSettingsBridgeMessage, fetchSettingsData, fetchSessions])
+
+  // Research can outlive the current chat or workspace, so its close state is board-wide.
+  useEffect(() => {
+    let live = true
+    const refreshResearchActivity = async () => {
+      try {
+        const result = await request<{ runs?: Array<{ status?: string; phase?: string; pending_options?: number }> }>('get_active_research_runs')
+        if (live) {
+          const activeRuns = result.runs || []
+          const pendingCount = activeRuns.reduce((total, run) => total +
+            Number(run.pending_options || 0) + Number(run.status === 'waiting_input' || run.phase === 'awaiting_approval'), 0)
+          window.app?.setResearchActive({ active: Boolean(activeRuns.length), pendingCount })
+        }
+      } catch { /* retain the last known close state through a brief bridge interruption */ }
+    }
+    void refreshResearchActivity()
+    const timer = window.setInterval(() => void refreshResearchActivity(), 4000)
+    return () => { live = false; window.clearInterval(timer) }
+  }, [])
+
+  const currentSessionId = useSessionStore((s) => s.currentSessionId)
+  const activeSessionId = useSessionStore(s => s.activeSessionId)
+  const activeResearchTaskId = useSessionStore(s => s.activeResearchTaskId)
+  const isSessionLoading = useSessionStore(s => s.isSessionLoading)
+  const sessionLoadError = useSessionStore(s => s.sessionLoadError)
+  const resyncModelCapability = useSettingsStore((s) => s.resyncModelCapability)
+
+  // The live model and its thinking ladder are properties of the session, but the initial
+  // fetch only ever runs once -- so a new, reopened or forked conversation would otherwise
+  // keep the previous one's model in the composer pill. The first pass is skipped because
+  // `fetchInitialData` above already covers it.
+  const lastResyncedSession = useRef<string | null | undefined>(undefined)
+  useEffect(() => {
+    if (isSessionLoading || sessionLoadError || activeSessionId !== currentSessionId) {
+      lastResyncedSession.current = null
+      resyncModelCapability() // invalidate previous-session requests without issuing new reads
+      return
+    }
+    if (lastResyncedSession.current === undefined) {
+      lastResyncedSession.current = currentSessionId
+      return
+    }
+    if (lastResyncedSession.current === currentSessionId) return
+    lastResyncedSession.current = currentSessionId
+    resyncModelCapability()
+  }, [currentSessionId, activeSessionId, isSessionLoading, sessionLoadError, resyncModelCapability])
 
   const currentSessionPath = useSessionStore((s) => s.currentSessionPath)
+  const lastDeletedSessionPath = useSessionStore((s) => s.lastDeletedSessionPath)
   const renameSession = useSessionStore((s) => s.renameSession)
   const forkSession = useSessionStore((s) => s.forkSession)
-  const exportSession = useSessionStore((s) => s.exportSession)
+  const treeOpen = useSessionStore((s) => s.treeOpen)
+  const treePayload = useSessionStore((s) => s.treePayload)
+  const treeLoading = useSessionStore((s) => s.treeLoading)
+  const treeError = useSessionStore((s) => s.treeError)
+  const treeFilterMode = useSessionStore((s) => s.treeFilterMode)
+  const labelTimestampsVisible = useSessionStore((s) => s.labelTimestampsVisible)
+  const skipSummaryPrompt = useSessionStore((s) => s.skipSummaryPrompt)
+  const sessionOperation = useSessionStore((s) => s.sessionOperation)
+  const compactOpen = useSessionStore((s) => s.compactOpen)
+  const compactStatus = useSessionStore((s) => s.compactStatus)
+  const compactDraft = useSessionStore((s) => s.compactDraft)
+  const openTreePanel = useSessionStore((s) => s.openTreePanel)
+  const closeTreePanel = useSessionStore((s) => s.closeTreePanel)
+  const fetchSessionTree = useSessionStore((s) => s.fetchSessionTree)
+  const setTreeFilterMode = useSessionStore((s) => s.setTreeFilterMode)
+  const setLabelTimestampsVisible = useSessionStore((s) => s.setLabelTimestampsVisible)
+  const toggleSkipSummaryPrompt = useSessionStore((s) => s.toggleSkipSummaryPrompt)
+  const navigateTree = useSessionStore((s) => s.navigateTree)
+  const setEntryLabel = useSessionStore((s) => s.setEntryLabel)
+  const openCompactDialog = useSessionStore((s) => s.openCompactDialog)
+  const closeCompactDialog = useSessionStore((s) => s.closeCompactDialog)
+  const runCompact = useSessionStore((s) => s.runCompact)
+  const cancelSessionOperation = useSessionStore((s) => s.cancelSessionOperation)
 
   // --- View/session navigation history (back/forward) ----------------------
   const [navStack, setNavStack] = useState<
@@ -134,6 +261,19 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [viewMode, currentSessionPath])
 
+  useEffect(() => {
+    if (!lastDeletedSessionPath) return
+    const selected = navStack[navIndex]
+    const retained = navStack.filter(entry => entry.sessionPath !== lastDeletedSessionPath)
+    const nextStack = retained.length ? retained : [{ viewMode, sessionPath: currentSessionPath }]
+    const nextIndex = selected?.sessionPath !== lastDeletedSessionPath
+      ? Math.max(0, nextStack.indexOf(selected!))
+      : Math.max(0, Math.min(navIndex, nextStack.length - 1))
+    setNavStack(nextStack)
+    setNavIndex(nextIndex)
+    useSessionStore.setState({ lastDeletedSessionPath: null })
+  }, [lastDeletedSessionPath, navStack, navIndex, viewMode, currentSessionPath])
+
   const canGoBack = navIndex > 0
   const canGoForward = navIndex < navStack.length - 1
 
@@ -150,6 +290,7 @@ export default function App() {
 
   // --- "More session options" menu -----------------------------------------
   const [menuOpen, setMenuOpen] = useState(false)
+  const [renameTarget, setRenameTarget] = useState<{ path: string; name: string } | null>(null)
   const menuRef = useRef<HTMLDivElement>(null)
   useEffect(() => {
     if (!menuOpen) return
@@ -175,27 +316,86 @@ export default function App() {
     return () => document.removeEventListener('mousedown', close)
   }, [workspaceMenuOpen])
 
-  const handleCopyWorkspacePath = (e: React.MouseEvent) => {
+  useEffect(() => () => {
+    if (copyFeedbackTimer.current) clearTimeout(copyFeedbackTimer.current)
+  }, [])
+
+  const handleCopyWorkspacePath = async (e: React.MouseEvent) => {
     e.stopPropagation()
-    if (!currentWorkspace) return
-    navigator.clipboard.writeText(currentWorkspace)
-    setCopiedPath(true)
-    setTimeout(() => setCopiedPath(false), 2000)
+    if (!currentWorkspace || copyingRef.current) return
+    copyingRef.current = true
+    if (copyFeedbackTimer.current) clearTimeout(copyFeedbackTimer.current)
+    setCopyNotice({ kind: 'pending', text: '正在复制工作区路径…' })
+    try {
+      await copyTextToClipboard(currentWorkspace)
+      setCopiedPath(true)
+      setCopyNotice({ kind: 'success', text: '工作区路径已复制' })
+      copyFeedbackTimer.current = setTimeout(() => {
+        setCopiedPath(false)
+        setCopyNotice(null)
+        copyFeedbackTimer.current = null
+      }, 2000)
+    } catch (error) {
+      setCopiedPath(false)
+      setCopyNotice({ kind: 'error', text: `复制工作区路径失败：${clipboardErrorMessage(error)}` })
+    } finally {
+      copyingRef.current = false
+    }
   }
 
   const handleRename = () => {
     setMenuOpen(false)
     if (!currentSessionPath) return
-    const next = window.prompt('重命名会话', currentTitle)
-    if (next && next.trim()) renameSession(currentSessionPath, next.trim())
+    setRenameTarget({ path: currentSessionPath, name: currentTitle })
   }
   const handleFork = () => {
     setMenuOpen(false)
     forkSession(null)
   }
-  const handleExport = () => {
+  const handleExport = async () => {
     setMenuOpen(false)
-    if (currentSessionPath) exportSession(currentSessionPath)
+    if (!currentSessionPath) {
+      setExportNotice({ kind: 'error', text: '当前无活动会话可导出' })
+      return
+    }
+    if (isExporting) return
+    setIsExporting(true)
+    setExportNotice({ kind: 'pending', text: '正在导出 JSONL…' })
+    try {
+      const result = await exportCurrentSession(currentSessionPath)
+      if (result.ok && result.path) setExportNotice({ kind: 'success', text: `导出成功：${result.path}`, path: result.path })
+      else setExportNotice({ kind: 'error', text: `导出失败：${result.error || '结果未确认'}` })
+    } catch (error) {
+      setExportNotice({ kind: 'error', text: `导出失败：${error instanceof Error ? error.message : String(error)}` })
+    } finally {
+      setIsExporting(false)
+    }
+  }
+  const handleOpenTree = () => {
+    setMenuOpen(false)
+    openTreePanel()
+  }
+  const handleOpenCompact = () => {
+    setMenuOpen(false)
+    openCompactDialog(null)
+  }
+  const handleCopyTreeText = async (value: string) => {
+    if (copyingRef.current) return
+    copyingRef.current = true
+    if (copyFeedbackTimer.current) clearTimeout(copyFeedbackTimer.current)
+    setCopyNotice({ kind: 'pending', text: '正在复制内容…' })
+    try {
+      await copyTextToClipboard(value)
+      setCopyNotice({ kind: 'success', text: '内容已复制' })
+      copyFeedbackTimer.current = setTimeout(() => {
+        setCopyNotice(null)
+        copyFeedbackTimer.current = null
+      }, 2000)
+    } catch (error) {
+      setCopyNotice({ kind: 'error', text: `复制失败：${clipboardErrorMessage(error)}` })
+    } finally {
+      copyingRef.current = false
+    }
   }
 
   const openModelSettings = () => {
@@ -203,12 +403,138 @@ export default function App() {
     setViewMode('settings')
   }
 
+  const messages = useSessionStore(s => s.agentMode === 'research' && s.researchBinding ? s.researchConversation.messages : s.messages)
+  const isStreaming = useSessionStore(s => s.agentMode === 'research' && s.researchBinding ? s.researchConversation.isStreaming : s.isStreaming)
+  const isWelcome = viewMode === 'timeline' && messages.length === 0 && !isSessionLoading && !isStreaming && !sessionLoadError
+  // Render the existing switcher in exactly one place so its ref and menu stay shared.
+  const workspaceSwitcher = (
+    <div className="relative" ref={workspaceMenuRef}>
+      <button
+        type="button"
+        onClick={() => setWorkspaceMenuOpen((v) => !v)}
+        className={`flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-xs transition-all cursor-pointer group shadow-e1 select-none ${
+          workspaceMenuOpen
+            ? 'bg-surface-3 text-text-main border border-accent/50'
+            : 'bg-surface-2 hover:bg-surface-3 text-text-main border border-border-subtle hover:border-border-accent/40'
+        }`}
+        title="点击快速切换工作区或打开新目录"
+      >
+        <Folder className="w-3.5 h-3.5 text-accent shrink-0" />
+        <span className="font-semibold text-text-main tracking-tight truncate max-w-[160px]">
+          {currentWorkspace ? projectNameForCwd(currentWorkspace) : '选择工作区'}
+        </span>
+        <ChevronDown className={`w-3 h-3 text-dim group-hover:text-text-main transition-transform ${workspaceMenuOpen ? 'rotate-180' : ''}`} />
+      </button>
+
+      {/* Workspace Dropdown Menu */}
+      {workspaceMenuOpen && (
+        <div className="misaka-glass-popover absolute left-0 top-10 z-50 w-72 rounded-xl bg-card border border-border-subtle shadow-e3 p-1.5 text-xs select-none">
+          {/* Current workspace header info */}
+          <div className="px-2.5 py-2 border-b border-border-subtle/70 bg-surface-2/40 rounded-lg">
+            <div className="flex items-center justify-between">
+              <span className="text-[10px] uppercase font-semibold text-muted tracking-wider">
+                当前工作区
+              </span>
+              {currentWorkspace && (
+                <button
+                  type="button"
+                  onClick={handleCopyWorkspacePath}
+                  disabled={copyNotice?.kind === 'pending'}
+                  className="text-[10.5px] text-dim hover:text-accent flex items-center gap-1 cursor-pointer transition-colors"
+                  title="复制绝对路径"
+                >
+                  {copyNotice?.kind === 'pending' ? (
+                    <><LoaderCircle className="w-3 h-3 animate-spin" /><span>复制中…</span></>
+                  ) : copiedPath ? (
+                    <>
+                      <Check className="w-3 h-3 text-copy-success" />
+                      <span className="text-copy-success">已复制</span>
+                    </>
+                  ) : (
+                    <>
+                      <Copy className="w-3 h-3" />
+                      <span>复制路径</span>
+                    </>
+                  )}
+                </button>
+              )}
+            </div>
+            <div className="font-semibold text-text-main truncate text-[12.5px] mt-1">
+              {currentWorkspace ? projectNameForCwd(currentWorkspace) : '未指定工作区'}
+            </div>
+            {currentWorkspace && (
+              <div
+                className="font-mono text-[10px] text-dim/80 truncate mt-0.5"
+                title={currentWorkspace}
+              >
+                {currentWorkspace}
+              </div>
+            )}
+          </div>
+
+          {/* Recent workspaces switcher list */}
+          {recentWorkspaces.length > 0 && (
+            <div className="py-1 border-b border-border-subtle/70">
+              <div className="px-2 py-1 text-[10px] uppercase font-semibold text-muted tracking-wider">
+                快速切换空间
+              </div>
+              <div className="space-y-0.5 max-h-40 overflow-y-auto pr-0.5">
+                {recentWorkspaces.map((wsPath) => {
+                  const isCurrent =
+                    currentWorkspace &&
+                    normalizeWorkspacePath(wsPath) === normalizeWorkspacePath(currentWorkspace)
+                  const name = projectNameForCwd(wsPath)
+
+                  return (
+                    <button
+                      key={wsPath}
+                      type="button"
+                      onClick={() => {
+                        switchWorkspace(wsPath)
+                        setWorkspaceMenuOpen(false)
+                      }}
+                      className={`w-full flex items-center gap-2 px-2.5 py-1.5 rounded-lg text-left transition-colors cursor-pointer ${
+                        isCurrent
+                          ? 'bg-surface-2 text-text-main font-semibold border border-border-subtle/70'
+                          : 'text-muted hover:text-text-main hover:bg-surface-2/60'
+                      }`}
+                      title={wsPath}
+                    >
+                      <Folder className={`w-3.5 h-3.5 shrink-0 ${isCurrent ? 'text-accent' : 'text-dim'}`} />
+                      <span className="truncate flex-1 text-[11.5px]">{name}</span>
+                      {isCurrent && <Check className="w-3.5 h-3.5 text-accent shrink-0" />}
+                    </button>
+                  )
+                })}
+              </div>
+            </div>
+          )}
+
+          {/* Action: Open folder */}
+          <div className="pt-1">
+            <button
+              type="button"
+              onClick={() => {
+                setWorkspaceMenuOpen(false)
+                openWorkspaceDialog()
+              }}
+              className="w-full flex items-center gap-2 px-2.5 py-1.5 rounded-lg text-left text-dim hover:text-text-main hover:bg-surface-2 transition-colors cursor-pointer"
+            >
+              <FolderPlus className="w-3.5 h-3.5 text-accent shrink-0" />
+              <span className="text-[11.5px]">打开本地文件夹作为工作区...</span>
+            </button>
+          </div>
+        </div>
+      )}
+    </div>
+  )
+
   return (
     <div className="relative flex flex-col h-screen w-screen bg-canvas text-text-main overflow-hidden select-none font-sans">
       <div className="misaka-atmosphere" aria-hidden="true" />
       {/* 1. Top Windows Frame Titlebar */}
       <header
-        className="relative z-[1] flex items-center justify-between px-3 h-[38px] text-xs select-none shrink-0"
+        className="misaka-glass-chrome relative z-[1] flex items-center justify-between px-3 h-[38px] text-xs select-none shrink-0"
         style={{ WebkitAppRegion: 'drag' } as React.CSSProperties}
       >
         {/* Left top controls: Back, Forward, Menu items */}
@@ -216,6 +542,17 @@ export default function App() {
           className="flex items-center gap-1 text-dim"
           style={{ WebkitAppRegion: 'no-drag' } as React.CSSProperties}
         >
+          <button
+            type="button"
+            onClick={toggleSidebar}
+            className="w-7 h-7 flex items-center justify-center rounded transition-colors hover:bg-surface-2 hover:text-text-main cursor-pointer"
+            title={sidebarVisible ? '隐藏侧边栏' : '展开侧边栏'}
+            aria-label={sidebarVisible ? '隐藏侧边栏' : '展开侧边栏'}
+            aria-expanded={sidebarVisible}
+            aria-controls="sidebar"
+          >
+            {sidebarVisible ? <PanelLeftClose className="w-4 h-4" /> : <PanelLeftOpen className="w-4 h-4" />}
+          </button>
           <button
             type="button"
             onClick={() => applyNav(navIndex - 1)}
@@ -251,7 +588,7 @@ export default function App() {
               文件
             </span>
             <span
-              onClick={() => setViewMode('graph')}
+              onClick={() => useSessionStore.getState().setResearchHistoryOpen(true)}
               className="hover:text-text-main cursor-pointer transition-colors"
             >
               研究
@@ -284,30 +621,31 @@ export default function App() {
       <div className="relative z-[1] flex-1 flex overflow-hidden">
         <Group orientation="horizontal" className="h-full w-full">
           {/* Left Panel: Sidebar */}
+          <Panel
+            id="sidebar"
+            panelRef={sidebarPanelRef}
+            collapsible
+            collapsedSize={0}
+            defaultSize={sidebarVisible ? 264 : 0}
+            minSize={200}
+            maxSize={400}
+            groupResizeBehavior="preserve-pixel-size"
+            className="h-full overflow-hidden"
+          >
+            <Sidebar
+              onOpenSettings={() => setViewMode('settings')}
+              isSettingsActive={viewMode === 'settings'}
+            />
+          </Panel>
           {sidebarVisible && (
-            <>
-              <Panel
-                id="sidebar"
-                defaultSize={264}
-                minSize={200}
-                maxSize={400}
-                groupResizeBehavior="preserve-pixel-size"
-                className="h-full overflow-hidden"
-              >
-                <Sidebar
-                  onOpenSettings={() => setViewMode('settings')}
-                  isSettingsActive={viewMode === 'settings'}
-                />
-              </Panel>
               <Separator className="w-1.5 -mx-[2.5px] rounded-full bg-transparent hover:bg-accent/25 transition-colors cursor-col-resize select-none z-10" />
-            </>
           )}
 
           {/* Right Panel: Active Workspace */}
           <Panel
             id="workspace"
-            defaultSize={sidebarVisible ? '78%' : '100%'}
-            minSize="50%"
+            defaultSize={sidebarVisible ? (treeOpen ? '72%' : '78%') : treeOpen ? '82%' : '100%'}
+            minSize="40%"
             className="h-full flex flex-col overflow-hidden"
           >
             {viewMode === 'settings' ? (
@@ -315,128 +653,13 @@ export default function App() {
             ) : (
               <>
                 {/* Top Workspace Header */}
-                <div className="flex items-center justify-between px-4 h-11 select-none shrink-0">
+                <div className="misaka-glass-chrome relative z-40 flex items-center justify-between px-4 h-11 select-none shrink-0">
                   {/* Task & Workspace Interactive Breadcrumb */}
                   <div className="flex items-center gap-1.5 font-medium text-text-main text-[13px] truncate min-w-0">
                     {/* Workspace Dropdown Button */}
-                    <div className="relative" ref={workspaceMenuRef}>
-                      <button
-                        type="button"
-                        onClick={() => setWorkspaceMenuOpen((v) => !v)}
-                        className={`flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-xs transition-all cursor-pointer group shadow-e1 select-none ${
-                          workspaceMenuOpen
-                            ? 'bg-surface-3 text-text-main border border-accent/50'
-                            : 'bg-surface-2 hover:bg-surface-3 text-text-main border border-border-subtle hover:border-border-accent/40'
-                        }`}
-                        title="点击快速切换工作区或打开新目录"
-                      >
-                        <Folder className="w-3.5 h-3.5 text-accent shrink-0" />
-                        <span className="font-semibold text-text-main tracking-tight truncate max-w-[160px]">
-                          {currentWorkspace ? projectNameForCwd(currentWorkspace) : '选择工作区'}
-                        </span>
-                        <ChevronDown className={`w-3 h-3 text-dim group-hover:text-text-main transition-transform ${workspaceMenuOpen ? 'rotate-180' : ''}`} />
-                      </button>
+                    {!isWelcome && workspaceSwitcher}
 
-                      {/* Workspace Dropdown Menu */}
-                      {workspaceMenuOpen && (
-                        <div className="absolute left-0 top-10 z-50 w-72 rounded-xl bg-card border border-border-subtle shadow-e3 p-1.5 text-xs select-none">
-                          {/* Current workspace header info */}
-                          <div className="px-2.5 py-2 border-b border-border-subtle/70 bg-surface-2/40 rounded-lg">
-                            <div className="flex items-center justify-between">
-                              <span className="text-[10px] uppercase font-semibold text-muted tracking-wider">
-                                当前工作区
-                              </span>
-                              {currentWorkspace && (
-                                <button
-                                  type="button"
-                                  onClick={handleCopyWorkspacePath}
-                                  className="text-[10.5px] text-dim hover:text-accent flex items-center gap-1 cursor-pointer transition-colors"
-                                  title="复制绝对路径"
-                                >
-                                  {copiedPath ? (
-                                    <>
-                                      <Check className="w-3 h-3 text-emerald-500" />
-                                      <span className="text-emerald-500">已复制</span>
-                                    </>
-                                  ) : (
-                                    <>
-                                      <Copy className="w-3 h-3" />
-                                      <span>复制路径</span>
-                                    </>
-                                  )}
-                                </button>
-                              )}
-                            </div>
-                            <div className="font-semibold text-text-main truncate text-[12.5px] mt-1">
-                              {currentWorkspace ? projectNameForCwd(currentWorkspace) : '未指定工作区'}
-                            </div>
-                            {currentWorkspace && (
-                              <div
-                                className="font-mono text-[10px] text-dim/80 truncate mt-0.5"
-                                title={currentWorkspace}
-                              >
-                                {currentWorkspace}
-                              </div>
-                            )}
-                          </div>
-
-                          {/* Recent workspaces switcher list */}
-                          {recentWorkspaces.length > 0 && (
-                            <div className="py-1 border-b border-border-subtle/70">
-                              <div className="px-2 py-1 text-[10px] uppercase font-semibold text-muted tracking-wider">
-                                快速切换空间
-                              </div>
-                              <div className="space-y-0.5 max-h-40 overflow-y-auto pr-0.5">
-                                {recentWorkspaces.map((wsPath) => {
-                                  const isCurrent =
-                                    currentWorkspace &&
-                                    normalizeWorkspacePath(wsPath) === normalizeWorkspacePath(currentWorkspace)
-                                  const name = projectNameForCwd(wsPath)
-
-                                  return (
-                                    <button
-                                      key={wsPath}
-                                      type="button"
-                                      onClick={() => {
-                                        switchWorkspace(wsPath)
-                                        setWorkspaceMenuOpen(false)
-                                      }}
-                                      className={`w-full flex items-center gap-2 px-2.5 py-1.5 rounded-lg text-left transition-colors cursor-pointer ${
-                                        isCurrent
-                                          ? 'bg-surface-2 text-text-main font-semibold border border-border-subtle/70'
-                                          : 'text-muted hover:text-text-main hover:bg-surface-2/60'
-                                      }`}
-                                      title={wsPath}
-                                    >
-                                      <Folder className={`w-3.5 h-3.5 shrink-0 ${isCurrent ? 'text-accent' : 'text-dim'}`} />
-                                      <span className="truncate flex-1 text-[11.5px]">{name}</span>
-                                      {isCurrent && <Check className="w-3.5 h-3.5 text-accent shrink-0" />}
-                                    </button>
-                                  )
-                                })}
-                              </div>
-                            </div>
-                          )}
-
-                          {/* Action: Open folder */}
-                          <div className="pt-1">
-                            <button
-                              type="button"
-                              onClick={() => {
-                                setWorkspaceMenuOpen(false)
-                                openWorkspaceDialog()
-                              }}
-                              className="w-full flex items-center gap-2 px-2.5 py-1.5 rounded-lg text-left text-dim hover:text-text-main hover:bg-surface-2 transition-colors cursor-pointer"
-                            >
-                              <FolderPlus className="w-3.5 h-3.5 text-accent shrink-0" />
-                              <span className="text-[11.5px]">打开本地文件夹作为工作区...</span>
-                            </button>
-                          </div>
-                        </div>
-                      )}
-                    </div>
-
-                    <ChevronRight className="w-3.5 h-3.5 text-dim/40 shrink-0 mx-0.5" />
+                    {!isWelcome && <ChevronRight className="w-3.5 h-3.5 text-dim/40 shrink-0 mx-0.5" />}
 
                     {/* Session Title & Mode Badge */}
                     <div className="flex items-center gap-1.5 min-w-0 truncate">
@@ -452,28 +675,14 @@ export default function App() {
 
                   {/* Right Action Icons */}
                   <div className="flex items-center gap-1.5 text-dim">
-                    {/* View Switcher Button (Timeline vs Research DAG) */}
                     <button
                       type="button"
-                      onClick={() => setViewMode(viewMode === 'timeline' ? 'graph' : 'timeline')}
-                      className={`flex items-center gap-1.5 px-2.5 py-1 rounded-md text-xs font-medium transition-all cursor-pointer ${
-                        viewMode === 'graph'
-                          ? 'bg-accent text-white shadow-sm'
-                          : 'hover:bg-surface-2 text-muted hover:text-text-main border border-border-subtle'
-                      }`}
-                      title={viewMode === 'timeline' ? '切换到多 Agent 研究 DAG 视图' : '返回对话时间线'}
+                      onClick={handleOpenTree}
+                      disabled={!currentSessionId}
+                      className={'w-7 h-7 flex items-center justify-center rounded transition-colors cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed ' + (treeOpen ? 'bg-surface-2 text-text-main' : 'hover:bg-surface-2 hover:text-text-main')}
+                      title="会话树"
                     >
-                      {viewMode === 'timeline' ? (
-                        <>
-                          <Network className="w-3.5 h-3.5" />
-                          <span>研究 DAG</span>
-                        </>
-                      ) : (
-                        <>
-                          <MessageSquare className="w-3.5 h-3.5" />
-                          <span>时间线</span>
-                        </>
-                      )}
+                      <ListTree className="w-4 h-4" />
                     </button>
 
                     <button
@@ -500,7 +709,7 @@ export default function App() {
                       </button>
 
                       {menuOpen && (
-                        <div className="absolute right-0 top-9 z-40 w-40 rounded-xl bg-card border border-border-subtle shadow-e3 p-1 text-xs">
+                        <div className="misaka-glass-popover absolute right-0 top-9 z-40 w-40 rounded-xl bg-card border border-border-subtle shadow-e3 p-1 text-xs">
                           <button
                             type="button"
                             onClick={handleRename}
@@ -521,11 +730,29 @@ export default function App() {
                           <button
                             type="button"
                             onClick={handleExport}
-                            disabled={!currentSessionPath}
+                            disabled={!currentSessionPath || isExporting}
                             className="w-full flex items-center gap-2 px-3 py-1.5 rounded-md text-left text-muted hover:text-text-main hover:bg-surface-2 cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
                           >
                             <Download className="w-3.5 h-3.5" />
-                            <span>导出为 JSONL</span>
+                            <span>{isExporting ? '导出中…' : '导出为 JSONL'}</span>
+                          </button>
+                          <button
+                            type="button"
+                            onClick={handleOpenTree}
+                            disabled={!currentSessionId}
+                            className="w-full flex items-center gap-2 px-3 py-1.5 rounded-md text-left text-muted hover:text-text-main hover:bg-surface-2 cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
+                          >
+                            <ListTree className="w-3.5 h-3.5" />
+                            <span>会话树</span>
+                          </button>
+                          <button
+                            type="button"
+                            onClick={handleOpenCompact}
+                            disabled={!currentSessionId}
+                            className="w-full flex items-center gap-2 px-3 py-1.5 rounded-md text-left text-muted hover:text-text-main hover:bg-surface-2 cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
+                          >
+                            <Archive className="w-3.5 h-3.5" />
+                            <span>手动压缩</span>
                           </button>
                         </div>
                       )}
@@ -533,23 +760,89 @@ export default function App() {
                   </div>
                 </div>
 
-                {/* Main Content Area */}
-                <div className="flex-1 flex flex-col min-h-0 relative overflow-hidden">
-                  {viewMode === 'graph' ? (
-                    <ResearchGraphCanvas />
-                  ) : (
-                    <>
-                      <Timeline />
-                      <Composer onOpenModelSettings={openModelSettings} />
-                    </>
-                  )}
+                {(copyNotice || exportNotice) && <div role={(copyNotice?.kind === 'error' || exportNotice?.kind === 'error') ? 'alert' : 'status'} className={`mx-4 mb-2 flex items-center justify-between gap-3 rounded-lg border px-3 py-2 text-xs ${(copyNotice?.kind === 'error' || exportNotice?.kind === 'error') ? 'bg-danger-surface text-danger border-danger-border' : (copyNotice?.kind === 'success' || exportNotice?.kind === 'success') ? 'bg-success-surface text-success border-success-border' : 'bg-surface-2 text-muted border-border-subtle'}`}>
+                  <span className="min-w-0 truncate">{copyNotice?.text || exportNotice?.text}</span>
+                  {(exportNotice?.kind === 'pending' || copyNotice?.kind === 'pending') && <LoaderCircle className="h-4 w-4 shrink-0 animate-spin" />}
+                  {exportNotice?.kind === 'success' && exportNotice.path && <button type="button" onClick={async () => {
+                    if (!window.app?.showItemInFolder) {
+                      setExportNotice({ kind: 'error', text: '系统文件定位功能不可用' })
+                      return
+                    }
+                    try {
+                      const result = await window.app.showItemInFolder(exportNotice.path!)
+                      if (!result.ok) setExportNotice({ kind: 'error', text: `定位导出文件失败：${result.error || '系统未能定位该文件'}` })
+                    } catch (error) {
+                      setExportNotice({ kind: 'error', text: `定位导出文件失败：${error instanceof Error ? error.message : String(error)}` })
+                    }
+                  }} className="shrink-0 underline underline-offset-2">在文件夹中查看</button>}
+                  {(copyNotice?.kind === 'error' || exportNotice?.kind === 'error') && <button type="button" onClick={() => { setCopyNotice(null); setExportNotice(null) }} aria-label="关闭提示" className="shrink-0"><X className="h-3.5 w-3.5" /></button>}
+                </div>}
+
+                {/* Main Content Area: conversation, with the session tree as a right column */}
+                <div className="flex min-h-0 flex-1">
+                  <div data-conversation-viewport data-welcome={isWelcome || undefined} className="relative flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
+                    {viewMode === 'graph' ? (
+                      <ResearchGraphCanvas />
+                    ) : (
+                      <>
+                        <Timeline />
+                        <Composer welcome={isWelcome} workspaceControl={workspaceSwitcher} onOpenModelSettings={openModelSettings} onResearchStarted={() => setViewMode('timeline')} />
+                      </>
+                    )}
+                  </div>
+                  {activeResearchTaskId ? (
+                    <ResearchTaskDrawer />
+                  ) : treeOpen ? (
+                    <div className="w-[340px] shrink-0 border-l border-border-subtle">
+                      <SessionTreePanel
+                        payload={treePayload}
+                        loading={treeLoading}
+                        error={treeError}
+                        busy={Boolean(sessionOperation)}
+                        operationKind={sessionOperation?.operation ?? null}
+                        filterMode={treeFilterMode ?? 'default'}
+                        showLabelTimestamps={labelTimestampsVisible}
+                        skipSummaryPrompt={skipSummaryPrompt}
+                        onFilterModeChange={setTreeFilterMode}
+                        onToggleLabelTimestamps={() => setLabelTimestampsVisible(!labelTimestampsVisible)}
+                        onToggleSkipSummaryPrompt={toggleSkipSummaryPrompt}
+                        onNavigate={navigateTree}
+                        onCancelOperation={cancelSessionOperation}
+                        onRenameLabel={setEntryLabel}
+                        onCopy={handleCopyTreeText}
+                        onRefresh={fetchSessionTree}
+                        onClose={closeTreePanel}
+                      />
+                    </div>
+                  ) : null}
                 </div>
               </>
             )}
           </Panel>
         </Group>
       </div>
+      <CompactDialog
+        open={compactOpen}
+        busy={sessionOperation?.operation === 'compact_session'}
+        status={compactStatus}
+        messageCount={messages.filter(message => message.role === 'user' || message.role === 'assistant').length}
+        initialInstructions={compactDraft}
+        onConfirm={runCompact}
+        onCancelOperation={cancelSessionOperation}
+        onClose={closeCompactDialog}
+      />
+      <SessionRenameDialog
+        open={renameTarget !== null}
+        path={renameTarget?.path ?? ''}
+        name={renameTarget?.name ?? ''}
+        onRename={renameSession}
+        onClose={() => setRenameTarget(null)}
+      />
+      <SessionDeleteDialog />
       <PermissionDialog />
+      <ResearchGraphModal />
+      <ResearchHistoryDialog />
+      <CloseConfirmDialog open={closeConfirmOpen} onClose={() => setCloseConfirmOpen(false)} />
     </div>
   )
 }

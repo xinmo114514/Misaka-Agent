@@ -472,7 +472,7 @@ def build_params(
     initial_tools = (initial_system_message.toolsAdded if initial_system_message else None) or []
     native_tool_changes = _native_tool_changes(model, context)
 
-    managed_effort = supports_mid_convo_effort(model)
+    managed_effort = supports_mid_convo_effort(model) and not _option(options, "useModelThinkingDefault")
     assistant_levels: dict[int, str] = {}
     converted = convert_messages(
         conversation_messages, model, is_oauth, cache_control,

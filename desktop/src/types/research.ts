@@ -1,5 +1,70 @@
+import type { ChatMessage } from './session'
+
+export interface ResearchConversationBinding {
+  sessionId: string
+  sessionFile: string
+  workspace: string
+  runId: string | null
+  streamId?: string
+}
+
+export interface ResearchModelRef { provider: string; modelId: string }
+
+export interface ResearchModelBinding {
+  effective: ResearchModelRef
+  target: ResearchModelRef | null
+  epoch: number
+  state: 'ready' | 'switching' | 'failed'
+  error?: string | null
+}
+
+export interface DesktopResearchMember {
+  id: string
+  name: string
+  kind: 'task_agent' | 'borrowed_sister'
+  sourceId?: string
+  responsibility: string
+  goal: string
+  instructions: string
+  tools: string[]
+  skills: string[]
+  status: string
+  taskIds?: string[]
+  retainedAs?: string | null
+  effectiveModel?: ResearchModelRef
+}
+
+export interface DesktopResearchTeam {
+  teamId: string
+  scene: 'desktop_research'
+  members: DesktopResearchMember[]
+}
+
+export interface ResearchTeamSnapshot {
+  team?: DesktopResearchTeam | null
+  modelBinding?: ResearchModelBinding | null
+}
+
+/** Authoritative persisted transcript and host state, not a local run-start receipt. */
+export interface ResearchHostSnapshot {
+  enabled: boolean
+  streamId?: string
+  session: { sessionId: string; file: string; cwd: string; name?: string | null }
+  messages: ChatMessage[]
+  historyVersion: string | null
+  lastEventSeq: number
+  /** Native host lifecycle also covers follow-ups to a finished research run. */
+  isStreaming?: boolean
+  isIdle?: boolean
+  run: { id: string; status: string; phase: string } | null
+  stats: { totalMessages?: number; [key: string]: unknown }
+  contextUsage: { tokens?: number; contextWindow?: number; percent?: number; [key: string]: unknown } | null
+  team?: DesktopResearchTeam | null
+  modelBinding?: ResearchModelBinding | null
+}
+
 export type ResearchNodeKind = 'root' | 'alt' | 'join'
-export type ResearchNodeStatus = 'done' | 'running' | 'pending' | 'review' | 'failed'
+export type ResearchNodeStatus = string
 
 export interface ResearchNodeData {
   id: string
@@ -78,6 +143,90 @@ export interface ResearchGraphPayload {
   [key: string]: any
 }
 
+export interface ResearchRunLimits {
+  max_depth: number
+  parallel: number
+  sister_parallel: number
+  max_followups: number
+  max_revisions: number
+  max_nodes: number
+  plan_approval: boolean
+}
+
+export interface ResearchLimitConstraint {
+  min: number
+  max?: number
+}
+
+export interface ResearchOptionsPayload {
+  defaults: ResearchRunLimits
+  constraints: Partial<Record<keyof ResearchRunLimits, ResearchLimitConstraint>>
+  sisters: Array<{ id: string; name: string; description: string }>
+}
+
+export interface ResearchArtifactDetail {
+  id: string
+  kind: string
+  title: string
+  path: string | null
+  state: 'available' | 'changed' | 'missing' | 'outside_workspace'
+  content: string | null
+}
+
+export interface ResearchCitation {
+  artifact_id: string | null
+  source_file: string
+  quote: string
+  evidence_sha: string
+}
+
+export interface ResearchFinding {
+  id: string
+  text: string
+  claim_type: 'fact' | 'inference' | 'interpretation' | 'normative' | string
+  citations: ResearchCitation[]
+}
+
+export interface ResearchTaskDetail {
+  id: string
+  title: string
+  body: string
+  status: string
+  kind: string
+  round: number
+  attempt: number
+  assignee: string
+  artifacts: ResearchArtifactDetail[]
+  findings: ResearchFinding[]
+}
+
+export interface ResearchNodeDetail {
+  node: { id: string; question: string; depth: number; status: string; kind: ResearchNodeKind }
+  plan_round: number
+  plan: Record<string, any> | null
+  plan_tool_call_id?: string | null
+  available_tools: string[]
+  cards: ResearchTaskDetail[]
+  artifacts: ResearchArtifactDetail[]
+  findings: ResearchFinding[]
+  issues: Array<Record<string, any>>
+  errata: Array<Record<string, any>>
+  red_team: { assignee?: string; reason?: string } | null
+}
+
+export interface ResearchRunDetail {
+  run: ResearchRunSummary & { rootSession?: string | null; driverLock?: string | null; driving?: boolean }
+  graph: ResearchGraphPayload & {
+    plans?: Array<{ node_id: string; round: number; tool_call_id: string; plan: Record<string, any> }>
+    final_artifacts?: Array<Omit<ResearchArtifactDetail, 'content'> & { content?: never }>
+  }
+  pending_questions?: Array<{ node_id: string; question: string }>
+  root_context?: {
+    stats: { totalMessages?: number; [key: string]: unknown }
+    contextUsage: { tokens?: number; contextWindow?: number; percent?: number; [key: string]: unknown }
+  } | null
+}
+
 /** Result of the desktop's update check. */
 export interface UpdateStatus {
   version: string | null
@@ -85,4 +234,38 @@ export interface UpdateStatus {
   behind: number | null
   upToDate: boolean | null
   reason: string | null
+}
+
+export interface ResearchTaskSummary {
+  id: string
+  nodeId?: string
+  title: string
+  assignee: string
+  status: 'pending' | 'running' | 'closed' | 'error' | string
+  summary?: string
+  round?: number
+  attempt?: number
+  findingsCount?: number
+  artifactsCount?: number
+}
+
+export interface ResearchRunCard {
+  runId: string
+  question: string
+  status: string // 'active' | 'waiting_input' | 'done' | 'error' | 'stopped'
+  phase: string
+  stage?: string
+  workspace?: string
+  tasks: ResearchTaskSummary[]
+  findings?: Array<string | ResearchFinding>
+  pendingQuestions?: string[]
+  report?: {
+    artifactId?: string
+    title?: string
+    path?: string
+    content?: string
+    surveyPath?: string
+  } | null
+  error?: string | null
+  updatedAt: number
 }

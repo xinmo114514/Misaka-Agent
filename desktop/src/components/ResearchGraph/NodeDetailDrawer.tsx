@@ -11,6 +11,7 @@ import {
   GitBranch,
 } from 'lucide-react'
 import type { ResearchNodeData } from '../../types/research'
+import { researchNodeLabel } from '../../lib/researchStatus'
 
 interface NodeDetailDrawerProps {
   node: ResearchNodeData | null
@@ -21,18 +22,19 @@ interface NodeDetailDrawerProps {
 export const NodeDetailDrawer: React.FC<NodeDetailDrawerProps> = ({ node, onClose }) => {
   if (!node) return null
 
-  const isDone = node.status === 'done'
-  const isRunning = node.status === 'running'
-  const isReview = node.status === 'review'
+  const isDone = node.status === 'closed' || node.status === 'done'
+  const isReview = ['critique', 'critiquing', 'diverging', 'divergence', 'divergence_review', 'red_team_review'].includes(node.status)
   const isFailed = node.status === 'failed'
+  const isWaiting = ['awaiting_approval', 'waiting_input', 'parked', 'queued'].includes(node.status)
+  const isRunning = !isDone && !isFailed && !isReview && !isWaiting
 
   return (
-    <div className="absolute top-0 right-0 bottom-0 w-[420px] bg-card border-l border-border-subtle shadow-e3 flex flex-col z-30 select-none animate-in slide-in-from-right duration-200">
+    <div className="misaka-glass-panel absolute top-0 right-0 bottom-0 w-[420px] bg-card border-l border-border-subtle shadow-e3 flex flex-col z-30 select-none animate-in slide-in-from-right duration-200">
       {/* Header */}
       <div className="flex items-center justify-between px-4 py-3 border-b border-border bg-surface-2/60 shrink-0">
         <div className="flex items-center gap-2">
           <div
-            className="w-6 h-6 rounded-full flex items-center justify-center text-[11px] font-bold text-white shrink-0"
+            className="w-6 h-6 rounded-full flex items-center justify-center text-[11px] font-bold text-on-chart shrink-0"
             style={{ backgroundColor: node.assignee.avatarBg || 'var(--accent)' }}
           >
             {node.assignee.id === 'lo' ? 'LO' : node.assignee.id.slice(-2)}
@@ -52,7 +54,7 @@ export const NodeDetailDrawer: React.FC<NodeDetailDrawerProps> = ({ node, onClos
       </div>
 
       {/* Scrollable Content */}
-      <div className="flex-1 overflow-y-auto p-4 space-y-4 text-xs font-sans">
+      <div className="flex-1 overflow-y-auto bg-surface-1 p-4 space-y-4 text-xs font-sans">
         {/* Node Overview Card */}
         <div className="p-3 rounded-xl bg-surface-2/40 border border-border space-y-2">
           <div className="flex items-center justify-between">
@@ -69,12 +71,12 @@ export const NodeDetailDrawer: React.FC<NodeDetailDrawerProps> = ({ node, onClos
               ) : isRunning ? (
                 <span className="flex items-center gap-1 text-[11px] text-warning font-medium">
                   <Loader2 className="w-3 h-3 animate-spin" />
-                  研究中
+                  {researchNodeLabel(node.status)}
                 </span>
               ) : isReview ? (
                 <span className="flex items-center gap-1 text-[11px] text-danger font-medium">
                   <ShieldAlert className="w-3 h-3" />
-                  红队审阅
+                  {researchNodeLabel(node.status)}
                 </span>
               ) : isFailed ? (
                 <span className="flex items-center gap-1 text-[11px] text-danger font-medium">
@@ -84,7 +86,7 @@ export const NodeDetailDrawer: React.FC<NodeDetailDrawerProps> = ({ node, onClos
               ) : (
                 <span className="flex items-center gap-1 text-[11px] text-dim font-medium">
                   <Clock className="w-3 h-3" />
-                  待启动
+                  {researchNodeLabel(node.status)}
                 </span>
               )}
             </div>

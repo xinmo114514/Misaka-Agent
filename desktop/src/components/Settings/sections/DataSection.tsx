@@ -1,4 +1,4 @@
-import React, { useState } from 'react'
+import React, { useEffect, useRef, useState } from 'react'
 import {
   Database,
   FolderOpen,
@@ -8,9 +8,15 @@ import {
   Trash2,
   FileCheck2,
   HardDrive,
+  AlertCircle,
+  LoaderCircle,
+  X,
 } from 'lucide-react'
 import { useSettingsStore } from '../../../store/useSettingsStore'
 import { useSessionStore } from '../../../store/useSessionStore'
+import { sessionHistoryCache } from '../../../lib/sessionHistoryCache'
+import { clearSessionViewsExcept } from '../../../lib/sessionViewState'
+import { clipboardErrorMessage, copyTextToClipboard } from '../../../lib/clipboard'
 import { SettingsRow } from '../SettingsRow'
 
 export const DataSection: React.FC = () => {
@@ -22,53 +28,103 @@ export const DataSection: React.FC = () => {
 
   const [copiedKey, setCopiedKey] = useState<string | null>(null)
   const [isExporting, setIsExporting] = useState(false)
-  const [exportNotice, setExportNotice] = useState<string | null>(null)
+  const [exportNotice, setExportNotice] = useState<{ kind: 'pending' | 'success' | 'error'; text: string } | null>(null)
+  const [pathNotice, setPathNotice] = useState<{ kind: 'success' | 'error'; text: string } | null>(null)
+  const [clipboardNotice, setClipboardNotice] = useState<{ kind: 'pending' | 'success' | 'error'; text: string } | null>(null)
+  const [copyingKey, setCopyingKey] = useState<string | null>(null)
+  const copyingRef = useRef(false)
+  const copiedResetTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const [cacheNotice, setCacheNotice] = useState<string | null>(null)
 
-  const handleCopy = (key: string, text: string) => {
-    if (!text) return
-    navigator.clipboard.writeText(text)
-    setCopiedKey(key)
-    setTimeout(() => setCopiedKey(null), 2000)
+  useEffect(() => () => {
+    if (copiedResetTimer.current) clearTimeout(copiedResetTimer.current)
+  }, [])
+
+  const handleCopy = async (key: string, text: string) => {
+    if (!text || copyingRef.current) return
+    copyingRef.current = true
+    setCopyingKey(key)
+    setClipboardNotice({ kind: 'pending', text: '正在写入剪贴板…' })
+    try {
+      await copyTextToClipboard(text)
+      setCopiedKey(key)
+      setClipboardNotice({ kind: 'success', text: '路径已复制' })
+      if (copiedResetTimer.current) clearTimeout(copiedResetTimer.current)
+      copiedResetTimer.current = setTimeout(() => {
+        setCopiedKey((current) => current === key ? null : current)
+        copiedResetTimer.current = null
+      }, 2000)
+    } catch (error) {
+      setCopiedKey(null)
+      setClipboardNotice({ kind: 'error', text: `复制失败：${clipboardErrorMessage(error)}` })
+    } finally {
+      copyingRef.current = false
+      setCopyingKey(null)
+    }
   }
 
   const handleOpenPath = async (targetPath: string) => {
-    if (window.app?.openPath && targetPath) {
-      await window.app.openPath(targetPath)
+    setPathNotice(null)
+    if (!window.app?.openPath || !targetPath) {
+      setPathNotice({ kind: 'error', text: '系统目录打开功能不可用' })
+      return
+    }
+    try {
+      const result = await window.app.openPath(targetPath)
+      setPathNotice(result.ok
+        ? { kind: 'success', text: `已提交打开路径请求：${targetPath}` }
+        : { kind: 'error', text: `打开路径失败：${result.error || '系统未能打开该路径'}` })
+    } catch (error) {
+      setPathNotice({ kind: 'error', text: `打开路径失败：${error instanceof Error ? error.message : String(error)}` })
     }
   }
 
   const handleShowInFolder = async (targetPath: string) => {
-    if (window.app?.showItemInFolder && targetPath) {
-      await window.app.showItemInFolder(targetPath)
+    setPathNotice(null)
+    if (!window.app?.showItemInFolder || !targetPath) {
+      setPathNotice({ kind: 'error', text: '系统文件定位功能不可用' })
+      return
+    }
+    try {
+      const result = await window.app.showItemInFolder(targetPath)
+      setPathNotice(result.ok
+        ? { kind: 'success', text: `已提交文件定位请求：${targetPath}` }
+        : { kind: 'error', text: `定位文件失败：${result.error || '系统未能定位该文件'}` })
+    } catch (error) {
+      setPathNotice({ kind: 'error', text: `定位文件失败：${error instanceof Error ? error.message : String(error)}` })
     }
   }
 
   const handleExport = async () => {
     if (!currentSessionPath) {
-      setExportNotice('当前无活动会话可导出')
-      setTimeout(() => setExportNotice(null), 3000)
+      setExportNotice({ kind: 'error', text: '当前无活动会话可导出' })
       return
     }
+    setExportNotice({ kind: 'pending', text: '正在导出 JSONL…' })
+    setPathNotice(null)
     setIsExporting(true)
-    const res = await exportCurrentSession(currentSessionPath)
-    setIsExporting(false)
-    if (res.ok && res.path) {
-      setExportNotice(`导出成功: ${res.path}`)
-    } else {
-      setExportNotice(`导出失败: ${res.error || '未知错误'}`)
+    try {
+      const res = await exportCurrentSession(currentSessionPath)
+      if (res.ok && res.path) setExportNotice({ kind: 'success', text: `导出成功：${res.path}` })
+      else setExportNotice({ kind: 'error', text: `导出失败：${res.error || '结果未确认'}` })
+    } catch (error) {
+      setExportNotice({ kind: 'error', text: `导出失败：${error instanceof Error ? error.message : String(error)}` })
+    } finally {
+      setIsExporting(false)
     }
   }
 
   const handleCleanCache = () => {
-    setCacheNotice('已清理临时文件与前端缓存')
+    sessionHistoryCache.clear()
+    clearSessionViewsExcept(currentSessionPath)
+    setCacheNotice('已清理前端会话缓存')
     setTimeout(() => setCacheNotice(null), 3000)
   }
 
   return (
     <div className="space-y-6">
       {/* Header Banner */}
-      <div className="p-4 rounded-xl bg-card shadow-e1 border border-border-subtle">
+      <div className="misaka-glass-panel relative p-4 rounded-xl bg-card shadow-e1 border border-border-subtle">
         <h2 className="text-sm font-semibold text-text-main flex items-center gap-2">
           <Database className="w-4 h-4 text-accent" />
           <span>本地存储、导出与安全路径</span>
@@ -79,7 +135,7 @@ export const DataSection: React.FC = () => {
       </div>
 
       {/* Path Locations */}
-      <div className="rounded-xl border border-border-subtle bg-card shadow-e1 p-4 space-y-1">
+      <div className="misaka-glass-panel relative rounded-xl border border-border-subtle bg-card shadow-e1 p-4 space-y-1">
         <SettingsRow
           title="配置根目录 (Agent Directory)"
           description="存放 settings.json, models.json 与主题配置文件的路径。"
@@ -93,6 +149,7 @@ export const DataSection: React.FC = () => {
                 <button
                   type="button"
                   onClick={() => handleCopy('agentDir', configPaths.agentDir)}
+                  disabled={Boolean(copyingKey)}
                   className="p-1.5 rounded hover:bg-surface-2 text-dim hover:text-text-main border border-border-subtle transition-colors cursor-pointer"
                   title="复制路径"
                 >
@@ -129,6 +186,7 @@ export const DataSection: React.FC = () => {
                 <button
                   type="button"
                   onClick={() => handleCopy('authPath', configPaths.authPath)}
+                  disabled={Boolean(copyingKey)}
                   className="p-1.5 rounded hover:bg-surface-2 text-dim hover:text-text-main border border-border-subtle transition-colors cursor-pointer"
                   title="复制路径"
                 >
@@ -165,6 +223,7 @@ export const DataSection: React.FC = () => {
                 <button
                   type="button"
                   onClick={() => handleCopy('sessionsDir', configPaths.sessionsDir)}
+                  disabled={Boolean(copyingKey)}
                   className="p-1.5 rounded hover:bg-surface-2 text-dim hover:text-text-main border border-border-subtle transition-colors cursor-pointer"
                   title="复制路径"
                 >
@@ -189,8 +248,17 @@ export const DataSection: React.FC = () => {
         </SettingsRow>
       </div>
 
+      {clipboardNotice && <div role={clipboardNotice.kind === 'error' ? 'alert' : 'status'} className={`p-2.5 rounded-lg border text-xs ${clipboardNotice.kind === 'error' ? 'bg-danger-surface text-danger border-danger-border' : clipboardNotice.kind === 'success' ? 'bg-success-surface text-success border-success-border' : 'bg-surface-2 text-muted border-border-subtle'}`}>
+        {clipboardNotice.text}
+        {clipboardNotice.kind === 'error' && <button type="button" onClick={() => setClipboardNotice(null)} aria-label="关闭复制提示" className="float-right"><X className="w-3.5 h-3.5" /></button>}
+      </div>}
+      {pathNotice && <div role={pathNotice.kind === 'error' ? 'alert' : 'status'} className={`p-2.5 rounded-lg border text-xs ${pathNotice.kind === 'error' ? 'bg-danger-surface text-danger border-danger-border' : 'bg-success-surface text-success border-success-border'}`}>
+        {pathNotice.text}
+        {pathNotice.kind === 'error' && <button type="button" onClick={() => setPathNotice(null)} aria-label="关闭路径提示" className="float-right"><X className="w-3.5 h-3.5" /></button>}
+      </div>}
+
       {/* Real Session Export Card */}
-      <div className="rounded-xl border border-border-subtle bg-card shadow-e1 p-5 space-y-4">
+      <div className="misaka-glass-panel relative rounded-xl border border-border-subtle bg-card shadow-e1 p-5 space-y-4">
         <div className="flex items-start justify-between gap-4">
           <div className="space-y-1">
             <h3 className="text-sm font-semibold text-text-main flex items-center gap-2">
@@ -206,7 +274,7 @@ export const DataSection: React.FC = () => {
             type="button"
             onClick={handleExport}
             disabled={isExporting || !currentSessionPath}
-            className="flex items-center gap-2 px-3.5 py-1.5 rounded-lg bg-accent text-white hover:bg-accent/90 text-xs font-medium transition-all shadow-xs cursor-pointer shrink-0 disabled:opacity-40 disabled:cursor-not-allowed"
+            className="misaka-luminous flex items-center gap-2 px-3.5 py-1.5 rounded-lg bg-accent text-on-accent hover:bg-accent/90 text-xs font-medium transition-all shadow-xs cursor-pointer shrink-0 disabled:opacity-40 disabled:cursor-not-allowed"
           >
             <Download className="w-3.5 h-3.5" />
             <span>{isExporting ? '导出中...' : '一键导出当前会话'}</span>
@@ -214,12 +282,12 @@ export const DataSection: React.FC = () => {
         </div>
 
         {exportNotice && (
-          <div className="flex items-center justify-between p-3 rounded-lg bg-surface-2 border border-border-subtle text-xs text-text-main">
+          <div role={exportNotice.kind === 'error' ? 'alert' : 'status'} className={`flex items-center justify-between p-3 rounded-lg border text-xs ${exportNotice.kind === 'error' ? 'bg-danger-surface text-danger border-danger-border' : exportNotice.kind === 'success' ? 'bg-success-surface text-success border-success-border' : 'bg-surface-2 text-muted border-border-subtle'}`}>
             <div className="flex items-center gap-2 truncate pr-2">
-              <FileCheck2 className="w-4 h-4 text-success shrink-0" />
-              <span className="truncate">{exportNotice}</span>
+              {exportNotice.kind === 'pending' ? <LoaderCircle className="w-4 h-4 animate-spin shrink-0" /> : exportNotice.kind === 'error' ? <AlertCircle className="w-4 h-4 shrink-0" /> : <FileCheck2 className="w-4 h-4 text-success shrink-0" />}
+              <span className="truncate">{exportNotice.text}</span>
             </div>
-            {lastExportedPath && (
+            {exportNotice.kind === 'success' && lastExportedPath && (
               <button
                 type="button"
                 onClick={() => handleShowInFolder(lastExportedPath)}
@@ -233,7 +301,7 @@ export const DataSection: React.FC = () => {
       </div>
 
       {/* Storage Overview & Maintenance */}
-      <div className="rounded-xl border border-border-subtle bg-card shadow-e1 p-5 space-y-4">
+      <div className="misaka-glass-panel relative rounded-xl border border-border-subtle bg-card shadow-e1 p-5 space-y-4">
         <div className="flex items-start justify-between gap-4">
           <div className="space-y-1">
             <h3 className="text-sm font-semibold text-text-main flex items-center gap-2">

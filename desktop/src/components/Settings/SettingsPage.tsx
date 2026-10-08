@@ -62,7 +62,7 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({ onClose }) => {
   return (
     <div className="flex-1 flex flex-col h-full w-full overflow-hidden select-none font-sans">
       {/* Top Header Breadcrumb matching ZCode */}
-      <div className="flex items-center justify-between px-5 h-11 select-none shrink-0">
+      <div className="misaka-glass-chrome relative flex items-center justify-between px-5 h-11 select-none shrink-0">
         <div className="flex items-center gap-2 text-xs">
           <button
             type="button"

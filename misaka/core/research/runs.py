@@ -343,6 +343,13 @@ def _lease_holder_is_dead(lock):
     return pid > 0 and not psutil.pid_exists(pid)
 
 
+def driver_is_live(run, *, now=None):
+    """Whether a persisted driver lease still names a live holder under the shared-TTL rule."""
+    lock = run["driver_lock"]
+    expires = run["driver_expires"]
+    return bool(lock) and (expires is None or expires >= (time.time() if now is None else now)) and not _lease_holder_is_dead(lock)
+
+
 def acquire_driver(con, run_id, lock, ttl_seconds=DRIVER_TTL_SECONDS):
     """Take the run's driver lease: one process advances a run at a time. False when another
     live lease holds it."""

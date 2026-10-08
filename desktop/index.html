@@ -5,17 +5,131 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Misaka Agent</title>
     <script>
-      // Electron passes the active theme in the load URL. This runs while the document is still
-      // being parsed, so the first frame already uses the matching [data-theme] palette instead
-      // of index.css's dark :root default — light users were flashing dark on every launch.
+      // Synchronous first paint, before styles and React. Keep this allowlist synchronized with
+      // theme/tokens.ts; themeRuntime.test.ts checks every emitted variable against this script.
       try {
-        var stamp = new URLSearchParams(location.search).get('theme')
-        if (stamp === 'dark' || stamp === 'light') document.documentElement.setAttribute('data-theme', stamp)
+        var params = new URLSearchParams(location.search)
+        var palette = JSON.parse(params.get('themePalette') || 'null')
+        var roles = ('accent accent-soft on-accent on-danger on-chart surface-0 surface-1 surface-2 surface-3 surface-hover border-subtle border border-strong border-accent text-main muted dim disabled focus-ring thinking-text success warning danger info success-surface warning-surface danger-surface info-surface success-border warning-border danger-border info-border chart-1 chart-2 chart-3 chart-4 chart-5 chart-6 switch-thumb overlay copy-success activity-ping activity-dot permission-plan permission-edit permission-bypass slider-thumb slider-thumb-border slider-passed slider-streak brand-zhipu brand-deepseek brand-anthropic brand-openai brand-kimi brand-xiaomi brand-qwen brand-custom scrollbar-thumb scrollbar-hover shadow-ink shadow-catch glass-highlight well band-1 band-2 band-3 thinking-quiet md-heading md-link md-code md-quote md-quote-border md-hr md-list-marker md-table-header tool-title tool-output tool-error tool-error-border graph-background graph-grid graph-edge graph-edge-active graph-edge-strong graph-minimap-mask graph-control-bg graph-control-surface graph-minimap-background graph-control-hover graph-control-text graph-control-border window-background window-symbol rose rose-lite').split(' ')
+        if (palette && typeof palette.name === 'string' && /^[a-z][a-z0-9-]*$/.test(palette.name)
+          && palette.name === params.get('theme') && (palette.mode === 'dark' || palette.mode === 'light')
+          && palette.vars && typeof palette.vars === 'object' && !Array.isArray(palette.vars)) {
+          // Validate the complete palette before any mutation; a partial or malformed query
+          // must leave the document unstamped so renderer initialization applies its default.
+          var complete = roles.every(function (role) {
+            var key = '--' + role
+            var value = palette.vars[key]
+            return Object.prototype.hasOwnProperty.call(palette.vars, key) && typeof value === 'string'
+              && (value === 'transparent' || /^#[\da-f]{6}(?:[\da-f]{2})?$/i.test(value))
+          })
+          if (complete) {
+            var root = document.documentElement
+            root.setAttribute('data-theme', palette.name)
+            root.setAttribute('data-theme-mode', palette.mode)
+            root.style.colorScheme = palette.mode
+            roles.forEach(function (role) { root.style.setProperty('--' + role, palette.vars['--' + role]) })
+          }
+        }
       } catch (e) {}
     </script>
+    <style>
+      .misaka-splash {
+        position: fixed;
+        inset: 0;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        background-color: var(--surface-0, #18181e);
+        user-select: none;
+        z-index: 9999;
+      }
+      .misaka-splash-content {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        text-align: center;
+      }
+      .misaka-splash-logo {
+        width: 72px;
+        height: 72px;
+        filter: drop-shadow(0 8px 24px color-mix(in srgb, var(--accent, #cb3862) 35%, transparent));
+        animation: misaka-splash-breathe 2.4s ease-in-out infinite;
+      }
+      .misaka-splash-title {
+        margin-top: 18px;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+        font-size: 13px;
+        font-weight: 600;
+        letter-spacing: 3px;
+        color: var(--text-main, #ffffff);
+        opacity: 0.85;
+      }
+      .misaka-splash-dots {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        margin-top: 14px;
+      }
+      .misaka-splash-dot {
+        width: 4px;
+        height: 4px;
+        border-radius: 9999px;
+        background-color: var(--accent, #cb3862);
+        opacity: 0.3;
+        animation: misaka-splash-dot-pulse 1.4s ease-in-out infinite;
+      }
+      .misaka-splash-dot:nth-child(2) {
+        animation-delay: 0.2s;
+      }
+      .misaka-splash-dot:nth-child(3) {
+        animation-delay: 0.4s;
+      }
+      @keyframes misaka-splash-breathe {
+        0%, 100% {
+          transform: scale(1);
+          opacity: 0.95;
+        }
+        50% {
+          transform: scale(1.04);
+          opacity: 1;
+        }
+      }
+      @keyframes misaka-splash-dot-pulse {
+        0%, 100% {
+          opacity: 0.25;
+          transform: scale(0.9);
+        }
+        50% {
+          opacity: 1;
+          transform: scale(1.3);
+        }
+      }
+      @media (prefers-reduced-motion: reduce) {
+        .misaka-splash-logo, .misaka-splash-dot {
+          animation: none !important;
+        }
+      }
+    </style>
   </head>
   <body class="bg-surface-0 text-text-main antialiased select-none">
-    <div id="root"></div>
+    <div id="root">
+      <div class="misaka-splash" aria-busy="true" aria-label="正在启动 Misaka Agent">
+        <div class="misaka-splash-content">
+          <svg class="misaka-splash-logo" viewBox="0 0 480 480" width="72" height="72" aria-hidden="true">
+            <rect width="480" height="480" rx="108" fill="var(--accent, #cb3862)"/>
+            <circle cx="240" cy="244.13" r="115.98" fill="#ffffff"/>
+            <circle cx="240" cy="157.12" r="29.10" fill="var(--accent, #cb3862)"/>
+            <circle cx="240" cy="293.44" r="72.62" fill="var(--accent, #cb3862)"/>
+          </svg>
+          <div class="misaka-splash-title">MISAKA AGENT</div>
+          <div class="misaka-splash-dots" aria-hidden="true">
+            <div class="misaka-splash-dot"></div>
+            <div class="misaka-splash-dot"></div>
+            <div class="misaka-splash-dot"></div>
+          </div>
+        </div>
+      </div>
+    </div>
     <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>

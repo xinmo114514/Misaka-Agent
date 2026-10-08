@@ -70,7 +70,7 @@ export const ShortcutsSection: React.FC = () => {
   return (
     <div className="space-y-6">
       {/* Header Banner */}
-      <div className="p-4 rounded-xl bg-card shadow-e1 border border-border-subtle">
+      <div className="misaka-glass-panel relative p-4 rounded-xl bg-card shadow-e1 border border-border-subtle">
         <h2 className="text-sm font-semibold text-text-main flex items-center gap-2">
           <Keyboard className="w-4 h-4 text-accent" />
           <span>键盘快捷键与高效交互</span>
@@ -81,7 +81,7 @@ export const ShortcutsSection: React.FC = () => {
       </div>
 
       {/* Live Shortcut Tester Card */}
-      <div className="p-4 rounded-xl bg-card shadow-e1 border border-border-subtle space-y-2">
+      <div className="misaka-glass-panel relative p-4 rounded-xl bg-card shadow-e1 border border-border-subtle space-y-2">
         <div className="flex items-center justify-between">
           <span className="text-xs font-semibold text-text-main flex items-center gap-1.5">
             <Sparkles className="w-3.5 h-3.5 text-accent" />
@@ -97,7 +97,7 @@ export const ShortcutsSection: React.FC = () => {
         <div className="p-3 rounded-lg bg-surface-2 border border-border-subtle flex items-center justify-between min-h-[48px]">
           <div className="flex items-center gap-2">
             {activeTestKey ? (
-              <kbd className="px-3 py-1 rounded bg-accent text-white font-mono text-xs shadow-xs font-semibold">
+              <kbd className="px-3 py-1 rounded bg-accent text-on-accent font-mono text-xs shadow-xs font-semibold">
                 {activeTestKey}
               </kbd>
             ) : (
@@ -113,7 +113,7 @@ export const ShortcutsSection: React.FC = () => {
       </div>
 
       {/* Shortcuts List */}
-      <div className="rounded-xl border border-border-subtle bg-card shadow-e1 p-4 space-y-1">
+      <div className="misaka-glass-panel relative rounded-xl border border-border-subtle bg-card shadow-e1 p-4 space-y-1">
         {SHORTCUTS.map((sc) => {
           const displayKey = isMac ? sc.macKey : sc.key
           const isPressed =
@@ -125,7 +125,7 @@ export const ShortcutsSection: React.FC = () => {
               <kbd
                 className={`px-2.5 py-1 rounded border font-mono text-[11px] shadow-xs transition-all ${
                   isPressed
-                    ? 'bg-accent text-white border-accent scale-105'
+                    ? 'bg-accent text-on-accent border-accent scale-105'
                     : 'bg-surface-2 text-text-main border-border-subtle'
                 }`}
               >

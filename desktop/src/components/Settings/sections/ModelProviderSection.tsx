@@ -287,7 +287,7 @@ export const ModelProviderSection: React.FC = () => {
           <button
             type="button"
             onClick={startCustomDraft}
-            className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-accent hover:opacity-90 text-white text-[12px] font-medium transition-all cursor-pointer shadow-xs"
+            className="misaka-luminous flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-accent hover:opacity-90 text-on-accent text-[12px] font-medium transition-all cursor-pointer shadow-xs"
           >
             <Plus className="w-3.5 h-3.5" />
             <span>添加自定义提供商</span>
@@ -301,7 +301,7 @@ export const ModelProviderSection: React.FC = () => {
         </div>
       )}
 
-      <div className="grid grid-cols-1 md:grid-cols-[224px_minmax(0,1fr)] border border-border-subtle rounded-xl overflow-hidden bg-card shadow-e1">
+      <div className="misaka-glass-panel relative grid grid-cols-1 md:grid-cols-[224px_minmax(0,1fr)] border border-border-subtle rounded-xl overflow-hidden bg-card shadow-e1">
         {/* Rail */}
         <aside className="border-b md:border-b-0 md:border-r border-border-subtle/70 flex flex-col min-h-0">
           <div className="p-3 border-b border-border-subtle/70">
@@ -507,7 +507,7 @@ export const ModelProviderSection: React.FC = () => {
               </div>
 
               {/* Credential form */}
-              <div className="rounded-xl border border-border-subtle bg-card shadow-e1 p-4 space-y-3">
+              <div className="misaka-glass-panel relative rounded-xl border border-border-subtle bg-card shadow-e1 p-4 space-y-3">
                 {selectedConnection.kind === "oauth" ? (
                   <div className="space-y-2">
                     <div className="text-[12.5px] text-text-main font-medium">订阅登录认证</div>
@@ -568,7 +568,7 @@ export const ModelProviderSection: React.FC = () => {
                           setKeyInput("")
                           clearConnectivity(selectedConnection.providerId)
                         }}
-                        className="flex items-center gap-1.5 px-3 py-1 rounded-lg bg-accent hover:opacity-90 text-white text-[11.5px] font-medium transition-all cursor-pointer shadow-xs disabled:opacity-40 disabled:cursor-not-allowed"
+                        className="misaka-luminous flex items-center gap-1.5 px-3 py-1 rounded-lg bg-accent hover:opacity-90 text-on-accent text-[11.5px] font-medium transition-all cursor-pointer shadow-xs disabled:opacity-40 disabled:cursor-not-allowed"
                       >
                         <Save className="w-3.5 h-3.5" />
                         <span>保存到本地</span>
@@ -661,7 +661,7 @@ export const ModelProviderSection: React.FC = () => {
               </div>
 
               {/* Custom Provider Info & Remote Model Sync Card */}
-              <div className="rounded-xl border border-border-subtle bg-card shadow-e1 p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+              <div className="misaka-glass-panel relative rounded-xl border border-border-subtle bg-card shadow-e1 p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
                 <div className="space-y-1">
                   <div className="text-[12.5px] font-medium text-text-main flex items-center gap-2">
                     <span>远程端点与模型管理</span>
@@ -677,7 +677,7 @@ export const ModelProviderSection: React.FC = () => {
                   type="button"
                   onClick={() => handleSyncRemoteModels(selectedEntry.draft)}
                   disabled={customFetchLoading}
-                  className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-accent hover:opacity-90 text-white text-[11.5px] font-medium transition-all cursor-pointer shadow-xs disabled:opacity-50 shrink-0"
+                  className="misaka-luminous flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-accent hover:opacity-90 text-on-accent text-[11.5px] font-medium transition-all cursor-pointer shadow-xs disabled:opacity-50 shrink-0"
                 >
                   {customFetchLoading ? (
                     <Loader2 className="w-3.5 h-3.5 animate-spin" />
@@ -1235,7 +1235,7 @@ const CustomProviderForm: React.FC<CustomProviderFormProps> = ({
             type="button"
             onClick={handleSaveClick}
             disabled={isSaving || !draft.providerId.trim() || !draft.baseUrl.trim()}
-            className="flex items-center gap-1.5 px-3 py-1 rounded-lg bg-accent hover:opacity-90 text-white text-[11.5px] font-medium transition-all cursor-pointer shadow-xs disabled:opacity-40 disabled:cursor-not-allowed"
+            className="misaka-luminous flex items-center gap-1.5 px-3 py-1 rounded-lg bg-accent hover:opacity-90 text-on-accent text-[11.5px] font-medium transition-all cursor-pointer shadow-xs disabled:opacity-40 disabled:cursor-not-allowed"
           >
             {isSaving ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Save className="w-3.5 h-3.5" />}
             <span>{isSaving ? "保存中…" : "保存提供商"}</span>

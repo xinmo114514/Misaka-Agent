@@ -52,6 +52,8 @@ class ProviderResponse(SchemaModel):
 
 
 class StreamOptions(RuntimeModel):
+    # Serialization policy: omission is provider default, never an explicit off command.
+    useModelThinkingDefault: bool = False
     temperature: float | None = None
     maxTokens: int | None = None
     signal: Any | None = None
@@ -693,6 +695,7 @@ class Model(SchemaModel):
     provider: Provider
     baseUrl: str
     reasoning: bool
+    thinkingCapabilityKnown: bool | None = None
     thinkingLevelMap: ThinkingLevelMap | None = None
     input: list[InputModality]
     # Provider input limits and cache-safe preprocessing metadata.

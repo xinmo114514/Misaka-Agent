@@ -70,6 +70,9 @@ class SessionSpec:
     # Optional one-call catalog snapshot shared with Research's assignment validator.
     sister_catalog: tuple[dict[str, Any], ...] | None = None
     research_context: bool = False
+    # The desktop's independent root is research-scoped but still owns /research.
+    # Workflow-internal node sessions remain controller-free.
+    research_host: bool = False
     # Settings this session runs with instead of the global ones, as ``(key, value)`` pairs
     # (``misaka.core.session_overrides``): a research run's compaction threshold and output limit.
     overrides: tuple[tuple[str, Any], ...] = ()
@@ -261,7 +264,7 @@ def spec_overrides(overrides) -> tuple[tuple[str, Any], ...]:
 
 
 def role_session_setup(profile_dir, workspace, *, model=None, receive_messages=False,
-                       receive_notifications=None, research_context=False, startup_skills=(), overrides=None):
+                       receive_notifications=None, research_context=False, research_host=False, startup_skills=(), overrides=None):
     """One role session entry, independent of terminal, root/fork and lifetime.
 
     Callers add only their transport/session-selection flags. Research changes the
@@ -280,7 +283,8 @@ def role_session_setup(profile_dir, workspace, *, model=None, receive_messages=F
     assembly = assemble(SessionSpec(
         profile_dir=profile_dir, role=role, workspace=workspace, kind="foreground",
         sender=sender, mcp_role=sender, receive_messages=receive_messages,
-        receive_notifications=receive_notifications, research_context=research_context, startup_skills=tuple(startup_skills),
+        receive_notifications=receive_notifications, research_context=research_context, research_host=research_host,
+        startup_skills=tuple(startup_skills),
         overrides=spec_overrides(overrides)))
     from misaka.config import env as env_file
 

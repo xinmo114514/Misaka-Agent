@@ -1,108 +1,164 @@
-import React, { useEffect, useRef, useState, useCallback, useMemo } from 'react'
-import { ArrowDown, MessageSquare } from 'lucide-react'
+import React, { useLayoutEffect, useRef, useState, useCallback } from 'react'
+import { ArrowDown, Loader2 } from 'lucide-react'
+import { MisakaLogo } from '../MisakaLogo'
+import { observeElementRect, useVirtualizer } from '@tanstack/react-virtual'
 import { useSessionStore } from '../../store/useSessionStore'
+import { messageHeights, readPosition, savePosition } from '../../lib/sessionViewState'
 import { MessageItem } from './MessageItem'
 
+const LANDMARKS = '.conversation-markdown > *, .conversation-group-toggle, .conversation-row-toggle, .conversation-tool-details pre, .conversation-thinking-content, .conversation-user-message, [data-custom-type]'
+const ESTIMATED_HEIGHT = 320
+
 export const Timeline: React.FC = () => {
-  const messages = useSessionStore((s) => s.messages)
-  const isStreaming = useSessionStore((s) => s.isStreaming)
+  const path = useSessionStore(s => s.agentMode === 'research' && s.researchBinding ? s.researchBinding.sessionFile : s.currentSessionPath)
+  return <TimelineContent key={path ?? 'new-session'} path={path} />
+}
+
+function TimelineContent({ path }: { path: string | null }) {
+  const messages = useSessionStore(s => s.agentMode === 'research' && s.researchBinding ? s.researchConversation.messages : s.messages)
+  const loading = useSessionStore(s => s.isSessionLoading)
+  const loadError = useSessionStore(s => s.sessionLoadError)
+  const retry = useSessionStore(s => s.retrySessionLoad)
   const scrollRef = useRef<HTMLDivElement>(null)
-  const [showScrollBottom, setShowScrollBottom] = useState(false)
-  const isAtBottomRef = useRef(true)
+  const contentRef = useRef<HTMLDivElement>(null)
+  const saved = useRef(path ? readPosition(path) : undefined)
+  const heights = useRef(path ? messageHeights(path) : new Map<string, number>())
+  const following = useRef(saved.current?.following ?? true)
+  const [showScrollBottom, setShowScrollBottom] = useState(!following.current)
+  const anchor = useRef<{ element: HTMLElement; offset: number } | null>(null)
+  const restoring = useRef(saved.current?.anchor)
+  const autoScroll = useRef(false)
+  const scrollFrame = useRef<number | null>(null)
+  const virtual = messages.length > 40
+  const getKey = useCallback((index: number) => messages[index].id, [messages])
+  const estimateSize = useCallback((index: number) => heights.current.get(messages[index].id) ?? ESTIMATED_HEIGHT, [messages])
+  const virtualizer = useVirtualizer({
+    count: messages.length,
+    getScrollElement: () => scrollRef.current,
+    getItemKey: getKey,
+    estimateSize,
+    enabled: virtual,
+    overscan: 6,
+    initialRect: { width: 840, height: 720 },
+    initialOffset: () => saved.current?.scrollTop ?? Math.max(0, messages.length * ESTIMATED_HEIGHT - 560),
+    observeElementRect: (instance, callback) => observeElementRect(instance, rect => callback({ width: rect.width || 840, height: rect.height || 720 })),
+    measureElement: (element, entry) => {
+      const size = entry?.borderBoxSize?.[0]?.blockSize || element.getBoundingClientRect().height || ESTIMATED_HEIGHT
+      const id = element.getAttribute('data-message-anchor')
+      if (id) {
+        heights.current.set(id, size)
+        while (heights.current.size > 1000) heights.current.delete(heights.current.keys().next().value!)
+      }
+      return size
+    },
+  })
+  // Size corrections above the viewport preserve the reading offset. Changes
+  // inside a row are handled with its paragraph landmark below.
+  virtualizer.shouldAdjustScrollPositionOnItemSizeChange = (item, _delta, instance) => !following.current && item.end < (instance.scrollOffset ?? 0)
 
-  // ZCode battle-tested pattern: split live tail from historical turns
-  // Prevents ResizeObserver 1-frame latency scroll jitter during high-speed token streaming
-  const { historicalMessages, liveMessage } = useMemo(() => {
-    const isLastLive =
-      isStreaming &&
-      messages.length > 0 &&
-      messages[messages.length - 1].role === 'assistant'
+  const rememberAnchor = useCallback(() => {
+    const viewport = scrollRef.current
+    if (!viewport) return
+    const top = viewport.getBoundingClientRect().top
+    // Only mounted visible/overscan rows are inspected, never the entire history.
+    const elements = contentRef.current?.querySelectorAll<HTMLElement>(LANDMARKS) || []
+    const visible = Array.from(elements).find(element => element.getBoundingClientRect().bottom > top)
+    anchor.current = visible ? { element: visible, offset: visible.getBoundingClientRect().top - top } : null
+    if (path) {
+      const row = visible?.closest<HTMLElement>('[data-message-anchor]')
+      savePosition(path, { scrollTop: viewport.scrollTop, following: following.current,
+        anchor: row && visible ? { messageId: row.dataset.messageAnchor!, landmark: Array.from(row.querySelectorAll(LANDMARKS)).indexOf(visible), offset: anchor.current!.offset } : undefined })
+    }
+  }, [path])
 
-    if (isLastLive) {
-      return {
-        historicalMessages: messages.slice(0, -1),
-        liveMessage: messages[messages.length - 1],
+  const toBottom = useCallback(() => {
+    const viewport = scrollRef.current
+    if (!viewport) return
+    autoScroll.current = virtual
+    viewport.scrollTop = viewport.scrollHeight
+    if (scrollFrame.current !== null) cancelAnimationFrame(scrollFrame.current)
+    scrollFrame.current = requestAnimationFrame(() => { autoScroll.current = false; scrollFrame.current = null })
+  }, [virtual])
+
+  const reconcile = useCallback(() => {
+    const viewport = scrollRef.current
+    if (!viewport) return
+    if (following.current) toBottom()
+    else {
+      if (restoring.current) {
+        const row = Array.from(contentRef.current?.querySelectorAll<HTMLElement>('[data-message-anchor]') ?? [])
+          .find(element => element.dataset.messageAnchor === restoring.current!.messageId)
+        const landmark = row?.querySelectorAll<HTMLElement>(LANDMARKS)[restoring.current.landmark]
+        if (landmark) {
+          viewport.scrollTop += landmark.getBoundingClientRect().top - viewport.getBoundingClientRect().top - restoring.current.offset
+          restoring.current = undefined
+        }
+      } else if (anchor.current?.element.isConnected) {
+        const current = anchor.current.element.getBoundingClientRect().top - viewport.getBoundingClientRect().top
+        const delta = current - anchor.current.offset
+        if (Math.abs(delta) > 0.5) viewport.scrollTop += delta
       }
     }
-    return {
-      historicalMessages: messages,
-      liveMessage: null,
-    }
-  }, [messages, isStreaming])
+    rememberAnchor()
+  }, [rememberAnchor, toBottom])
 
   const handleScroll = useCallback(() => {
-    if (!scrollRef.current) return
-    const { scrollTop, scrollHeight, clientHeight } = scrollRef.current
-    const distanceToBottom = scrollHeight - scrollTop - clientHeight
-    const atBottom = distanceToBottom < 80
-    isAtBottomRef.current = atBottom
+    const viewport = scrollRef.current
+    if (!viewport || autoScroll.current) return
+    const atBottom = viewport.scrollHeight - viewport.scrollTop - viewport.clientHeight <= 32
+    following.current = atBottom
     setShowScrollBottom(!atBottom)
-  }, [])
+    restoring.current = undefined
+    rememberAnchor()
+  }, [rememberAnchor])
 
-  const scrollToBottom = (smooth = true) => {
-    if (!scrollRef.current) return
-    scrollRef.current.scrollTo({
-      top: scrollRef.current.scrollHeight,
-      behavior: smooth ? 'smooth' : 'auto',
-    })
-    isAtBottomRef.current = true
+  const scrollToBottom = useCallback(() => {
+    following.current = true
+    restoring.current = undefined
     setShowScrollBottom(false)
-  }
+    toBottom()
+    rememberAnchor()
+  }, [toBottom, rememberAnchor])
 
-  // Smooth stick-to-bottom on new streaming tokens
-  useEffect(() => {
-    if (isAtBottomRef.current) {
-      scrollToBottom(false)
-    }
-  }, [messages, liveMessage?.content, liveMessage?.thinking])
+  useLayoutEffect(() => {
+    if (!following.current && saved.current && scrollRef.current) scrollRef.current.scrollTop = saved.current.scrollTop
+    return () => { if (scrollFrame.current !== null) cancelAnimationFrame(scrollFrame.current) }
+  }, [])
+  useLayoutEffect(reconcile, [messages, reconcile])
+  useLayoutEffect(() => {
+    const content = contentRef.current
+    const viewport = scrollRef.current
+    if (!content || !viewport || typeof ResizeObserver === 'undefined') return
+    const observer = new ResizeObserver(reconcile)
+    observer.observe(content)
+    observer.observe(viewport)
+    const host = viewport.closest<HTMLElement>('[data-conversation-viewport]')
+    if (host) observer.observe(host)
+    return () => observer.disconnect()
+  }, [reconcile])
 
-  return (
-    <div className="relative flex-1 h-full overflow-hidden flex flex-col">
-      <div
-        ref={scrollRef}
-        onScroll={handleScroll}
-        className="flex-1 overflow-y-auto px-6 sm:px-12 md:px-20 lg:px-28 py-6 space-y-4"
-      >
-        {messages.length === 0 ? (
-          <div className="h-full flex flex-col items-center justify-center text-muted gap-3 select-none">
-            <div className="w-12 h-12 rounded-xl bg-card border border-border-subtle flex items-center justify-center text-dim shadow-e2">
-              <MessageSquare className="w-6 h-6 text-rose-lite" />
-            </div>
-            <p className="text-sm font-medium text-text-main">开始新的研究对话</p>
-            <p className="text-xs text-dim">在下方输入框中提出问题或课题，Misaka 将开始研究。</p>
-          </div>
-        ) : (
-          <>
-            {/* Historical turns */}
-            <div className="space-y-4">
-              {historicalMessages.map((msg) => (
-                <MessageItem key={msg.id} message={msg} />
-              ))}
-            </div>
-
-            {/* Live Tail: normal document flow, 0 scroll jitter */}
-            {liveMessage && (
-              <div className="live-tail pt-1">
-                <MessageItem message={liveMessage} />
-              </div>
-            )}
-          </>
-        )}
-
-        {/* Bottom padding so content is not obscured by floating composer */}
-        <div className="h-28" />
+  return <div className="conversation-timeline">
+    {(loading || loadError) && <div className="conversation-load-status" role="status">
+      {loading && <Loader2 className="w-3.5 h-3.5 animate-spin" />}
+      <span>{loadError || (messages.length ? '历史已显示，正在准备会话…' : '正在读取会话历史…')}</span>
+      {loadError && <button type="button" onClick={retry}>重试</button>}
+    </div>}
+    <div ref={scrollRef} onScroll={handleScroll} onWheel={() => { autoScroll.current = false }} onTouchStart={() => { autoScroll.current = false }} onClickCapture={rememberAnchor} className="conversation-scroll" aria-label="对话记录">
+      <div ref={contentRef} className="conversation-content">
+        {messages.length === 0 ? <div className="conversation-empty text-muted">
+          <div className="conversation-empty-icon">{loading ? <Loader2 className="w-6 h-6 text-rose-lite animate-spin" /> : <MisakaLogo size={26} />}</div>
+          <p className="text-sm font-medium text-text-main">{loading ? '正在加载对话' : loadError ? '会话尚未就绪' : '开始新的研究对话'}</p>
+          <p className="text-xs text-dim">{loading || loadError ? '你可以先在下方写草稿，准备完成后再发送。' : '在下方输入框中提出问题或课题，Misaka 将开始研究。'}</p>
+        </div> : virtual ? <div className="conversation-virtual-content" style={{ height: virtualizer.getTotalSize() }}>
+          {virtualizer.getVirtualItems().map(item => <div key={item.key} ref={virtualizer.measureElement} data-index={item.index} data-message-anchor={messages[item.index].id} className="conversation-virtual-row" style={{ transform: `translateY(${item.start}px)` }}>
+            <MessageItem message={messages[item.index]} />
+          </div>)}
+        </div> : messages.map(message => <div key={message.id} data-message-anchor={message.id}><MessageItem message={message} /></div>)}
+        <div className="conversation-composer-spacer" aria-hidden="true" />
       </div>
-
-      {/* Floating Stick-to-bottom Button */}
-      {showScrollBottom && (
-        <button
-          onClick={() => scrollToBottom(true)}
-          className="absolute right-8 bottom-32 flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-card border border-border-subtle text-xs text-text-main shadow-e2 hover:shadow-e3 transition-all hover:scale-105 cursor-pointer z-20"
-        >
-          <ArrowDown className="w-3.5 h-3.5 text-accent" />
-          <span>回到底部</span>
-        </button>
-      )}
     </div>
-  )
+    {showScrollBottom && <button type="button" onClick={scrollToBottom} className="conversation-jump-bottom">
+      <ArrowDown className="w-3.5 h-3.5 text-accent" /><span>回到底部</span>
+    </button>}
+  </div>
 }

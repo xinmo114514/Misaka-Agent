@@ -9,14 +9,14 @@ import { Boxes, Sparkles } from 'lucide-react'
  * is recognizable at a glance in the navigation rail.
  */
 const BRAND_STYLE: Record<string, { monogram: string; hue: string }> = {
-  zhipu: { monogram: '智', hue: '#3b6ea5' },
-  deepseek: { monogram: 'DS', hue: '#4d6bfe' },
-  anthropic: { monogram: 'C', hue: '#d97757' },
-  openai: { monogram: 'O', hue: '#10a37f' },
-  kimi: { monogram: 'K', hue: '#7a5af8' },
-  xiaomi: { monogram: '米', hue: '#ff6900' },
-  qwen: { monogram: '通', hue: '#615ced' },
-  custom: { monogram: '', hue: '#8a8f98' },
+  zhipu: { monogram: '智', hue: 'var(--brand-zhipu)' },
+  deepseek: { monogram: 'DS', hue: 'var(--brand-deepseek)' },
+  anthropic: { monogram: 'C', hue: 'var(--brand-anthropic)' },
+  openai: { monogram: 'O', hue: 'var(--brand-openai)' },
+  kimi: { monogram: 'K', hue: 'var(--brand-kimi)' },
+  xiaomi: { monogram: '米', hue: 'var(--brand-xiaomi)' },
+  qwen: { monogram: '通', hue: 'var(--brand-qwen)' },
+  custom: { monogram: '', hue: 'var(--brand-custom)' },
 }
 
 interface BrandLogoProps {
@@ -32,7 +32,7 @@ export const BrandLogo: React.FC<BrandLogoProps> = ({ brandId, size = 32, classN
   if (brandId === 'custom') {
     return (
       <span
-        className={`flex shrink-0 items-center justify-center rounded-lg border border-border-subtle bg-surface-2 text-dim ${className}`}
+        className={`flex shrink-0 items-center justify-center rounded-lg border border-border-subtle bg-surface-2 text-brand-custom ${className}`}
         style={{ width: dimension, height: dimension }}
         aria-hidden="true"
       >

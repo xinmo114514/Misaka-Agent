@@ -1,0 +1,196 @@
+/* Explicitly opted-in shells only. Reading surfaces and graph nodes remain solid.
+   Material parameters are independent of theme IDs; all inks come from theme roles. */
+:root {
+  --glass-chrome-opacity: 84%;
+  --glass-panel-opacity: 82%;
+  --glass-popover-opacity: 90%;
+}
+
+html[data-theme-mode="light"] {
+  --glass-chrome-opacity: 90%;
+  --glass-panel-opacity: 88%;
+  --glass-popover-opacity: 94%;
+}
+
+.misaka-glass-chrome {
+  --glass-base: var(--surface-0);
+  --glass-opacity: var(--glass-chrome-opacity);
+  --glass-blur: 16px;
+  --glass-reflection: radial-gradient(ellipse 70vw 180px at 18vw -10px, color-mix(in srgb, var(--accent) 6%, transparent), transparent 80%);
+  --glass-edge: transparent;
+  --glass-glint: transparent;
+  --glass-shadow: 0 0 0 transparent;
+}
+
+.misaka-glass-panel {
+  --glass-base: var(--surface-1);
+  --glass-opacity: var(--glass-panel-opacity);
+  --glass-blur: 20px;
+  --glass-reflection:
+    radial-gradient(ellipse 110% 190% at 32% -115%, color-mix(in srgb, var(--glass-highlight) 32%, transparent), transparent 80%),
+    radial-gradient(ellipse 120% 180% at 0% -50%, color-mix(in srgb, var(--accent) 6%, transparent), transparent 85%);
+  --glass-edge: color-mix(in srgb, var(--glass-highlight) 22%, transparent);
+  --glass-glint: color-mix(in srgb, var(--glass-highlight) 26%, transparent);
+  --glass-shadow:
+    0 2px 5px color-mix(in srgb, var(--shadow-ink) 9%, transparent),
+    0 12px 30px -16px color-mix(in srgb, var(--shadow-ink) 20%, transparent);
+}
+
+.misaka-glass-popover {
+  --glass-base: var(--surface-1);
+  --glass-opacity: var(--glass-popover-opacity);
+  --glass-blur: 24px;
+  --glass-reflection:
+    linear-gradient(160deg, color-mix(in srgb, var(--glass-highlight) 34%, transparent), transparent 46%),
+    radial-gradient(ellipse at 0% 0%, color-mix(in srgb, var(--accent) 6%, transparent), transparent 65%);
+  --glass-edge: color-mix(in srgb, var(--glass-highlight) 65%, transparent);
+  --glass-glint: color-mix(in srgb, var(--glass-highlight) 65%, transparent);
+  --glass-shadow:
+    0 3px 8px color-mix(in srgb, var(--shadow-ink) 12%, transparent),
+    0 20px 44px -18px color-mix(in srgb, var(--shadow-ink) 32%, transparent);
+}
+
+/* Two classes keep the composer consistent in welcome and timeline states. */
+.misaka-glass-chrome,
+.misaka-glass-panel,
+.misaka-glass-popover,
+.conversation-composer.misaka-glass-panel {
+  background-color: var(--glass-base);
+  background-image: var(--glass-reflection);
+  border-color: color-mix(in srgb, var(--border-subtle) 65%, transparent);
+  box-shadow:
+    var(--glass-shadow),
+    inset 0 1px 0 var(--glass-edge),
+    inset 0 -1px 0 color-mix(in srgb, var(--border-subtle) 24%, transparent);
+  transition: background-color 180ms ease, border-color 180ms ease, box-shadow 180ms ease;
+}
+
+/* A one-pixel reflection follows the shell, not the cursor. Shells retain their
+   existing relative/absolute/fixed positioning and overflow behavior. */
+.misaka-glass-chrome::before,
+.misaka-glass-panel::before,
+.misaka-glass-popover::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 12px;
+  right: 12px;
+  height: 1px;
+  border-radius: inherit;
+  background: linear-gradient(90deg, transparent, var(--glass-glint) 24%, var(--glass-glint) 58%, transparent);
+  pointer-events: none;
+}
+
+/* The opaque declaration above is the default for platforms without blur. */
+@supports (backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px)) {
+  .misaka-glass-chrome,
+  .misaka-glass-panel,
+  .misaka-glass-popover,
+  .conversation-composer.misaka-glass-panel {
+    background-color: color-mix(in srgb, var(--glass-base) var(--glass-opacity), transparent);
+    -webkit-backdrop-filter: blur(var(--glass-blur));
+    backdrop-filter: blur(var(--glass-blur));
+  }
+}
+
+/* Permanent chrome shares one viewport-anchored light source. No repeated bright
+   top/bottom strips or floating-card shadows at each header/rail boundary. */
+.misaka-glass-chrome {
+  background-attachment: fixed;
+  background-size: 100vw 220px;
+  background-position: left top;
+  background-repeat: no-repeat;
+  border-color: color-mix(in srgb, var(--border-subtle) 32%, transparent);
+  box-shadow: none;
+}
+
+.misaka-glass-chrome::before {
+  content: none;
+}
+
+.misaka-glass-chrome > .border-b {
+  border-bottom-color: color-mix(in srgb, var(--border-subtle) 32%, transparent);
+}
+
+/* Retain visible glass on floating surfaces, rather than drawing every shell alike. */
+.misaka-glass-popover {
+  border-color: color-mix(in srgb, var(--border-subtle) 88%, var(--accent) 12%);
+}
+
+/* Diffuse light on the input follows the reading canvas instead of a diagonal beam. */
+.conversation-composer.misaka-glass-panel {
+  --glass-base: color-mix(in srgb, var(--surface-0) 24%, var(--surface-1));
+  border-color: color-mix(in srgb, var(--border-subtle) 48%, transparent);
+}
+
+/* White-mode canvas and panel already match; retain its exact opaque fallback. */
+html[data-theme-mode="light"] .conversation-composer.misaka-glass-panel {
+  --glass-base: var(--surface-1);
+}
+
+.conversation-composer-dock:not(.conversation-composer-dock--welcome) {
+  isolation: isolate;
+}
+
+/* A non-interactive fade joins the floating input and reading pane without a hard
+   footer rectangle; the existing composer spacer keeps the last message readable. */
+.conversation-composer-dock:not(.conversation-composer-dock--welcome)::before {
+  content: '';
+  position: absolute;
+  inset: -40px 0 -24px;
+  z-index: -1;
+  background: linear-gradient(180deg, transparent, color-mix(in srgb, var(--surface-0) 60%, transparent) 38%, var(--surface-0) 84%);
+  pointer-events: none;
+}
+
+/* Nested settings groups use solid content surfaces rather than stacking blur. */
+.misaka-glass-panel .misaka-glass-panel {
+  background-color: var(--surface-1);
+  background-image: none;
+  -webkit-backdrop-filter: none;
+  backdrop-filter: none;
+}
+
+.conversation-composer.misaka-glass-panel:focus-within {
+  border-color: var(--border-accent);
+  box-shadow:
+    var(--glass-shadow),
+    inset 0 1px 0 var(--glass-edge),
+    0 0 0 1px color-mix(in srgb, var(--focus-ring) 25%, transparent),
+    0 8px 28px -14px color-mix(in srgb, var(--accent) 30%, transparent);
+}
+
+.misaka-luminous,
+.conversation-welcome-card .conversation-send-button.misaka-luminous {
+  box-shadow:
+    inset 0 1px 0 var(--glass-highlight),
+    0 4px 14px -8px color-mix(in srgb, var(--accent) 32%, transparent);
+  transition: border-color 180ms ease, box-shadow 180ms ease, opacity 180ms ease;
+}
+
+.misaka-luminous:not(:disabled):hover,
+.misaka-luminous:not(:disabled):focus-visible,
+.conversation-welcome-card .conversation-send-button.misaka-luminous:not(:disabled):hover,
+.conversation-welcome-card .conversation-send-button.misaka-luminous:not(:disabled):focus-visible {
+  box-shadow:
+    inset 0 1px 0 var(--glass-highlight),
+    0 5px 20px -8px color-mix(in srgb, var(--accent) 48%, transparent),
+    0 0 0 1px color-mix(in srgb, var(--focus-ring) 24%, transparent);
+}
+
+/* A glow is decoration, not a substitute for a distinct keyboard focus ring. */
+.misaka-luminous:not(:disabled):focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 3px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .misaka-glass-chrome,
+  .misaka-glass-panel,
+  .misaka-glass-popover,
+  .conversation-composer.misaka-glass-panel,
+  .misaka-luminous,
+  .conversation-welcome-card .conversation-send-button.misaka-luminous {
+    transition: none !important;
+  }
+}

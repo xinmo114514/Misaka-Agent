@@ -39,6 +39,7 @@ class Args:
     fork: str | None = None
     sessionDir: str | None = None
     cwd: str | None = None
+    researchContext: bool = False
     models: list[str] | None = None
     tools: list[str] | None = None
     agents: str | None = None
@@ -456,6 +457,8 @@ def add_desktop_bridge_subparser(sub: Any) -> Any:
     db.add_argument("--model", help="Model to use (provider/model)")
     db.add_argument("--theme", help="Theme name or path")
     db.add_argument("--no-session", action="store_true", help="Run ephemeral session without saving to disk")
+    db.add_argument("--research-context", action="store_true",
+                    help="Open an independent Last Order session with the persistent research workflow")
     return db
 
 

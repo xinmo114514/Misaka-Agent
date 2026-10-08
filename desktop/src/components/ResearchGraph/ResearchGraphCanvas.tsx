@@ -14,33 +14,22 @@ import '@xyflow/react/dist/style.css'
 import { Network, RefreshCw } from 'lucide-react'
 import { ResearchNodeComponent } from './ResearchNodeComponent'
 import { NodeDetailDrawer } from './NodeDetailDrawer'
-import { useThemeTokens, withAlpha } from '../../theme/useThemeTokens'
+import { useThemeTokens } from '../../theme/useThemeTokens'
 import { useSessionStore } from '../../store/useSessionStore'
-import type { ResearchGraphNode, ResearchGraphPayload, ResearchNodeData, ResearchNodeStatus } from '../../types/research'
+import { researchNodeLabel } from '../../lib/researchStatus'
+import type { ResearchGraphNode, ResearchGraphPayload, ResearchNodeData } from '../../types/research'
 
 const POLL_INTERVAL_MS = 4000
 
 /** Node status → the four visual states the card understands. Anything transient is "running",
  *  the terminal trio keeps its own state, and everything not yet started reads as pending. */
-function mapStatus(status: string): ResearchNodeStatus {
-  switch (status) {
-    case 'closed':
-      return 'done'
-    case 'failed':
-      return 'failed'
-    case 'parked':
-    case 'queued':
-      return 'pending'
-    default:
-      // planning, executing, synthesizing, critiquing, diverging, deciding, filling_gaps,
-      // disposing, waiting_input, awaiting_approval — all "working".
-      return 'running'
-  }
+function isActiveNode(status: string): boolean {
+  return !['closed', 'failed', 'parked', 'queued'].includes(status)
 }
 
 // Mirrors the themed chart palette (1/4/5/2/6) plus danger, so avatars follow the active
 // theme. var() inside an inline background-color resolves at paint time, so this needs no
-// JS re-read on a theme switch — and nothing feeds these into withAlpha(), which needs hex.
+// JS re-read on a theme switch.
 const AVATAR_COLORS = [
   'var(--chart-1)',
   'var(--chart-4)',
@@ -72,7 +61,7 @@ function toNodeData(node: ResearchGraphNode): ResearchNodeData {
       role: redTeam ? '红队复审' : node.kind === 'root' ? '研究统筹' : node.kind === 'join' ? '汇合节点' : '研究分支',
       avatarBg: avatarFor(assigneeId),
     },
-    status: mapStatus(node.status),
+    status: node.status,
     depth: node.depth,
     summary: node.dissolves?.grounds || '',
     evidence: cards.map((c) => c.title).filter(Boolean),
@@ -104,17 +93,16 @@ function layoutNodes(nodes: ResearchGraphNode[]): Node<ResearchNodeData>[] {
 }
 
 interface EdgePalette {
-  accent: string
-  border: string
-  borderStrong: string
+  active: string
+  strong: string
 }
 
 function buildEdges(nodes: ResearchGraphNode[], palette: EdgePalette): Edge[] {
   const edges: Edge[] = []
   for (const node of nodes) {
     for (const parent of node.parents || []) {
-      const active = mapStatus(node.status) === 'running'
-      const color = active ? palette.accent : palette.borderStrong
+      const active = isActiveNode(node.status)
+      const color = active ? palette.active : palette.strong
       edges.push({
         id: `e-${parent}-${node.id}`,
         source: parent,
@@ -128,7 +116,15 @@ function buildEdges(nodes: ResearchGraphNode[], palette: EdgePalette): Edge[] {
   return edges
 }
 
-export const ResearchGraphCanvas: React.FC = () => {
+interface ResearchGraphCanvasProps {
+  showRunPicker?: boolean
+  showNodeDrawer?: boolean
+  onSelectNode?: (node: ResearchGraphNode) => void
+}
+
+export const ResearchGraphCanvas: React.FC<ResearchGraphCanvasProps> = ({
+  showRunPicker = true, showNodeDrawer = true, onSelectNode,
+}) => {
   const tokens = useThemeTokens()
   const researchGraph = useSessionStore((s) => s.researchGraph)
   const researchRuns = useSessionStore((s) => s.researchRuns)
@@ -158,9 +154,9 @@ export const ResearchGraphCanvas: React.FC = () => {
   }, [researchGraph])
 
   const themedEdges = useMemo(
-    () => buildEdges(graphNodes, { accent: tokens.accent, border: tokens.border, borderStrong: tokens.borderStrong }),
+    () => buildEdges(graphNodes, { active: tokens.graphEdgeActive, strong: tokens.graphEdgeStrong }),
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [researchGraph, tokens.accent, tokens.border, tokens.borderStrong],
+    [researchGraph, tokens.graphEdgeActive, tokens.graphEdgeStrong],
   )
   const [edges, setEdges, onEdgesChange] = useEdgesState<Edge>(themedEdges)
   useEffect(() => setEdges(themedEdges), [themedEdges, setEdges])
@@ -169,14 +165,16 @@ export const ResearchGraphCanvas: React.FC = () => {
 
   const onNodeClick = useCallback((_event: React.MouseEvent, node: Node) => {
     setSelectedNode(node.data as ResearchNodeData)
-  }, [])
+    const selected = graphNodes.find(item => item.id === node.id)
+    if (selected) onSelectNode?.(selected)
+  }, [graphNodes, onSelectNode])
 
   const hasRun = Boolean(researchGraph && graphNodes.length > 0)
 
   return (
     <div className="relative flex-1 h-full w-full overflow-hidden select-none">
       {/* Run picker */}
-      {researchRuns.length > 0 && (
+      {showRunPicker && researchRuns.length > 0 && (
         <div className="absolute top-3 left-3 z-20 flex items-center gap-2">
           <select
             value={researchRunId || ''}
@@ -185,7 +183,7 @@ export const ResearchGraphCanvas: React.FC = () => {
           >
             {researchRuns.map((run) => (
               <option key={run.id} value={run.id}>
-                {run.status} · {run.question || run.id}
+                {researchNodeLabel(run.phase || run.status)} · {run.question || run.id}
               </option>
             ))}
           </select>
@@ -202,6 +200,7 @@ export const ResearchGraphCanvas: React.FC = () => {
 
       {hasRun ? (
         <ReactFlow
+          className="misaka-research-graph"
           nodes={nodes}
           edges={edges}
           nodeTypes={nodeTypes}
@@ -213,18 +212,20 @@ export const ResearchGraphCanvas: React.FC = () => {
           maxZoom={1.8}
           proOptions={{ hideAttribution: true }}
         >
-          <Background color={tokens.border} gap={20} size={1} />
-          <Controls className="!bg-card !border-border-subtle !rounded-lg !shadow-e2 [&>button]:!bg-surface-2 [&>button]:!border-border-subtle [&>button]:!text-text-main hover:[&>button]:!bg-surface-3" />
+          <Background color={tokens.graphGrid} gap={20} size={1} />
+          <Controls className="!bg-graph-control-surface !border-graph-control-border !rounded-lg !shadow-e2" />
           <MiniMap
-            className="!bg-card !border-border-subtle !rounded-lg"
+            className="!bg-graph-minimap-background !border-graph-control-border !rounded-lg"
             nodeColor={(n) => {
               const data = n.data as ResearchNodeData
-              if (data?.status === 'done') return tokens.success
-              if (data?.status === 'running') return tokens.warning
+              if (data?.status === 'closed') return tokens.success
               if (data?.status === 'failed') return tokens.danger
-              return tokens.borderStrong
+              if (['critique', 'critiquing', 'diverging', 'divergence'].includes(data?.status)) return tokens.danger
+              if (!['queued', 'parked'].includes(data?.status)) return tokens.warning
+              return tokens.graphEdgeStrong
             }}
-            maskColor={withAlpha(tokens.surface0, 0.7)}
+            nodeStrokeColor="transparent"
+            maskColor={tokens.graphMinimapMask}
           />
         </ReactFlow>
       ) : (
@@ -241,7 +242,7 @@ export const ResearchGraphCanvas: React.FC = () => {
       )}
 
       {/* Slide-in Node Details Drawer (read-only) */}
-      <NodeDetailDrawer node={selectedNode} onClose={() => setSelectedNode(null)} />
+      {showNodeDrawer && <NodeDetailDrawer node={selectedNode} onClose={() => setSelectedNode(null)} />}
     </div>
   )
 }

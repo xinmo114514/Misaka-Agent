@@ -2,6 +2,7 @@ import React from 'react'
 import { Handle, Position, type NodeProps, type Node } from '@xyflow/react'
 import { CheckCircle2, Loader2, ShieldAlert, Clock, GitMerge, Sparkles, XCircle, FileText } from 'lucide-react'
 import type { ResearchNodeData } from '../../types/research'
+import { researchNodeLabel } from '../../lib/researchStatus'
 
 export const ResearchNodeComponent: React.FC<NodeProps<Node<ResearchNodeData>>> = ({
   data,
@@ -9,10 +10,11 @@ export const ResearchNodeComponent: React.FC<NodeProps<Node<ResearchNodeData>>> 
 }) => {
   const isRoot = data.kind === 'root'
   const isJoin = data.kind === 'join'
-  const isRunning = data.status === 'running'
-  const isReview = data.status === 'review'
-  const isDone = data.status === 'done'
+  const isReview = ['critique', 'critiquing', 'diverging', 'divergence', 'divergence_review', 'red_team_review'].includes(data.status)
+  const isDone = data.status === 'closed' || data.status === 'done'
   const isFailed = data.status === 'failed'
+  const isWaiting = ['parked', 'queued', 'planning', 'awaiting_approval', 'waiting_input', 'stopped'].includes(data.status)
+  const isRunning = !isDone && !isFailed && !isReview && !isWaiting
   const evidenceCount = data.evidence?.length || 0
 
   return (
@@ -37,7 +39,7 @@ export const ResearchNodeComponent: React.FC<NodeProps<Node<ResearchNodeData>>> 
         {/* Assignee Badge */}
         <div className="flex items-center gap-1.5 font-medium text-text-main">
           <div
-            className="w-5 h-5 rounded-full flex items-center justify-center text-[10px] font-bold text-white shrink-0"
+            className="w-5 h-5 rounded-full flex items-center justify-center text-[10px] font-bold text-on-chart shrink-0"
             style={{ backgroundColor: data.assignee.avatarBg || 'var(--accent)' }}
           >
             {data.assignee.id === 'lo' ? 'LO' : data.assignee.id.slice(-2)}
@@ -55,12 +57,12 @@ export const ResearchNodeComponent: React.FC<NodeProps<Node<ResearchNodeData>>> 
           ) : isRunning ? (
             <span className="flex items-center gap-1 px-2 py-0.5 rounded text-[10.5px] font-medium bg-warning-surface text-warning border border-warning-border animate-pulse">
               <Loader2 className="w-3 h-3 animate-spin" />
-              <span>研究中</span>
+              <span>{researchNodeLabel(data.status)}</span>
             </span>
           ) : isReview ? (
             <span className="flex items-center gap-1 px-2 py-0.5 rounded text-[10.5px] font-medium bg-danger-surface text-danger border border-danger-border">
               <ShieldAlert className="w-3 h-3" />
-              <span>红队审阅</span>
+              <span>{researchNodeLabel(data.status)}</span>
             </span>
           ) : isFailed ? (
             <span className="flex items-center gap-1 px-2 py-0.5 rounded text-[10.5px] font-medium bg-danger-surface text-danger border border-danger-border">
@@ -70,7 +72,7 @@ export const ResearchNodeComponent: React.FC<NodeProps<Node<ResearchNodeData>>> 
           ) : (
             <span className="flex items-center gap-1 px-2 py-0.5 rounded text-[10.5px] font-medium bg-surface-3 text-dim border border-border-subtle">
               <Clock className="w-3 h-3" />
-              <span>待启动</span>
+              <span>{researchNodeLabel(data.status)}</span>
             </span>
           )}
         </div>
