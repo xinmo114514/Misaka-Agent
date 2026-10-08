@@ -27,12 +27,13 @@ async def _off_loop(work, *args, signal=None, must_finish=False):
 def register(harn, *, kind: str, workspace: str):
     """Register the original tool surface and adapt MISAKA lifecycle events."""
 
-    from .nous import flow
-    harn.registerProvider('nous', {'oauth': flow})
+    from .. import register_native_auth
+    register_native_auth(harn)
 
     def scoped(handler):
         async def run(event, ctx):
             return await handler(event, storage.context(ctx, workspace))
+        run.desktop_research_factory = register_native_auth
         return run
 
     def on(name, handler):

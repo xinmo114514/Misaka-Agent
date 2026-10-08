@@ -6,32 +6,25 @@ SDK compactor instead; normal desktop/TUI LCM factories and source are untouched
 """
 from __future__ import annotations
 
-LCM_PREFIX = 'misaka.extensions.misaka_lcm'
-LCM_DIAGNOSTIC = {
+AUXILIARY_DIAGNOSTIC = {
     'code': 'desktop_native_compaction',
     'message': 'This independent research root uses native SDK compaction on its selected team model. '
-               'Optional LCM model-backed/external auxiliary routes are omitted for this root and its workers; '
-               'ordinary desktop/TUI LCM settings and factories are unchanged.'}
-
-
-def is_lcm_factory(item):
-    return item.get('name') == 'misaka_lcm' or getattr(item.get('factory'), '__module__', '').startswith(LCM_PREFIX)
-
-
-def register_native_auth(harn):
-    # The optional extension also publishes a native OAuth implementation.
-    # Preserve that native registry/auth source, without its LCM callbacks/tools.
-    from misaka.extensions.misaka_lcm.host.nous import flow
-    harn.registerProvider('nous', {'oauth': flow})
+               'Optional external auxiliary model routes are omitted for this root and its workers; '
+               'ordinary desktop/TUI settings and factories are unchanged.'}
 
 
 def prepare_desktop_assembly(assembly):
-    """Call BEFORE open_session; only this caller-owned assembly is changed."""
-    factories = list(assembly.extension_factories)
-    if any(is_lcm_factory(item) for item in factories):
-        assembly._extension_factories = [item for item in factories if not is_lcm_factory(item)] + [
-            {'name': 'desktop-native-auth', 'factory': register_native_auth, 'hidden': True}]
-    assembly._desktop_runtime_diagnostics = [dict(LCM_DIAGNOSTIC)]
+    """Apply a factory's declared strict-model variant, without knowing its package."""
+    prepared = []
+    for item in assembly.extension_factories:
+        replacement = getattr(item.get('factory'), 'desktop_research_factory', None)
+        if callable(replacement):
+            prepared.append({**item, 'factory': replacement, 'hidden': True,
+                             'name': getattr(replacement, 'extension_name', item['name'])})
+        else:
+            prepared.append(item)
+    assembly._extension_factories = prepared
+    assembly._desktop_runtime_diagnostics = [dict(AUXILIARY_DIAGNOSTIC)]
     return assembly
 
 
@@ -60,22 +53,22 @@ def adapt_extension_factories(_owner, assembly):
     return prepare_desktop_assembly(assembly)
 
 
-def omit_live_lcm(session):
-    """Fallback for a caller that constructed an idle host before preparing it."""
+def omit_live_auxiliaries(session):
+    """Fallback for an idle host whose callbacks declare a strict-model variant."""
     runner = getattr(session, '_extensionRunner', None)
     if runner is None:
         return
-    def is_lcm(extension):
+    def external_auxiliary(extension):
         callbacks = [callback for group in extension.handlers.values() for callback in group]
-        return any(getattr(callback, '__module__', '').startswith(LCM_PREFIX) for callback in callbacks)
-    omitted = [extension for extension in runner.extensions if is_lcm(extension)]
+        return any(callable(getattr(callback, 'desktop_research_factory', None)) for callback in callbacks)
+    omitted = [extension for extension in runner.extensions if external_auxiliary(extension)]
     if not omitted:
         return
-    runner.extensions[:] = [extension for extension in runner.extensions if not is_lcm(extension)]
+    runner.extensions[:] = [extension for extension in runner.extensions if not external_auxiliary(extension)]
     loaded = session._resourceLoader.getExtensions().extensions
-    loaded[:] = [extension for extension in loaded if not is_lcm(extension)]
+    loaded[:] = [extension for extension in loaded if not external_auxiliary(extension)]
     session.refreshTools()
 
 
 def adapt_live_extensions(_owner, session):
-    omit_live_lcm(session)
+    omit_live_auxiliaries(session)

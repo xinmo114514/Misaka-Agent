@@ -31,7 +31,7 @@ def test_a_symlinked_store_is_read_and_written_through_the_link(tmp_path):
     assert storage.get("anthropic") == KEY
     storage.set("openai", {"type": "api_key", "key": "sk-other"})
 
-    assert link.is_symlink() and os.readlink(link) == str(real)
+    assert link.is_symlink() and os.path.samefile(os.readlink(link), real)
     assert json.loads(real.read_text(encoding="utf-8"))["openai"]["key"] == "sk-other"
     assert AuthStorage.create(str(link)).get("openai")["key"] == "sk-other"
 

@@ -526,7 +526,7 @@ def test_real_cli_browser_setup_and_explicit_install_flags(monkeypatch, isolated
     assert commands[0][-1] == 'agent-browser@0.26.0'
     assert commands[1][-1] == 'install'
     assert str(isolated) in commands[1][0]
-    assert commands[1][0].endswith('node_modules/.bin/agent-browser.cmd')
+    assert Path(commands[1][0]).as_posix().endswith('node_modules/.bin/agent-browser.cmd')
 
 
 async def test_camofox_managed_state_requires_reusable_identity(monkeypatch, isolated):

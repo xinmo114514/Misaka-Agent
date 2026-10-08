@@ -11,7 +11,7 @@ from pathlib import Path
 
 import pytest
 
-from tests import posix
+from tests import posix_test_support as posix
 
 
 def test_office_cache_does_not_bypass_private_material_guard(tmp_path):

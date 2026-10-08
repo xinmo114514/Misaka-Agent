@@ -503,25 +503,45 @@ async def test_publish_is_complete_when_name_becomes_visible(monkeypatch, tmp_pa
 
 
 async def test_overlapping_cache_writers_never_pair_body_with_other_metadata(monkeypatch):
-    entered, release = threading.Event(), threading.Event()
+    # Writer entry is an event, not a one-second filesystem speed requirement.
+    loop = asyncio.get_running_loop()
+    entered, second_started = asyncio.Event(), asyncio.Event()
+    release = threading.Event()
+    published = []
     original = cache.atomic.write_text
     def write(path, text, **kw):
         original(path, text, **kw)
-        # The first writer has published its data but has not yet published the index.
         if "body-A" in text:
-            entered.set()
-            assert release.wait(3)
+            published.append("A")
+            loop.call_soon_threadsafe(entered.set)
+            release.wait()
+        elif "body-B" in text:
+            published.append("B")
+    def write_second():
+        loop.call_soon_threadsafe(second_started.set)
+        cache.extract_cache_put(URL, "body-B", title="title-B",
+            metadata={"sourceURL": "https://example.org/B", "served_by": "parallel"})
     monkeypatch.setattr(cache.atomic, "write_text", write)
     first = asyncio.create_task(asyncio.to_thread(
         cache.extract_cache_put, URL, "body-A", title="title-A",
         metadata={"sourceURL": "https://example.org/A", "served_by": "exa"}))
-    assert await asyncio.to_thread(entered.wait, 1)
+    waiting = asyncio.create_task(entered.wait())
+    second = None
     try:
-        await asyncio.to_thread(cache.extract_cache_put, URL, "body-B", title="title-B",
-            metadata={"sourceURL": "https://example.org/B", "served_by": "parallel"})
+        async with asyncio.timeout(20):
+            await asyncio.wait({first, waiting}, return_when=asyncio.FIRST_COMPLETED)
+            assert entered.is_set(), "the first cache writer did not publish its body"
+            # The real cache serializes the envelope and index. Awaiting B to finish
+            # before releasing A deadlocks correct serialization; start both instead.
+            second = asyncio.create_task(asyncio.to_thread(write_second))
+            await second_started.wait()
+            release.set()
+            await asyncio.gather(first, second)
     finally:
         release.set()
-    await first
+        waiting.cancel()
+        await asyncio.gather(first, waiting, *([second] if second else []), return_exceptions=True)
+    assert sorted(published) == ["A", "B"]
     hit = cache.extract_cache_get(URL)
     assert (hit["content"], hit["title"], hit["metadata"]["served_by"]) in {
         ("body-A", "title-A", "exa"), ("body-B", "title-B", "parallel")}

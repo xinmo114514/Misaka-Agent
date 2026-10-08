@@ -27,7 +27,7 @@ from misaka.core.web.accounting import account_call
 from misaka.core.web.config import without_credentials
 from misaka.core.web.provider import WebSearchProvider
 from misaka.core.web.timeouts import ddgs_request_timeout, operation_seconds
-from misaka.utils.async_lifecycle import settle
+from misaka.utils.async_lifecycle import run_in_thread, settle
 
 logger = logging.getLogger(__name__)
 
@@ -111,6 +111,17 @@ async def _terminate_and_reap(proc: asyncio.subprocess.Process) -> None:
     """Terminate a worker, escalate to kill, and wait so no orphan remains."""
     if proc.returncode is not None:
         return
+    if sys.platform == "win32":
+        from misaka.core.platform.processes import terminate
+
+        # A Windows venv executable is a launcher: its interpreter is a child.
+        # Capture and stop the owned tree before terminating that launcher,
+        # otherwise the live interpreter becomes an unreachable orphan.
+        # asyncio remains the sole waiter for the direct subprocess.
+        await run_in_thread(terminate, proc.pid, reap_root=False)
+        if proc.returncode is not None:
+            await proc.wait()
+            return
     try:
         proc.terminate()
         try:

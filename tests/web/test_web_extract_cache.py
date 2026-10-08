@@ -21,7 +21,7 @@ from webconf import write_web
 
 from misaka.config import home
 from misaka.core.web import cache
-from tests import posix
+from tests import posix_test_support as posix
 
 
 @pytest.fixture(autouse=True)

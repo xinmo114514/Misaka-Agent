@@ -21,6 +21,10 @@ def isolated(tmp_path, monkeypatch):
     for key in tuple(os.environ):
         if key.startswith(("MISAKA_", "HERMES_", "LCM_", "PI_")) or key.endswith(("_API_KEY", "_TOKEN")):
             monkeypatch.delenv(key, raising=False)
+    # These real requests are loopback-only; shell proxies are not part of the fixture.
+    for key in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("NO_PROXY", "localhost,127.0.0.1")
     for key, leaf in (("HOME", "home"), ("XDG_CONFIG_HOME", "config"),
                       ("XDG_CACHE_HOME", "cache"), ("XDG_DATA_HOME", "data"),
                       ("HERMES_HOME", "hermes")):
@@ -120,7 +124,8 @@ def host(root):
                  # The fork snapshot records the session's effective prompt (pi 0.87: the
                  # agent state's prompt is replayed from the transcript and read-only).
                  systemPrompt="Fixture parent.",
-                 agent=NS(state=NS(messages=[], tools=[])))
+                 agent=NS(state=NS(messages=[], tools=[])),
+                 moments=NS(parts=[], send_message=lambda *args, **kwargs: None))
     manager = SubagentManager(session, RoleContext(
         role="sisters/10032", mcp_role="sisters/10032", workspace=workspace,
         profile_dir=str(home.path("profiles_root") / "10032")))
@@ -139,6 +144,30 @@ async def create(manager, session, kind="explorer", background=False):
         tool_call_id="", context=session)
 
 
+async def _complete_native_turn(turn, task, requests=None, *, requests_before=None):
+    """Bound real startup separately from the fixture reply; do not fabricate readiness.
+
+    Native startup already permits 45 s (mcp.required_wait 30 + its 15 s margin).
+    Before the HTTP fixture receives a real request, the child is still opening
+    its session/provider. The answer and teardown keep their original 20 s bound.
+    """
+    before = (len(requests) if requests_before is None else requests_before) if requests is not None else None
+    runner = asyncio.ensure_future(turn)
+    try:
+        async with asyncio.timeout(45):
+            while not runner.done():
+                observed = (len(requests) > before if requests is not None else task.prompt_accepted)
+                if observed:
+                    break
+                await asyncio.sleep(.01)
+        async with asyncio.timeout(20):
+            await runner
+    finally:
+        if not runner.done():
+            runner.cancel()
+            await asyncio.gather(runner, return_exceptions=True)
+
+
 @pytest.mark.parametrize("kind", ["explorer", "general"])
 @pytest.mark.parametrize("background", [False, True])
 async def test_native_first_turn_and_resume(isolated, endpoint, kind, background):
@@ -152,8 +181,7 @@ async def test_native_first_turn_and_resume(isolated, endpoint, kind, background
         if os.name != "nt":                  # POSIX modes; Windows keeps the profile private by ACL
             assert task.transcript.stat().st_mode & 0o777 == 0o600
         assert not task.initial_prompt_sent
-        async with asyncio.timeout(20):
-            await manager._drive(task, "FIRST_MARKER", notify=False)
+        await _complete_native_turn(manager._drive(task, "FIRST_MARKER", notify=False), task, endpoint)
         assert task.status == "completed", (task.error, task.stderr)
         assert task.turn_count == 1 and task.initial_prompt_sent
         assert "Fixture answer." in str(task.result)
@@ -161,11 +189,11 @@ async def test_native_first_turn_and_resume(isolated, endpoint, kind, background
             # Also exercise registry rehydration, not just an in-memory task.
             await manager.close()
             manager = type(manager)(session, manager.role_context)
+        requests_before = len(endpoint)
         result = await manager.send_message(task.id, "SECOND_MARKER", context=session)
         assert result["success"]
         task = manager._tasks[task.id]
-        async with asyncio.timeout(20):
-            await task.runner
+        await _complete_native_turn(task.runner, task, endpoint, requests_before=requests_before)
         assert task.status == "completed", (task.error, task.stderr)
         assert task.turn_count == 2 and task.process is None
         assert SessionManager.open(str(task.transcript)).getSessionId() == original_id
@@ -205,8 +233,7 @@ async def test_background_child_uses_live_card_output_grant(isolated, endpoint, 
         task = await create(manager, session, "general", True)
         assert manager._child_permission_mode(task) == "default"
         assert not manager._child_can_prompt(task)
-        async with asyncio.timeout(20):
-            await manager._drive(task, "Write the assigned report.", notify=False)
+        await _complete_native_turn(manager._drive(task, "Write the assigned report.", notify=False), task, endpoint)
         assert task.status == "completed", (task.error, task.stderr)
         assert (output / "report.md").read_text(encoding="utf-8") == "Written by child."
         assert len(endpoint) == 2
@@ -224,8 +251,7 @@ async def test_fork_keeps_seed_history(isolated, endpoint):
     try:
         task = await create(manager, session, "fork", True)
         assert "PARENT_MARKER" in task.transcript.read_text(encoding="utf-8")
-        async with asyncio.timeout(20):
-            await manager._drive(task, "FORK_MARKER", notify=False)
+        await _complete_native_turn(manager._drive(task, "FORK_MARKER", notify=False), task, endpoint)
         assert task.status == "completed", (task.error, task.stderr)
         assert len(endpoint) == 1
         assert "PARENT_MARKER" in json.dumps(endpoint[0]["messages"])
@@ -270,8 +296,7 @@ async def test_native_startup_failure_preserves_traceback(isolated):
         task = await create(manager, session)
         task.transcript.unlink(missing_ok=True)
         task.stderr.append("STALE_ERROR_FROM_PREVIOUS_TURN")
-        async with asyncio.timeout(15):
-            await manager._drive(task, "must not be sent", notify=False)
+        await _complete_native_turn(manager._drive(task, "must not be sent", notify=False), task)
         assert task.status == "failed"
         assert "FileNotFoundError" in task.error
         assert str(task.transcript) in task.error
@@ -345,8 +370,7 @@ async def test_lcm_child_inherits_resumed_project_not_launcher(isolated, endpoin
     parent.extensionRunner = ExtensionRunner([lcm], runtime, parent.cwd, parent.sessionManager, None)
     try:
         task = await create(manager, parent)
-        async with asyncio.timeout(20):
-            await manager._drive(task, 'PROJECT_OWNER_MARKER', notify=False)
+        await _complete_native_turn(manager._drive(task, 'PROJECT_OWNER_MARKER', notify=False), task, endpoint)
         assert task.status == 'completed', (task.error, task.stderr)
         child = SessionManager.openInMemory(str(task.transcript))
         marker = next(e for e in child.getEntries() if e.get('customType') == 'lcm-project')
@@ -365,8 +389,7 @@ async def test_message_to_unstarted_child_returns_at_once(isolated, endpoint):
         result = await asyncio.wait_for(
             manager.send_message(task.id, "LATE_MARKER", context=session), 3)
         assert result["success"]
-        async with asyncio.timeout(20):
-            await manager._drive(task, "FIRST_MARKER", notify=False)
+        await _complete_native_turn(manager._drive(task, "FIRST_MARKER", notify=False), task, endpoint)
         assert task.status == "completed", (task.error, task.stderr)
         assert any("LATE_MARKER" in json.dumps(r["messages"]) for r in endpoint)
         assert not task.pending_messages

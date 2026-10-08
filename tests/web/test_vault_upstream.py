@@ -36,7 +36,7 @@ from misaka.core.web.browser.vault.store import (
     normalize_origin,
     scrub_secret_from_text,
 )
-from tests import posix
+from tests import posix_test_support as posix
 
 
 @pytest.fixture()

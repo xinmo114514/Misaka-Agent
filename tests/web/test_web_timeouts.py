@@ -547,6 +547,41 @@ async def test_ddgs_deadline_kills_and_reaps_owned_worker(tmp_path, monkeypatch)
     assert not psutil.pid_exists(int(pidfile.read_text(encoding="utf-8")))
 
 
+async def test_ddgs_cancellation_reaps_worker_without_touching_sibling(tmp_path, monkeypatch):
+    import sys
+
+    import psutil
+
+    from misaka.core.platform.processes import terminate
+    from misaka.core.web.backends import ddgs
+
+    pidfile = tmp_path / "cancelled-worker-pid"
+    script = ("import os,sys,time;sys.stdin.read();"
+              f"open({str(pidfile)!r},'w').write(str(os.getpid()));time.sleep(30)")
+    monkeypatch.setattr(ddgs, "_worker_argv", lambda: [sys.executable, "-c", script])
+    write(operation_timeout={"ddgs": 30})
+    sibling = await asyncio.create_subprocess_exec(sys.executable, "-c", "import time;time.sleep(30)")
+    call = asyncio.create_task(ddgs._run_ddgs_search_bounded("query", 1))
+    worker_pid = None
+    try:
+        async with asyncio.timeout(5):
+            while not pidfile.exists() or not pidfile.read_text(encoding="utf-8"):
+                await asyncio.sleep(0.01)
+        worker_pid = int(pidfile.read_text(encoding="utf-8"))
+        call.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await call
+        assert not psutil.pid_exists(worker_pid)
+        assert sibling.returncode is None and psutil.pid_exists(sibling.pid)
+    finally:
+        call.cancel()
+        await asyncio.gather(call, return_exceptions=True)
+        if worker_pid is not None and psutil.pid_exists(worker_pid):
+            await asyncio.to_thread(terminate, worker_pid)
+        await asyncio.to_thread(terminate, sibling.pid, reap_root=False)
+        await sibling.wait()
+
+
 async def test_timeout_rotation_preserves_busy_pool_and_retires_it_after_drain(tmp_path, monkeypatch):
     started, release = asyncio.Event(), asyncio.Event()
     real, clients, seen = httpx.AsyncClient, [], []

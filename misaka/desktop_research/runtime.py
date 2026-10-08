@@ -385,8 +385,8 @@ class DesktopExecutionScope:
         self.catalog_views = []
         self.counter = 0
         self.adapted_extensions = set()
-        from .auxiliary import LCM_DIAGNOSTIC
-        self.runtime_diagnostics = [dict(LCM_DIAGNOSTIC)]
+        from .auxiliary import AUXILIARY_DIAGNOSTIC
+        self.runtime_diagnostics = [dict(AUXILIARY_DIAGNOSTIC)]
         atomic_json(self.team.directory / 'runtime-diagnostics.json', self.runtime_diagnostics)
         import misaka.core.platform.session as platform_session
         from misaka.core.research import node, planner

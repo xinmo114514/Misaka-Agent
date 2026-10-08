@@ -15,7 +15,7 @@ from pathlib import Path
 import pytest
 
 from misaka.config import CFG, current_config, home
-from tests import posix
+from tests import posix_test_support as posix
 
 PACKAGE = Path(__file__).resolve().parents[1] / "misaka"
 # Shipped skill assets and vendored upstream code are not MISAKA's own source.

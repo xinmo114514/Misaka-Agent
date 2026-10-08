@@ -563,12 +563,14 @@ async def test_an_abort_mid_flight_cancels_the_vendor_call(monkeypatch):
     """
     signal = _LiveSignal()
     cancelled = asyncio.Event()
+    entered = asyncio.Event()
 
     monkeypatch.setattr(
         extract, "resolve_extractor", lambda: (_Provider("tavily"), "tavily", "")
     )
 
     async def never_answers(prov, urls, *, format=None):
+        entered.set()
         try:
             await asyncio.sleep(60)
         except asyncio.CancelledError:
@@ -578,12 +580,9 @@ async def test_an_abort_mid_flight_cancels_the_vendor_call(monkeypatch):
 
     monkeypatch.setattr(extract, "dispatch_extract", never_answers)
 
-    async def abort_soon():
-        await asyncio.sleep(0.05)
-        signal.abort()
-
     task = asyncio.ensure_future(run(["https://a.test"], signal=signal))
-    await abort_soon()
+    await asyncio.wait_for(entered.wait(), 5)
+    signal.abort()
     result = json.loads(await task)
 
     assert result == {"error": "Interrupted", "success": False}

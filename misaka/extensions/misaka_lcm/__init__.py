@@ -21,6 +21,15 @@ def command(argv):
     return main(argv)
 
 
+def register_native_auth(harn):
+    """Keep native OAuth available to strict-model research without auxiliary calls."""
+    from .host.nous import flow
+    harn.registerProvider('nous', {'oauth': flow})
+
+
+register_native_auth.extension_name = 'desktop-native-auth'
+
+
 def activate(spec):
     import os
 
@@ -32,4 +41,5 @@ def activate(spec):
     def register_for_session(harn):
         return register(harn, kind=spec.kind, workspace=workspace)
 
+    register_for_session.desktop_research_factory = register_native_auth
     return register_for_session
