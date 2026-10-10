@@ -250,7 +250,8 @@ def session_entry_to_display_messages(entry: SessionEntry) -> list[AgentMessage]
 
 def _entry_starts_transcript(entry: SessionEntry) -> bool:
     """Keep empty UI/drafts lazy, but persist actual output and adopted checkpoints."""
-    return (entry.get("type") == "custom_message"
+    return ((entry.get('type') == 'custom' and entry.get('customType') == 'research-delivery')
+            or entry.get("type") == "custom_message"
             or (entry.get("type") == "compaction" and entry.get("contextMessages") is not None)
             or (entry.get("type") == "message" and _message_role(entry.get("message")) == "assistant"))
 

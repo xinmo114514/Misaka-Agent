@@ -249,10 +249,17 @@ class SessionControl:
 
             async def deliver():
                 try:
+                    options = {'streamingBehavior': command.get('streamingBehavior', 'steer'),
+                               'preflightResult': preflight,
+                               **({'requestId': command['requestId']} if command.get('deliveryId') else {}),
+                               **({'deliveryId': command['deliveryId']} if command.get('deliveryId') else {})}
                     if self.on_input is not None:
-                        await self.on_input(text, preflight)
+                        if command.get('deliveryId'):
+                            await self.on_input(text, preflight, options)
+                        else:
+                            await self.on_input(text, preflight)
                     else:
-                        await self.session.prompt(text, {"streamingBehavior": "steer", "preflightResult": preflight})
+                        await self.session.prompt(text, options)
                 except Exception as error:  # noqa: BLE001 - failed background turns must remain visible
                     self.error = str(error)
                     if not accepted.done():

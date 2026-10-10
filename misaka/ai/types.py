@@ -241,6 +241,9 @@ class UserMessage(SchemaModel):
     role: Literal["user"] = "user"
     content: str | list[UserContent]
     timestamp: int
+    # Native provenance; provider adapters construct their own wire payloads.
+    requestId: str | None = None
+    deliveryId: str | None = None
 
     _normalize_null_content = field_validator("content", mode="before")(_content_never_null)
 
