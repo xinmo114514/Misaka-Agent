@@ -26,6 +26,18 @@ export function clearSessionViewsExcept(currentPath: string | null): void {
 }
 export function messageHeights(path: string): Map<string, number> { return view(path).heights }
 
+/** Mounted rows the reader opened by hand, even before a session path exists. */
+const openDisclosures = new Set<string>()
+export function isDisclosureOpen(key: string): boolean { return openDisclosures.has(key) }
+
+/** True when the reader left one of these rows open and expects the lane to stay open. */
+export function hasOpenDisclosure(path: string | null, keys: string[]): boolean {
+  if (keys.some(isDisclosureOpen)) return true
+  if (!path) return false
+  const choices = view(path).disclosures
+  return keys.some(key => choices.get(key) === true)
+}
+
 export function migrateEntryDisclosures(path: string, liveId: string, entryId: string): void {
   if (!path || !liveId || !entryId) return
   const v = view(path)
@@ -41,9 +53,21 @@ export function migrateEntryDisclosures(path: string, liveId: string, entryId: s
   }
 }
 
+/**
+ * The conversation actually on screen. Research mode renders a different transcript
+ * than `currentSessionPath`, so reading state must not be filed under the agent row.
+ */
+export function selectSessionViewKey(state: { agentMode: string; currentSessionPath: string | null; researchBinding: { sessionFile: string | null } | null }): string | null {
+  return state.agentMode === 'research' && state.researchBinding ? state.researchBinding.sessionFile : state.currentSessionPath
+}
+
+export function useSessionViewKey(): string | null {
+  return useSessionStore(selectSessionViewKey)
+}
+
 /** Manual choices outlive DOM rows. Defaults (such as streaming thinking) stay live. */
 export function useDisclosure(key: string): [boolean | null, (expanded: boolean) => void] {
-  const path = useSessionStore(state => state.currentSessionPath)
+  const path = useSessionViewKey()
   const [choice, setChoice] = useState(() => ({ path, key, value: path ? view(path).disclosures.get(key) ?? null : null }))
   const manual = choice.path === path ? choice.value : path ? view(path).disclosures.get(key) ?? null : null
   // A live message acquires its durable entryId without remounting. Migrate the
@@ -66,5 +90,10 @@ export function useDisclosure(key: string): [boolean | null, (expanded: boolean)
     }
     setChoice({ path, key, value: expanded })
   }
+  useEffect(() => {
+    if (!manual) return
+    openDisclosures.add(key)
+    return () => { openDisclosures.delete(key) }
+  }, [key, manual])
   return [manual, setExpanded]
 }

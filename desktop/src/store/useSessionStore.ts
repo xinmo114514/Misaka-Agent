@@ -10,8 +10,10 @@ import {
 import type { BridgeMessage, BridgeEventEnvelope } from '../types/global'
 import { reduceConversationEvent, type ConversationState } from '../lib/conversationEvents'
 import { normalizeChatMessage } from '../lib/messageBlocks'
-import { emptyResearchConversation, hydrateResearchHistoryCards, isResearchRunActive, projectResearchHistory, reconcileResearchPendingHistory, reduceResearchConversationEvent, researchNoticeRunId } from '../lib/researchConversation'
+import { emptyResearchConversation, hydrateResearchHistoryCards, isResearchRunActive, isResearchStartupFailure, projectResearchHistory, reconcileResearchPendingHistory, reduceResearchConversationEvent, researchNoticeRunId } from '../lib/researchConversation'
 import { newRequestId, request } from '../lib/bridge'
+import { cancelResearchStartup, startComposerResearch, type ResearchSubmissionInput } from '../lib/startComposerResearch'
+import { executeResearchControl, isResearchRequestTimeout, requestResearch } from '../lib/researchBridge'
 import { sessionHistoryCache } from '../lib/sessionHistoryCache'
 import { forgetSessionView, migrateEntryDisclosures } from '../lib/sessionViewState'
 import type { AttachmentPreparation, PreparedAttachment, PromptImage } from '../types/attachment'
@@ -150,6 +152,7 @@ interface SessionState {
   pendingPermissionRequest: PermissionRequestPayload | null
   /** The composer's text, mirrored here so a tree navigation can hand a message back to it. */
   draft: string
+  draftRevision: number
   /** Kept when a navigation returned text but the composer already had a draft; nothing is silently dropped. */
   retainedEditorText: string | null
   treeOpen: boolean
@@ -174,15 +177,20 @@ interface SessionState {
   removeAttachment: (path: string) => void
   clearAttachments: () => void
   retryMessage: (messageId: string) => void
+  retryResearchMessage: (messageId: string) => void
   abortGeneration: () => void
   handleBridgeMessage: (msg: BridgeMessage) => void
-  bindResearchConversation: (snapshot: ResearchHostSnapshot) => void
+  bindResearchConversation: (snapshot: ResearchHostSnapshot, force?: boolean) => void
   applyResearchTeamSnapshot: (sessionId: string, snapshot: ResearchTeamSnapshot, seq?: number) => void
   handleResearchBridgeMessage: (msg: BridgeMessage) => void
   clearResearchConversation: () => void
   queueResearchMessage: (requestId: string, text: string) => void
   acceptResearchMessage: (requestId: string) => void
-  failResearchMessage: (requestId: string, error: string) => void
+  unconfirmResearchMessage: (requestId: string, error: string, retryable?: boolean, reconciled?: boolean) => void
+  failResearchMessage: (requestId: string, error: string, retryable?: boolean) => void
+  failResearchExecution: (requestId: string, error: string) => void
+  rememberResearchSubmission: (requestId: string, submission: ResearchSubmissionInput, draft?: ChatMessage['researchDraft']) => void
+  requestResearchStop: () => void
   fetchSessions: () => void
   openSession: (path: string) => void
   retrySessionLoad: () => void
@@ -298,6 +306,8 @@ let listTimer: number | null = null
 let listDirty = false
 const confirmedDeletedSessions = new Set<string>()
 const pendingPrompts = new Map<string, { sessionId: string; userMessageId: string; placeholderId: string | null }>()
+const researchDeliveryBindings = new Map<string, { sessionId: string; streamId?: string }>()
+const retiredResearchBindings = new Set<string>()
 const MAX_ATTACHMENTS = 10
 const MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024
 
@@ -307,6 +317,15 @@ function attachmentName(path: string): string {
 
 function attachmentIdentity(path: string): string { return path.toLowerCase() }
 let pendingTreeRequestId: string | null = null
+
+function researchBindingKey(binding: { sessionId: string; streamId?: string }): string {
+  return `${binding.sessionId}\u0000${binding.streamId || ''}`
+}
+
+function deliveryBelongsToBinding(requestId: string, binding: ResearchConversationBinding | null): boolean {
+  const owner = researchDeliveryBindings.get(requestId)
+  return Boolean(owner && binding && owner.sessionId === binding.sessionId && owner.streamId === binding.streamId)
+}
 
 function markSessionDeleted(path: string): void {
   confirmedDeletedSessions.add(path)
@@ -370,6 +389,7 @@ function beginHydration(command: HydrationCommand, targetPath?: string, keepDisp
   const known = state.sessions.find(session => session.path === targetPath)
   useSessionStore.setState({ ...resetSessionOperationState(), isSessionLoading: true, isStreaming: true, isAborting: false,
     streamingMessageId: null, pendingPermissionRequest: null, sessionLoadError: null, treeOpen: false,
+    agentMode: 'agent', researchConnectionError: null,
     sessionHistoryVersion: cached?.historyVersion ?? null,
     ...(targetPath ? { currentSessionPath: targetPath, currentSessionId: cached?.sessionId ?? known?.id ?? '',
       currentTitle: cached?.title ?? (known ? deriveTitle(known) : '加载会话'),
@@ -431,6 +451,7 @@ export const useSessionStore = create<SessionState>((set, get) => ({
   messages: [],
   streamingMessageId: null,
   draft: '',
+  draftRevision: 0,
   attachments: [],
   retainedEditorText: null,
   treeOpen: false,
@@ -447,24 +468,51 @@ export const useSessionStore = create<SessionState>((set, get) => ({
   compactDraft: null,
   isCompacting: false,
 
-  setDraft: (text: string) => set({ draft: text }),
+  setDraft: (text: string) => set(state => ({ draft: text, draftRevision: state.draftRevision + 1 })),
 
-  bindResearchConversation: (snapshot) => {
+  bindResearchConversation: (snapshot, force = false) => {
     if (!snapshot.session?.sessionId || !Array.isArray(snapshot.messages)) return
     set(state => {
       const sameSession = state.researchBinding?.sessionId === snapshot.session.sessionId
-      const sameStream = sameSession && snapshot.streamId && state.researchBinding?.streamId === snapshot.streamId
-      if (sameStream && snapshot.lastEventSeq < state.researchConversation.lastEventSeq) return state
+      // Legacy snapshots omit streamId; that absence is not a transport change.
+      const snapshotStreamId = snapshot.streamId ?? (sameSession ? state.researchBinding?.streamId : undefined)
+      const incomingBinding = { sessionId: snapshot.session.sessionId, streamId: snapshotStreamId }
+      const incomingKey = researchBindingKey(incomingBinding)
+      if (!state.researchBinding) retiredResearchBindings.clear()
+      else if (researchBindingKey(state.researchBinding) !== incomingKey) {
+        // Opening a run from history or the run pill is the user's own decision and stays
+        // authoritative even if that binding was retired by an earlier automatic switch.
+        if (retiredResearchBindings.has(incomingKey) && !force) return state
+        retiredResearchBindings.delete(incomingKey)
+        retiredResearchBindings.add(researchBindingKey(state.researchBinding))
+      }
+      const sameStream = sameSession && snapshotStreamId && state.researchBinding?.streamId === snapshotStreamId
+      if (sameStream && snapshot.lastEventSeq < state.researchConversation.lastEventSeq) {
+        // An older snapshot must not replace a newer transcript, but a run identity it
+        // alone knows about is still authoritative: refusing it would pin the binding at
+        // `runId: null` and keep the UI on the welcome page after the run exists.
+        const knownRunId = snapshot.run?.id
+        if (knownRunId && !state.researchBinding?.runId) {
+          return { researchBinding: { ...state.researchBinding!, runId: knownRunId },
+            researchPendingCreationRequestId: null }
+        }
+        return state
+      }
       const history = projectResearchHistory(snapshot.messages)
       const owner = sameStream ? state.researchConversation.messages.find(message => message.id === state.researchConversation.streamingMessageId && message.isStreaming) : undefined
-      const liveOwner = owner && !history.some(message => message.role === 'assistant' &&
+      const runStatus = snapshot.run?.status
+      const runSettled = snapshot.isIdle === true || runStatus === 'waiting_input' || Boolean(runStatus && !isResearchRunActive(runStatus))
+      const liveOwner = !runSettled && owner && !history.some(message => message.role === 'assistant' &&
         (message.id === owner.id || message.timestamp === owner.timestamp || Boolean(owner.entryId && message.entryId === owner.entryId))) ? owner : undefined
       const hasNativeLifecycle = typeof snapshot.isStreaming === 'boolean' || typeof snapshot.isIdle === 'boolean'
       const nativeBusy = snapshot.isStreaming === true || snapshot.isIdle === false
       const isStreaming = liveOwner ? state.researchConversation.isStreaming
         : hasNativeLifecycle ? nativeBusy
           : Boolean(sameStream && state.researchConversation.isStreaming) || isResearchRunActive(snapshot.run?.status)
-      const messages = reconcileResearchPendingHistory(liveOwner ? [...history, liveOwner] : history, sameSession ? state.researchConversation.messages : [])
+      const messages = reconcileResearchPendingHistory(liveOwner ? [...history, liveOwner] : history, sameSession ? state.researchConversation.messages : [], snapshot.submissionReceipts)
+      for (const message of messages) {
+        if (message.requestId && message.deliveryStatus === 'created') researchDeliveryBindings.delete(message.requestId)
+      }
       const cards = hydrateResearchHistoryCards(state.researchCards, snapshot.messages)
       for (const message of snapshot.messages) {
         const runId = researchNoticeRunId(message)
@@ -481,14 +529,16 @@ export const useSessionStore = create<SessionState>((set, get) => ({
       }
       return {
         researchBinding: { sessionId: snapshot.session.sessionId, sessionFile: snapshot.session.file, workspace: snapshot.session.cwd, runId: snapshot.run?.id ?? null,
-          ...(snapshot.streamId ? { streamId: snapshot.streamId } : {}) },
+          ...(snapshotStreamId ? { streamId: snapshotStreamId } : {}) },
         researchConversation: { ...emptyResearchConversation(), currentSessionId: snapshot.session.sessionId,
           messages, lastEventSeq: snapshot.lastEventSeq ?? 0,
           streamingMessageId: liveOwner?.id ?? null,
           isStreaming,
-          isAborting: liveOwner ? state.researchConversation.isAborting : false },
+          isAborting: Boolean(sameStream && state.researchConversation.isAborting && !runSettled) },
         researchCards: cards, researchConnectionError: null,
-        researchPendingCreationRequestId: snapshot.run || !sameSession ? null : state.researchPendingCreationRequestId,
+        researchPendingCreationRequestId: snapshot.run || !sameSession || snapshot.submissionReceipts?.some(receipt =>
+          receipt.requestId === state.researchPendingCreationRequestId && receipt.state === 'rejected')
+          ? null : state.researchPendingCreationRequestId,
         researchHistoryVersion: snapshot.historyVersion,
         researchHostStats: snapshot.stats, researchContextUsage: snapshot.contextUsage,
         researchTeam: snapshot.team === undefined && sameSession ? state.researchTeam : snapshot.team ?? null,
@@ -527,6 +577,8 @@ export const useSessionStore = create<SessionState>((set, get) => ({
 
   queueResearchMessage: (requestId, text) => {
     if (!get().researchBinding || !text.trim()) return
+    const binding = get().researchBinding!
+    researchDeliveryBindings.set(requestId, { sessionId: binding.sessionId, streamId: binding.streamId })
     set(state => {
       if (state.researchConversation.messages.some(message => message.requestId === requestId)) return state
       const message: ChatMessage = { id: `research-user-${requestId}`, role: 'user', content: text.trim(), timestamp: Date.now(),
@@ -536,24 +588,180 @@ export const useSessionStore = create<SessionState>((set, get) => ({
     })
   },
 
-  acceptResearchMessage: (requestId) => set(state => ({ researchConversation: { ...state.researchConversation,
-    messages: state.researchConversation.messages.map(message => message.requestId === requestId && message.deliveryStatus === 'pending'
-      ? { ...message, deliveryStatus: 'accepted' } : message) } })),
+  acceptResearchMessage: (requestId) => set(state => {
+    if (!deliveryBelongsToBinding(requestId, state.researchBinding)) return state
+    return { researchConnectionError: null, researchConversation: { ...state.researchConversation,
+      messages: state.researchConversation.messages.map(message => message.requestId === requestId &&
+        (message.deliveryStatus === 'pending' || message.deliveryStatus === 'unconfirmed')
+        ? { ...message, deliveryStatus: 'accepted', submissionError: undefined, deliveryReconciled: undefined } : message) } }
+  }),
 
-  failResearchMessage: (requestId, error) => set(state => {
-    if (!state.researchConversation.messages.some(message => message.requestId === requestId)) return state
-    return { researchConnectionError: error,
+  rememberResearchSubmission: (requestId, submission, draft) => set(state => {
+    if (!deliveryBelongsToBinding(requestId, state.researchBinding)) return state
+    const original = Object.freeze({ ...submission, ...(submission.limits ? { limits: Object.freeze({ ...submission.limits }) } : {}) })
+    return { researchConversation: { ...state.researchConversation, messages: state.researchConversation.messages.map(message =>
+      message.requestId === requestId && !message.researchSubmission ? { ...message, researchSubmission: original,
+        ...(draft ? { researchDraft: { ...draft, attachmentPaths: [...draft.attachmentPaths] } } : {}) } : message) } }
+  }),
+
+  failResearchExecution: (requestId, error) => set(state => {
+    if (!deliveryBelongsToBinding(requestId, state.researchBinding) && !state.researchConversation.messages.some(message => message.requestId === requestId && message.deliveryStatus === 'created')) return state
+    return { researchPendingCreationRequestId: state.researchPendingCreationRequestId === requestId ? null : state.researchPendingCreationRequestId,
+      researchConversation: { ...state.researchConversation, messages: state.researchConversation.messages.map(message => message.requestId === requestId
+        ? { ...message, optimistic: false, executionError: error, submissionError: undefined,
+          deliveryStatus: message.deliveryStatus === 'created' ? 'created' : 'accepted' } : message) } }
+  }),
+
+  unconfirmResearchMessage: (requestId, error, retryable, reconciled) => set(state => {
+    if (!deliveryBelongsToBinding(requestId, state.researchBinding)) return state
+    // A retryable unconfirmed send has to give its creation fence back: while the fence is
+    // held, the retry finder refuses this very row. A backend that said "not retryable" keeps
+    // it, so no second research creation can fire behind an unknown outcome.
+    const releaseFence = retryable !== false && state.researchPendingCreationRequestId === requestId
+    return { ...(releaseFence ? { researchPendingCreationRequestId: null } : {}),
+      researchConversation: { ...state.researchConversation,
+      messages: state.researchConversation.messages.map(message => message.requestId === requestId && message.deliveryStatus !== 'created' && message.deliveryStatus !== 'accepted'
+        ? { ...message, optimistic: true, deliveryStatus: 'unconfirmed', submissionError: error,
+          ...(retryable !== undefined ? { deliveryRetryable: retryable } : {}),
+          deliveryReconciled: reconciled ? true
+            : message.deliveryStatus === 'unconfirmed' ? message.deliveryReconciled : false } : message) } }
+  }),
+
+  failResearchMessage: (requestId, error, retryable = true) => set(state => {
+    if (!deliveryBelongsToBinding(requestId, state.researchBinding) ||
+      !state.researchConversation.messages.some(message => message.requestId === requestId && message.deliveryStatus !== 'created' && message.deliveryStatus !== 'accepted')) return state
+    return { researchConnectionError: null,
       researchPendingCreationRequestId: state.researchPendingCreationRequestId === requestId ? null : state.researchPendingCreationRequestId,
       researchConversation: { ...state.researchConversation,
-      messages: state.researchConversation.messages.map(message => message.requestId === requestId
-        ? { ...message, optimistic: false, deliveryStatus: 'failed', submissionError: error } : message) } }
+        messages: state.researchConversation.messages.map(message => message.requestId === requestId
+          ? { ...message, optimistic: false, deliveryStatus: 'failed', submissionError: error, deliveryRetryable: retryable } : message) } }
   }),
+
+  retryResearchMessage: (messageId) => {
+    const state = get()
+    const binding = state.researchBinding
+    const message = state.researchConversation.messages.find(row => row.id === messageId && row.role === 'user' && row.requestId &&
+      row.deliveryRetryable !== false && (row.deliveryStatus === 'failed' || (row.deliveryStatus === 'unconfirmed' && row.deliveryReconciled) ||
+        (Boolean(row.executionError) && Boolean(row.researchSubmission) && !binding?.runId)))
+    if (!binding || !message?.requestId || state.researchConversation.isAborting || state.isSessionLoading || state.sessionLoadError ||
+      (!binding.runId && state.researchPendingCreationRequestId) ||
+      state.researchConversation.messages.some(row => row.requestId === message.requestId && row.deliveryStatus === 'pending')) return
+    const requestId = message.requestId
+    let owner = binding
+    const ownsContext = () => get().agentMode === 'research' && get().researchBinding?.sessionId === owner.sessionId && get().researchBinding?.streamId === owner.streamId
+    researchDeliveryBindings.set(requestId, { sessionId: binding.sessionId, streamId: binding.streamId })
+    set(current => ({ researchConnectionError: null,
+      researchPendingCreationRequestId: binding.runId ? current.researchPendingCreationRequestId : requestId,
+      researchConversation: { ...current.researchConversation,
+      messages: current.researchConversation.messages.map(row => row.id === messageId
+        ? { ...row, optimistic: true, deliveryStatus: 'pending', deliveryReconciled: undefined, submissionError: undefined, executionError: undefined } : row) } }))
+    void startComposerResearch({ question: message.content, workspace: binding.workspace, binding, requestId, submission: message.researchSubmission,
+      onSubmission: submission => get().rememberResearchSubmission(requestId, submission, message.researchDraft),
+      onBound: host => {
+        if (!ownsContext()) return
+        get().bindResearchConversation(host)
+        const rebound = get().researchBinding
+        if (rebound) {
+          owner = rebound
+          researchDeliveryBindings.set(requestId, { sessionId: rebound.sessionId, streamId: rebound.streamId })
+        }
+      },
+      onAccepted: () => get().acceptResearchMessage(requestId),
+      onUnconfirmed: (error, reconciled) => get().unconfirmResearchMessage(requestId, error.message, (error as Error & { retryable?: boolean }).retryable, reconciled),
+    }).then(host => {
+      if (!ownsContext()) return
+      get().bindResearchConversation(host)
+      const current = get()
+      const draft = message.researchDraft
+      if (draft && draft.mode === current.agentMode && draft.sessionId === current.researchBinding?.sessionId &&
+        current.draft === draft.text &&
+        (draft.revision === undefined || draft.revision === current.draftRevision) &&
+        current.attachments.length === draft.attachmentPaths.length && current.attachments.every((item, index) => item.path === draft.attachmentPaths[index])) {
+        set({ draft: '', attachments: [] })
+      }
+      if (host.syncError) set({ researchConnectionError: host.syncError })
+    }).catch(error => {
+      if (!ownsContext()) return
+      const message = error instanceof Error ? error.message : String(error)
+      if (isResearchStartupFailure(error)) get().failResearchExecution(requestId, message)
+      else if (isResearchRequestTimeout(error) || error?.errorCode === 'RESEARCH_DELIVERY_UNCONFIRMED') get().unconfirmResearchMessage(requestId, message, error?.retryable)
+      else get().failResearchMessage(requestId, message, error?.retryable)
+    })
+  },
+
+  requestResearchStop: () => {
+    const state = get()
+    const binding = state.researchBinding
+    if (!binding) return
+    if (state.researchConversation.isAborting) return
+    if (!binding.runId) {
+      // A start that has no run *yet* is owned by the research host; the ordinary session's
+      // abort channel must never receive this cancel. The run is durable on the board, though,
+      // so ask the owning host before deciding: a missed creation notice must not turn the
+      // user's "stop" into a cancel of a research that is already running.
+      set({ researchConnectionError: null, researchConversation: { ...state.researchConversation, isAborting: true } })
+      void requestResearch<ResearchHostSnapshot>('get_research_host', {}, 5_000)
+        .then(latest => {
+          const current = get()
+          if (researchBindingKey(current.researchBinding || { sessionId: '' }) !== researchBindingKey(binding)) return
+          const discovered = latest?.session?.sessionId === binding.sessionId ? latest.run?.id : undefined
+          if (discovered) {
+            set(state => ({ researchBinding: state.researchBinding ? { ...state.researchBinding, runId: String(discovered) } : state.researchBinding,
+              researchPendingCreationRequestId: null, researchConversation: { ...state.researchConversation, isAborting: false } }))
+            get().requestResearchStop()
+            return
+          }
+          set(state => ({ researchConversation: { ...state.researchConversation, isAborting: false } }))
+          cancelResearchStartup(binding.sessionId)
+        })
+        .catch(() => {
+          const current = get()
+          if (researchBindingKey(current.researchBinding || { sessionId: '' }) !== researchBindingKey(binding)) return
+          // The host did not answer, so the run is still unconfirmed; cancelling the start is
+          // the only safe door, and the outcome is reported rather than implied.
+          set({ researchConnectionError: '未能确认研究是否已创建，已按取消启动处理；请刷新研究状态核对。',
+            researchConversation: { ...current.researchConversation, isAborting: false } })
+          cancelResearchStartup(binding.sessionId)
+        })
+      return
+    }
+    let owner = binding
+    const ownsContext = () => get().agentMode === 'research' &&
+      researchBindingKey(get().researchBinding || { sessionId: '' }) === researchBindingKey(owner)
+    set({ researchConnectionError: null, researchConversation: { ...state.researchConversation, isAborting: true } })
+    void executeResearchControl('stop_research', { runId: binding.runId, workspace: binding.workspace, sessionFile: binding.sessionFile,
+      onBound: host => {
+        if (host.session.sessionId !== binding.sessionId || (host.run && host.run.id !== binding.runId)) {
+          throw new Error('研究控制目标已变更，请重新打开原研究。')
+        }
+        if (!ownsContext()) return
+        get().bindResearchConversation(host)
+        const rebound = get().researchBinding
+        if (!rebound) return
+        owner = rebound
+        const settled = host.run && host.run.status !== 'waiting_input' && !isResearchRunActive(host.run.status)
+        set(current => ({ researchConversation: { ...current.researchConversation, isAborting: !settled } }))
+      },
+    })
+      .catch(error => {
+        if (isResearchRequestTimeout(error)) return
+        set(current => {
+          if (researchBindingKey(current.researchBinding || { sessionId: '' }) !== researchBindingKey(owner)) return current
+          return { researchConnectionError: error instanceof Error ? error.message : String(error),
+            researchConversation: { ...current.researchConversation, isAborting: false } }
+        })
+      })
+  },
 
   handleResearchBridgeMessage: (msg) => {
     if ('type' in msg && msg.type === 'ack') {
       if (msg.requestId) {
+        const binding = get().researchBinding
+        if ((typeof msg.sessionId === 'string' && msg.sessionId !== binding?.sessionId) ||
+          (typeof msg.streamId === 'string' && msg.streamId !== binding?.streamId)) return
         if (msg.ok) get().acceptResearchMessage(msg.requestId)
-        else get().failResearchMessage(msg.requestId, msg.error || '研究消息提交失败')
+        else if (msg.errorCode === 'RESEARCH_DELIVERY_UNCONFIRMED') get().unconfirmResearchMessage(msg.requestId, msg.error || '研究消息结果尚未确认', false)
+        else get().failResearchMessage(msg.requestId, msg.error || '研究消息提交失败', msg.retryable)
       }
       return
     }
@@ -570,7 +778,26 @@ export const useSessionStore = create<SessionState>((set, get) => ({
     if (typeof msg.seq !== 'number') return
     const envelope = msg as BridgeEventEnvelope
     const state = get()
-    if (!state.researchBinding || msg.sessionId !== state.researchBinding.sessionId || msg.seq <= state.researchConversation.lastEventSeq) return
+    if (!state.researchBinding || msg.sessionId !== state.researchBinding.sessionId) return
+    if (msg.seq <= state.researchConversation.lastEventSeq) {
+      // The arrival cursor dedupes the message flow, not the run's identity. A
+      // `research-discipline` notice carries the run id the UI needs to leave the
+      // welcome page; dropping it here strands the binding at `runId: null` forever,
+      // because no later event re-publishes that identity. Only the identity is
+      // adopted -- no message row is inserted for an already-consumed seq.
+      const raw = msg.event.type === 'message_end' ? msg.event.message : null
+      if (raw?.customType === 'research-discipline') {
+        const lateRunId = researchNoticeRunId(raw)
+        const pendingRequestId = state.researchPendingCreationRequestId
+        const noticeRequestId = raw.details?.requestId
+        if (lateRunId && !state.researchBinding.runId &&
+          (!pendingRequestId || !noticeRequestId || noticeRequestId === pendingRequestId)) {
+          set(current => ({ researchBinding: current.researchBinding ? { ...current.researchBinding, runId: lateRunId } : current.researchBinding,
+            researchPendingCreationRequestId: null }))
+        }
+      }
+      return
+    }
     if (msg.event.type === 'desktop-team' || msg.event.type === 'desktop-model-switch') {
       get().applyResearchTeamSnapshot(msg.sessionId, msg.event.details ?? msg.event, msg.seq)
     }
@@ -589,7 +816,11 @@ export const useSessionStore = create<SessionState>((set, get) => ({
         cards = { ...cards, [runId]: card }
       }
       const startupError = raw?.customType === 'research-progress' && raw.details?.stage === 'startup_error'
-      return { researchConversation: conversation, researchCards: cards,
+      const failedExecutionRequestId = startupError ? raw.details?.requestId || current.researchPendingCreationRequestId : null
+      const settledConversation = failedExecutionRequestId ? { ...conversation, messages: conversation.messages.map(message => message.requestId === failedExecutionRequestId
+        ? { ...message, executionError: raw.content || '研究启动失败', submissionError: undefined, optimistic: false,
+          deliveryStatus: message.deliveryStatus === 'created' ? 'created' as const : 'accepted' as const } : message) } : conversation
+      return { researchConversation: settledConversation, researchCards: cards,
         researchBinding: raw?.customType === 'research-discipline' && runId ? { ...current.researchBinding!, runId } : current.researchBinding,
         researchPendingCreationRequestId: (raw?.customType === 'research-discipline' && runId) || startupError ? null
           : raw?.customType === 'research-question' && !current.researchBinding?.runId
@@ -752,7 +983,7 @@ export const useSessionStore = create<SessionState>((set, get) => ({
   },
 
   openSession: (path: string) => {
-    if (path === get().currentSessionPath && !get().isSessionLoading && !get().sessionLoadError) return
+    if (path === get().currentSessionPath && get().agentMode !== 'research' && !get().isSessionLoading && !get().sessionLoadError) return
     beginHydration({ type: 'load_session', requestId: newRequestId('load'), path, preview: true }, path)
   },
 

@@ -17,6 +17,105 @@ beforeEach(() => {
 })
 
 describe('isolated continuous research conversation', () => {
+  it('preserves permanent acknowledgement retryability on a failed row', () => {
+    const actions = useSessionStore.getState()
+    actions.bindResearchConversation(snapshot())
+    actions.queueResearchMessage('permanent', '原问题')
+    actions.handleResearchBridgeMessage({ type: 'ack', requestId: 'permanent', ok: false, error: '原会话标识冲突', retryable: false })
+    expect(useSessionStore.getState().researchConversation.messages[0]).toMatchObject({ deliveryStatus: 'failed', deliveryRetryable: false })
+    actions.retryResearchMessage('research-user-permanent')
+    expect(useSessionStore.getState().researchConversation.messages[0].deliveryStatus).toBe('failed')
+  })
+
+  it('keeps the backend original envelope when matching a local row without submission metadata', () => {
+    const actions = useSessionStore.getState()
+    actions.bindResearchConversation(snapshot())
+    actions.queueResearchMessage('restored', '原问题')
+    actions.failResearchMessage('restored', '暂时失败')
+    const researchSubmission = { text: '原问题', requestId: 'restored', sessionId: 'research-session', limits: {
+      max_depth: 2, parallel: 3, sister_parallel: 1, max_followups: 2, max_revisions: 2, max_nodes: 10, plan_approval: false,
+    } }
+    actions.bindResearchConversation(snapshot({ lastEventSeq: 11, messages: [{ id: 'persisted-restored', role: 'custom',
+      customType: 'research-input', details: { requestId: 'restored', text: '原问题' }, content: '原问题', timestamp: 1, researchSubmission }],
+      submissionReceipts: [{ requestId: 'restored', state: 'rejected' }] }))
+    const restored = useSessionStore.getState().researchConversation.messages[0].researchSubmission
+    expect(restored).toEqual(researchSubmission)
+    expect(Object.isFrozen(restored)).toBe(true)
+    expect(Object.isFrozen(restored?.limits)).toBe(true)
+  })
+  it('correlates persisted entry ids only with their authoritative request id', () => {
+    const actions = useSessionStore.getState()
+    actions.bindResearchConversation(snapshot())
+    for (const requestId of ['first-entry', 'second-entry']) {
+      actions.queueResearchMessage(requestId, '相同文本')
+      actions.handleResearchBridgeMessage(event(requestId === 'first-entry' ? 11 : 12, 'message_end', {
+        message: { role: 'custom', customType: 'research-input', content: '相同文本', details: { requestId, text: '相同文本' }, timestamp: 100 },
+      }))
+    }
+    actions.handleResearchBridgeMessage(event(13, 'entry_appended', { entry: { type: 'message', id: 'entry-first',
+      message: { role: 'custom', customType: 'research-input', details: { requestId: 'first-entry', text: '相同文本' }, timestamp: 100 } } }))
+    const rows = useSessionStore.getState().researchConversation.messages
+    expect(rows[0].entryId).toBe('entry-first')
+    expect(rows[1].entryId).toBeUndefined()
+  })
+  it('treats structured uncertainty acknowledgements as unconfirmed without retry', () => {
+    const actions = useSessionStore.getState()
+    actions.bindResearchConversation(snapshot())
+    actions.queueResearchMessage('uncertain', '原问题')
+    actions.handleResearchBridgeMessage({ type: 'ack', requestId: 'uncertain', ok: false, error: '执行结果待核对',
+      errorCode: 'RESEARCH_DELIVERY_UNCONFIRMED', retryable: false })
+    expect(useSessionStore.getState().researchConversation.messages[0]).toMatchObject({ deliveryStatus: 'unconfirmed', deliveryRetryable: false })
+    expect(useSessionStore.getState().researchPendingCreationRequestId).toBe('uncertain')
+  })
+  it('keeps a distinct request id from consuming a same-text pending input', () => {
+    const actions = useSessionStore.getState()
+    actions.bindResearchConversation(snapshot())
+    actions.queueResearchMessage('original-id', '相同文本')
+    actions.handleResearchBridgeMessage(notice(11, 'research-input', { requestId: 'other-id', text: '相同文本' }))
+    expect(useSessionStore.getState().researchConversation.messages).toHaveLength(2)
+    expect(useSessionStore.getState().researchConversation.messages[0]).toMatchObject({ requestId: 'original-id', deliveryStatus: 'pending', optimistic: true })
+    expect(useSessionStore.getState().researchConversation.messages[1]).toMatchObject({ requestId: 'other-id', deliveryStatus: 'created' })
+  })
+
+  it('keeps accepted startup execution errors separate from delivery rejection', () => {
+    const actions = useSessionStore.getState()
+    actions.bindResearchConversation(snapshot())
+    actions.queueResearchMessage('startup-error', '原问题')
+    actions.acceptResearchMessage('startup-error')
+    actions.handleResearchBridgeMessage(notice(11, 'research-progress', { requestId: 'startup-error', stage: 'startup_error' }, '初始化失败'))
+    expect(useSessionStore.getState().researchConversation.messages[0]).toMatchObject({ deliveryStatus: 'accepted', submissionError: undefined, executionError: '初始化失败' })
+  })
+  it('does not downgrade accepted delivery after a late rejection or timeout', () => {
+    const actions = useSessionStore.getState()
+    actions.bindResearchConversation(snapshot())
+    actions.queueResearchMessage('monotonic', '真实问题')
+    actions.acceptResearchMessage('monotonic')
+    actions.handleResearchBridgeMessage({ type: 'ack', requestId: 'monotonic', ok: false, error: 'late rejection' })
+    actions.unconfirmResearchMessage('monotonic', 'late timeout')
+    expect(useSessionStore.getState().researchConversation.messages[0]).toMatchObject({ deliveryStatus: 'accepted', submissionError: undefined })
+  })
+
+  it('uses receipt rejection rather than persisted intent to settle delivery', () => {
+    const actions = useSessionStore.getState()
+    actions.bindResearchConversation(snapshot())
+    actions.queueResearchMessage('rejected', '问题')
+    actions.bindResearchConversation(snapshot({ lastEventSeq: 11, messages: [
+      { id: 'intent', role: 'custom', customType: 'research-input', content: '问题', details: { requestId: 'rejected', text: '问题' }, timestamp: 1 },
+    ], submissionReceipts: [{ requestId: 'rejected', state: 'rejected' }] }))
+    expect(useSessionStore.getState().researchConversation.messages[0]).toMatchObject({ requestId: 'rejected', deliveryStatus: 'failed' })
+  })
+
+  it('keeps failed local input across same-session rebind with an unrelated equal-text request', () => {
+    const actions = useSessionStore.getState()
+    actions.bindResearchConversation(snapshot())
+    actions.queueResearchMessage('failed-id', '相同文本')
+    actions.failResearchMessage('failed-id', 'rejected')
+    actions.bindResearchConversation(snapshot({ lastEventSeq: 11, messages: [
+      { id: 'other', role: 'user', requestId: 'other-id', content: '相同文本', timestamp: 1 },
+    ] }))
+    expect(useSessionStore.getState().researchConversation.messages).toHaveLength(2)
+    expect(useSessionStore.getState().researchConversation.messages[1]).toMatchObject({ requestId: 'failed-id', deliveryStatus: 'failed' })
+  })
   it('binds genuine host history without touching ordinary session or loading state', () => {
     const ordinary = useSessionStore.getState().messages
     useSessionStore.setState({ isSessionLoading: true })
@@ -264,7 +363,7 @@ describe('isolated continuous research conversation', () => {
     useSessionStore.getState().bindResearchConversation(snapshot({ messages, lastEventSeq: 20, run: { id: 'run1', status: 'active', phase: 'executing' } }))
     const state = useSessionStore.getState()
     expect(state.researchConversation.messages[0]).toMatchObject({ id: 'q', entryId: 'eq', role: 'user', content: '原问题' })
-    expect(state.researchConversation.messages.some(m => m.submissionError)).toBe(false)
+    expect(state.researchConversation.messages.find(m => m.requestId === 'late')).toMatchObject({ deliveryStatus: 'failed', submissionError: '失败' })
     expect(state.researchCards.run1).toMatchObject({ question: '原问题', tasks: [{ id: 'task1', title: '真实任务' }] })
   })
 
@@ -287,5 +386,123 @@ describe('isolated continuous research conversation', () => {
     actions.handleResearchBridgeMessage(event(13, 'message_end', { message: { role: 'custom', customType: 'research-input', content: '原样输入', details: { run_id: 'run1', requestId: 'plain-input' }, timestamp: 1200 } }))
     expect(useSessionStore.getState().researchConversation.messages.filter(message => message.content === '原样输入')).toHaveLength(1)
     expect(useSessionStore.getState().researchConversation.messages.at(-1)).toMatchObject({ role: 'user', content: '原样输入', optimistic: false, deliveryStatus: 'created' })
+  })
+
+  it('keeps the live run owner when one research input is rejected', () => {
+    useSessionStore.getState().bindResearchConversation(snapshot())
+    useSessionStore.setState(state => ({
+      researchConversation: {
+        ...state.researchConversation,
+        isStreaming: true,
+        isAborting: false,
+        streamingMessageId: 'assistant-placeholder',
+      },
+    }))
+    useSessionStore.getState().queueResearchMessage('req-fail', '研究问题')
+    useSessionStore.getState().failResearchMessage('req-fail', '调用模型错误')
+    const conv = useSessionStore.getState().researchConversation
+    expect(conv.isStreaming).toBe(true)
+    expect(conv.isAborting).toBe(false)
+    expect(conv.streamingMessageId).toBe('assistant-placeholder')
+    expect(conv.messages[0]).toMatchObject({ deliveryStatus: 'failed', submissionError: '调用模型错误' })
+    expect(useSessionStore.getState().researchConnectionError).toBeNull()
+  })
+
+  it('accepts a late acknowledgement for an unconfirmed input in the current binding', () => {
+    useSessionStore.getState().bindResearchConversation(snapshot({ streamId: 'stream-1' }))
+    useSessionStore.getState().queueResearchMessage('late-ack', '保留原文')
+    useSessionStore.setState(state => ({ researchConversation: { ...state.researchConversation,
+      messages: state.researchConversation.messages.map(message => ({ ...message, deliveryStatus: 'unconfirmed' as const,
+        submissionError: '发送结果尚未确认' })) } }))
+    useSessionStore.getState().handleResearchBridgeMessage({ type: 'ack', requestId: 'late-ack', ok: true })
+    expect(useSessionStore.getState().researchConversation.messages[0]).toMatchObject({
+      requestId: 'late-ack', deliveryStatus: 'accepted', submissionError: undefined,
+    })
+  })
+
+  it('reconciles an unconfirmed input from host history before enabling retry', () => {
+    const actions = useSessionStore.getState()
+    actions.bindResearchConversation(snapshot({ streamId: 'stream-1' }))
+    actions.queueResearchMessage('timed-out', '同一条消息')
+    useSessionStore.setState(state => ({ researchConversation: { ...state.researchConversation,
+      messages: state.researchConversation.messages.map(message => ({ ...message, deliveryStatus: 'unconfirmed' as const,
+        submissionError: '发送结果尚未确认' })) } }))
+    actions.bindResearchConversation(snapshot({ streamId: 'stream-1', lastEventSeq: 11 }))
+    expect(useSessionStore.getState().researchConversation.messages[0]).toMatchObject({
+      requestId: 'timed-out', deliveryStatus: 'unconfirmed', deliveryReconciled: true,
+    })
+    actions.unconfirmResearchMessage('timed-out', '发送结果尚未确认')
+    expect(useSessionStore.getState().researchConversation.messages[0]).toMatchObject({ deliveryReconciled: true })
+    actions.bindResearchConversation(snapshot({ streamId: 'stream-1', lastEventSeq: 12, messages: [
+      { id: 'persisted-input', role: 'user', content: '同一条消息', timestamp: 100, details: { requestId: 'timed-out' } },
+    ] }))
+    expect(useSessionStore.getState().researchConversation.messages).toHaveLength(1)
+    expect(useSessionStore.getState().researchConversation.messages[0]).toMatchObject({
+      id: 'persisted-input', requestId: 'timed-out', deliveryStatus: 'created', optimistic: false,
+    })
+  })
+
+  it('does not let a retired stream snapshot replace the current binding', () => {
+    const actions = useSessionStore.getState()
+    actions.bindResearchConversation(snapshot({ streamId: 'old-stream', lastEventSeq: 100 }))
+    actions.bindResearchConversation(snapshot({ streamId: 'new-stream', lastEventSeq: 1,
+      messages: [{ id: 'new', role: 'user', content: '新绑定', timestamp: 1 }] }))
+    actions.bindResearchConversation(snapshot({ streamId: 'old-stream', lastEventSeq: 101,
+      messages: [{ id: 'old', role: 'user', content: '旧绑定', timestamp: 2 }] }))
+    expect(useSessionStore.getState().researchBinding?.streamId).toBe('new-stream')
+    expect(useSessionStore.getState().researchConversation.messages[0]?.content).toBe('新绑定')
+  })
+
+  it('resets isStreaming and cancels active message streams when research-error notice arrives', () => {
+    useSessionStore.getState().bindResearchConversation(snapshot())
+    useSessionStore.setState(state => ({
+      researchConversation: {
+        ...state.researchConversation,
+        isStreaming: true,
+        isAborting: false,
+        streamingMessageId: 'assistant-1',
+        messages: [{ id: 'assistant-1', role: 'assistant', content: 'generating...', timestamp: 100, isStreaming: true }],
+      },
+    }))
+    useSessionStore.getState().handleResearchBridgeMessage(notice(25, 'research-error', { run_id: 'r_err' }, 'Research run paused: ModelError'))
+    const conv = useSessionStore.getState().researchConversation
+    expect(conv.isStreaming).toBe(false)
+    expect(conv.isAborting).toBe(false)
+    expect(conv.streamingMessageId).toBeNull()
+    expect(conv.messages[0].isStreaming).toBe(false)
+  })
+})
+
+describe('run identity survives message-flow deduplication', () => {
+  it('adopts the run id from a discipline notice that the arrival cursor already passed', () => {
+    const actions = useSessionStore.getState()
+    // Binding at lastEventSeq 10 means a notice delivered at the boundary is deduplicated.
+    actions.bindResearchConversation(snapshot({ lastEventSeq: 12 }))
+    actions.queueResearchMessage('req-1', '复杂历史研究课题')
+    expect(useSessionStore.getState().researchBinding?.runId).toBeNull()
+
+    // The notice arrives late/duplicated, so its seq is not newer than the cursor. The row
+    // stream must not be replayed, but the run identity is still authoritative.
+    actions.handleResearchBridgeMessage(notice(12, 'research-discipline', { run_id: 'r_late' }))
+    expect(useSessionStore.getState().researchBinding?.runId).toBe('r_late')
+    expect(useSessionStore.getState().researchPendingCreationRequestId).toBeNull()
+    // The deduplicated notice must not insert a duplicate transcript row.
+    expect(useSessionStore.getState().researchConversation.messages.filter(row => row.role === 'user')).toHaveLength(1)
+    expect(useSessionStore.getState().researchConversation.lastEventSeq).toBe(12)
+  })
+
+  it('prefers a run id known only to an older host snapshot over discarding the snapshot', () => {
+    const actions = useSessionStore.getState()
+    actions.bindResearchConversation(snapshot({ lastEventSeq: 50, streamId: 'stream-1' }))
+    actions.queueResearchMessage('req-2', '另一课题')
+    expect(useSessionStore.getState().researchConversation.lastEventSeq).toBe(50)
+
+    // A stale snapshot cannot replace a newer transcript, but it is the only place that
+    // knows the run exists; refusing it would pin the binding at runId null.
+    actions.bindResearchConversation({ ...snapshot({ lastEventSeq: 4, streamId: 'stream-1',
+      run: { id: 'r_stale', status: 'active', phase: 'plan' } }), messages: [] })
+    expect(useSessionStore.getState().researchBinding?.runId).toBe('r_stale')
+    expect(useSessionStore.getState().researchConversation.lastEventSeq).toBe(50)
+    expect(useSessionStore.getState().researchPendingCreationRequestId).toBeNull()
   })
 })

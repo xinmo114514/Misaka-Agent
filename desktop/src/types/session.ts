@@ -1,6 +1,7 @@
 export type MessageRole = 'user' | 'assistant' | 'system' | 'custom'
 
 import type { PromptImage } from './attachment'
+import type { ResearchSubmissionInput } from '../lib/startComposerResearch'
 
 export interface ToolCall {
   id: string
@@ -12,6 +13,9 @@ export interface ToolCall {
   partialArguments?: string
   details?: any
   error?: string
+  /** Observed locally: transcripts carry no per-call clock, so history may omit both. */
+  startedAt?: number
+  endedAt?: number
 }
 
 export type MessageBlock =
@@ -43,10 +47,19 @@ export interface ChatMessage {
   optimistic?: boolean
   /** Research delivery acknowledgement is distinct from persisted message creation. */
   requestId?: string
-  deliveryStatus?: 'pending' | 'accepted' | 'created' | 'failed'
+  deliveryStatus?: 'pending' | 'unconfirmed' | 'accepted' | 'created' | 'failed'
+  /** A host snapshot/history refresh completed after an acknowledgement timeout. */
+  deliveryReconciled?: boolean
+  /** False when authoritative delivery uncertainty requires manual reconciliation. */
+  deliveryRetryable?: boolean
   /** Local delivery intent; acknowledgement means accepted, not consumed. */
   streamingBehavior?: 'steer' | 'followUp'
   submissionError?: string
+  /** Immutable original native input, retained for request-idempotent retry. */
+  researchSubmission?: Readonly<ResearchSubmissionInput>
+  researchDraft?: { text: string; attachmentPaths: string[]; sessionId: string; streamId?: string; mode: 'research'; revision?: number }
+  /** Delivery succeeded; execution subsequently failed. */
+  executionError?: string
   stopReason?: string
   errorMessage?: string
   tokens?: {

@@ -56,6 +56,7 @@ export interface AppAPI {
     stats: { totalMessages?: number; [key: string]: unknown }
     contextUsage: { tokens?: number; contextWindow?: number; percent?: number; [key: string]: unknown }
     messages?: import('./session').ChatMessage[]
+    submissionReceipts?: import('./research').ResearchHostSnapshot['submissionReceipts']
     historyVersion?: string | null
     lastEventSeq?: number
     streamId?: string

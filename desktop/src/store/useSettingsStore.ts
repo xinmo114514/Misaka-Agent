@@ -69,6 +69,16 @@ function sendSettingsCommand(type: string, payload: Record<string, any> = {}, ti
 let latestModelSwitchId: string | null = null
 let latestResearchModelRequest: string | null = null
 let awaitingResearchModelRequest: { requestId: string; sessionId: string; baseEpoch: number } | null = null
+/**
+ * A model the user just picked that the research team binding has not caught up to
+ * yet. While it stands, a polled team binding (still reporting the old effective
+ * pair) must not paint the old model back over the fresh choice. Cleared once the
+ * binding reports the choice as its effective model, or when a research-channel
+ * commit is confirmed.
+ */
+// `sessionId` is set only by a pick made inside a research conversation. An ordinary-mode
+// pick deliberately carries into the next research session, so it stays unscoped.
+let pendingModelChoice: { sessionId?: string; provider: string; modelId: string } | null = null
 let latestThinkingSwitchId: string | null = null
 let latestModelsReadId: string | null = null
 let latestThinkingReadId: string | null = null
@@ -691,12 +701,17 @@ export const useSettingsStore = create<SettingsState>((set, get) => ({
   setSessionModel: (provider: string, modelId: string, persist = false) => {
     const session = useSessionStore.getState()
     if (session.agentMode === 'research' && session.researchBinding) {
+      // The user's pick is authoritative for the team until its binding commits it.
+      pendingModelChoice = { sessionId: session.researchBinding.sessionId, provider, modelId }
       get().switchResearchTeamModel(provider, modelId)
       return
     }
     if (!window.bridge?.send || !sessionReady()) return
     // A new session needs a coherent model + ladder before it can own a rollback snapshot.
     if (!confirmedCapability && (latestModelsReadId || latestThinkingReadId)) return
+    // A pick that will still be sent through the research channel keeps itself alive
+    // across the team-binding effect that would otherwise paint the old model back.
+    pendingModelChoice = { provider, modelId }
     beginSwitch(get())
     const reqId = switchReqId('sm')
     // A new model supersedes any level change still in flight: its ack describes the model
@@ -736,14 +751,25 @@ export const useSettingsStore = create<SettingsState>((set, get) => ({
     const localPending = awaitingResearchModelRequest?.sessionId === sessionId && binding.epoch <= awaitingResearchModelRequest.baseEpoch
       && get().modelSwitchPending && Boolean(get().researchModelTarget)
     window.clearTimeout(pickerErrorTimer)
+    // A pick made for another research conversation must not keep this binding's effective
+    // model from painting; an unscoped ordinary-mode pick is meant to carry over.
+    if (pendingModelChoice?.sessionId && pendingModelChoice.sessionId !== sessionId) pendingModelChoice = null
+    // A fresh pick the team has not committed yet outranks a binding that still
+    // reports the previous pair, so the model pill keeps the user's choice instead
+    // of snapping back to the old effective model.
+    // A failed team commit settles the pick as abandoned, so the binding (and its
+    // error) paints the effective model again instead of the stale choice.
+    const caughtUp = binding.state === 'failed' || !pendingModelChoice
+      || (binding.effective.provider === pendingModelChoice.provider && binding.effective.modelId === pendingModelChoice.modelId)
+    if (caughtUp) pendingModelChoice = null
     const matched = get().models.find(model => model.provider === binding.effective.provider && model.id === binding.effective.modelId)
     const levels = matched ? resolveSupportedLevels(matched) : null
     const thinking = levels ? clampThinkingLevel(levels, get().thinkingLevel) : 'off'
     set({ researchModelBinding: binding, researchModelSessionId: sessionId, researchModelTarget: localPending ? get().researchModelTarget : binding.target,
       modelSwitchPending: localPending || binding.state === 'switching', pickerError: localPending ? get().pickerError : binding.state === 'failed' ? binding.error || '团队模型切换失败' : null,
-      currentModel: { ...binding.effective, name: matched?.name || binding.effective.modelId, thinking }, thinkingLevel: thinking,
-      availableThinkingLevels: matched && hasThinkingCapability(matched) ? levels : null,
-      thinkingCapability: matched?.thinkingCapability ?? null, supportsThinking: matched?.supportsThinking ?? matched?.reasoning ?? false })
+      ...(caughtUp ? { currentModel: { ...binding.effective, name: matched?.name || binding.effective.modelId, thinking }, thinkingLevel: thinking,
+        availableThinkingLevels: matched && hasThinkingCapability(matched) ? levels : null,
+        thinkingCapability: matched?.thinkingCapability ?? null, supportsThinking: matched?.supportsThinking ?? matched?.reasoning ?? false } : {}) })
   },
 
   switchResearchTeamModel: (provider, modelId, action = 'switch') => {

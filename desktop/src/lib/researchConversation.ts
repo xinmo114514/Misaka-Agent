@@ -1,6 +1,6 @@
 import type { BridgeEventEnvelope } from '../types/global'
 import type { ChatMessage } from '../types/session'
-import type { ResearchRunCard } from '../types/research'
+import type { ResearchRunCard, ResearchHostSnapshot } from '../types/research'
 import { reduceConversationEvent, type ConversationState } from './conversationEvents'
 import { contentText, normalizeChatMessage } from './messageBlocks'
 import { applyResearchNoticeToCard } from './researchCards'
@@ -24,6 +24,10 @@ function researchUserText(message: { customType?: string; details?: Record<strin
 export function projectResearchHistory(messages: ChatMessage[]): ChatMessage[] {
   return messages.map(raw => {
     const message = normalizeChatMessage(raw)
+    if (message.researchSubmission) {
+      const input = message.researchSubmission
+      message.researchSubmission = Object.freeze({ ...input, ...(input.limits ? { limits: Object.freeze({ ...input.limits }) } : {}) })
+    }
     const question = researchUserText(message)
     if (question === null && message.role !== 'user') return message
     return { ...message, role: 'user', content: question ?? message.content, deliveryStatus: 'created', optimistic: false,
@@ -32,21 +36,45 @@ export function projectResearchHistory(messages: ChatMessage[]): ChatMessage[] {
 }
 
 /** Snapshot absence is not rejection: preserve accepted but not-yet-persisted sends. */
-export function reconcileResearchPendingHistory(history: ChatMessage[], local: ChatMessage[]): ChatMessage[] {
-  const pending = local.filter(message => message.role === 'user' && message.optimistic && !message.submissionError)
+export function reconcileResearchPendingHistory(history: ChatMessage[], local: ChatMessage[], receipts: ResearchHostSnapshot['submissionReceipts'] = []): ChatMessage[] {
+  const candidates = local.filter(message => message.role === 'user' && (message.optimistic || message.deliveryStatus === 'failed' || message.researchSubmission))
   const matched = new Set<string>()
-  for (const message of history) {
-    if (message.role !== 'user') continue
+  const rows = history.map(message => {
+    if (message.role !== 'user') return message
     const requestId = message.requestId || message.details?.requestId
-    const match = pending.find(row => !matched.has(row.id) && (requestId ? row.requestId === requestId : row.content === message.content))
-    if (match) matched.add(match.id)
-  }
-  return [...history, ...pending.filter(message => !matched.has(message.id))]
+    const match = candidates.find(row => !matched.has(row.id) && (requestId ? row.requestId === requestId : row.content === message.content))
+    if (!match) return message
+    matched.add(match.id)
+    return { ...message, researchSubmission: match.researchSubmission ?? message.researchSubmission,
+      researchDraft: match.researchDraft ?? message.researchDraft, executionError: match.executionError ?? message.executionError,
+      deliveryRetryable: match.deliveryRetryable ?? message.deliveryRetryable }
+  })
+  return [...rows, ...candidates.filter(message => !matched.has(message.id))].map(message => {
+    const receipt = receipts.find(item => item.requestId === message.requestId)
+    if (receipt?.state === 'rejected' && receipt.errorStage === 'startup') return {
+      ...message, optimistic: false,
+      deliveryStatus: message.deliveryStatus === 'created' ? 'created' : 'accepted',
+      deliveryRetryable: receipt.retryable ?? true, submissionError: undefined,
+      executionError: receipt.error || message.executionError || '研究启动失败，原始问题已记录。',
+    }
+    if (receipt?.state === 'rejected') return { ...message, optimistic: false, deliveryStatus: 'failed',
+      deliveryRetryable: receipt.retryable ?? message.deliveryRetryable ?? true,
+      submissionError: receipt.error || message.submissionError || '研究消息已拒绝，请重试' }
+    if (receipt?.state === 'prepared' || receipt?.state === 'unconfirmed') return { ...message, optimistic: true, deliveryStatus: 'unconfirmed', deliveryRetryable: false, deliveryReconciled: true, submissionError: undefined }
+    if (receipt?.state === 'accepted' || receipt?.state === 'applied') return { ...message, optimistic: receipt.state === 'accepted', deliveryStatus: receipt.state === 'applied' ? 'created' : 'accepted', submissionError: undefined, deliveryReconciled: undefined }
+    return message.deliveryStatus === 'unconfirmed' ? { ...message, deliveryReconciled: true } : message
+  })
 }
 
 export function reduceResearchConversationEvent(state: ConversationState, envelope: BridgeEventEnvelope): ConversationState {
   if (!state.currentSessionId || envelope.sessionId !== state.currentSessionId || envelope.seq <= state.lastEventSeq) return state
   const event = envelope.event
+  const entryMessage = event.type === 'entry_appended' ? event.entry?.message : null
+  const entryRequestId = entryMessage?.requestId || entryMessage?.details?.requestId
+  if (entryRequestId && (entryMessage.role === 'user' || researchUserText(entryMessage) !== null)) {
+    return { ...state, lastEventSeq: envelope.seq, messages: state.messages.map(message =>
+      message.role === 'user' && message.requestId === entryRequestId && !message.entryId ? { ...message, entryId: event.entry.id } : message) }
+  }
   const question = researchUserText(event.message ?? {})
   const projected = question !== null && (event.type === 'message_start' || event.type === 'message_end')
     ? { ...envelope, event: { ...event, message: { ...event.message, role: 'user', content: question } } }
@@ -56,17 +84,20 @@ export function reduceResearchConversationEvent(state: ConversationState, envelo
     ? state.messages.find(message => message.role === 'user' && message.requestId === requestId) : undefined
   // Use the shared reducer's authoritative row conversion but reconcile its identity
   // by request ID: identical queued inputs are independent submissions.
-  let next = reduceConversationEvent(correlatedRow ? { ...state, messages: [] } : state, projected)
-  if (correlatedRow) {
+  const identifiedUserEvent = Boolean(projected.event.message?.role === 'user' && requestId && (event.type === 'message_start' || event.type === 'message_end'))
+  let next = reduceConversationEvent(identifiedUserEvent ? { ...state, messages: [] } : state, projected)
+  if (identifiedUserEvent) {
     const authoritative = next.messages.find(message => message.role === 'user')
-    if (authoritative) next = { ...next, messages: state.messages.map(message => message.id === correlatedRow.id
-      ? { ...message, ...authoritative, id: message.id, requestId: message.requestId, optimistic: false, deliveryStatus: 'created', submissionError: undefined } : message) }
+    if (authoritative) next = { ...next, messages: correlatedRow ? state.messages.map(message => message.id === correlatedRow.id
+      ? { ...message, ...authoritative, id: message.id, requestId: message.requestId, optimistic: false, deliveryStatus: 'created', submissionError: undefined } : message)
+      : [...state.messages, { ...authoritative, requestId, optimistic: false, deliveryStatus: 'created' }] }
   }
   // Non-conversation notices share the same ordered host stream too.
   if (next.lastEventSeq !== envelope.seq) next = { ...next, lastEventSeq: envelope.seq }
   if ((event.type === 'message_start' || event.type === 'message_end') && (event.message?.role === 'user' || question !== null)) {
     const questionRow = question === null ? null : [...next.messages].reverse().find(message =>
       message.role === 'user' && !message.optimistic && !message.submissionError && message.content === question &&
+      (!requestId || message.requestId === requestId) &&
       (event.message?.timestamp === undefined || message.timestamp === event.message.timestamp))
     next = { ...next, messages: next.messages.map(message => {
       if (message.role !== 'user' || message.optimistic || message.submissionError) return message
@@ -80,11 +111,16 @@ export function reduceResearchConversationEvent(state: ConversationState, envelo
       ? { ...message, entryId: event.entry.id } : message) }
   }
   if (event.type === 'message_end' && event.message?.role === 'custom' &&
-    (event.message.customType === 'research-final' || event.message.customType === 'research-error' || event.message.customType === 'research-clarification') &&
-    !next.streamingMessageId) {
+    (event.message.customType === 'research-final' || event.message.customType === 'research-error' || event.message.customType === 'research-clarification')) {
     // The background research driver can finish without a model agent_settled event.
-    // A genuinely live assistant remains owned by the shared conversation reducer.
-    next = { ...next, isStreaming: false, isAborting: false }
+    // When research-error / final / clarification arrives, the run is no longer streaming.
+    next = {
+      ...next,
+      isStreaming: false,
+      isAborting: false,
+      streamingMessageId: null,
+      messages: next.messages.map(m => m.isStreaming ? { ...m, isStreaming: false } : m),
+    }
   }
   return next
 }
@@ -116,4 +152,15 @@ export function hydrateResearchHistoryCards(existing: Record<string, ResearchRun
 
 export function isResearchRunActive(status?: string): boolean {
   return Boolean(status && !['done', 'closed', 'stopped', 'partial', 'failed', 'error', 'cancelled', 'aborted', 'waiting_input'].includes(status))
+}
+
+/**
+ * A failure that happened *after* the intent was taken but before (or instead of) the run it
+ * describes. The question is already recorded, so it is an execution failure to retry, never a
+ * submission that failed to send. `startup` covers run creation; `recruitment` covers the team
+ * turn that has to finish first.
+ */
+export function isResearchStartupFailure(error: { accepted?: boolean; stage?: string; errorStage?: string } | null | undefined): boolean {
+  if (!error) return false
+  return Boolean(error.accepted) || error.stage === 'startup' || error.errorStage === 'startup' || error.errorStage === 'recruitment'
 }

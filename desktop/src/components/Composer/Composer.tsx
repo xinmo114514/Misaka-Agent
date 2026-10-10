@@ -20,9 +20,10 @@ import { useSettingsStore } from '../../store/useSettingsStore'
 import { ModelPickerPopover } from './ModelPickerPopover'
 import { MisakaLogo } from '../MisakaLogo'
 import type { PermissionMode } from '../../types/session'
-import { startComposerResearch } from '../../lib/startComposerResearch'
+import { cancelResearchStartup, startComposerResearch } from '../../lib/startComposerResearch'
+import { isResearchStartupFailure } from '../../lib/researchConversation'
 import { newRequestId } from '../../lib/bridge'
-import { executeResearchControl } from '../../lib/researchBridge'
+import { recordResearchSubmissionDiagnostic } from '../../lib/researchDiagnostics'
 
 interface ComposerProps {
   onOpenModelSettings?: () => void
@@ -89,8 +90,10 @@ export const Composer: React.FC<ComposerProps> = ({ onOpenModelSettings, welcome
   const [isPickingFiles, setIsPickingFiles] = useState(false)
   const [attachmentNotice, setAttachmentNotice] = useState<string | null>(null)
   const [researchStarting, setResearchStarting] = useState(false)
+  const [researchCancelling, setResearchCancelling] = useState(false)
   const [researchError, setResearchError] = useState<string | null>(null)
   const researchStartingRef = useRef(false)
+  const researchStartingRequestRef = useRef<string | null>(null)
   const sendMenuRef = useRef<HTMLDivElement>(null)
   const sendMenuTriggerRef = useRef<HTMLButtonElement>(null)
   const textareaRef = useRef<HTMLTextAreaElement>(null)
@@ -113,12 +116,20 @@ export const Composer: React.FC<ComposerProps> = ({ onOpenModelSettings, welcome
   const runSlashCommand = useSessionStore(s => s.runSlashCommand)
   const sendMessage = useSessionStore((s) => s.sendMessage)
   const ordinaryAbort = useSessionStore(s => s.abortGeneration)
+  const requestResearchStop = useSessionStore(s => s.requestResearchStop)
   const abortGeneration = useCallback(() => {
     const state = useSessionStore.getState()
-    if (state.agentMode === 'research' && state.researchBinding?.runId) {
-      void executeResearchControl('stop_research', { runId: state.researchBinding.runId, workspace: state.researchBinding.workspace, sessionFile: state.researchBinding.sessionFile }).catch(error => setResearchError(String(error)))
+    if (state.agentMode === 'research' && state.researchBinding) {
+      setResearchError(null)
+      // A start with no run id is owned by the research host, never this window's ordinary session.
+      if (!state.researchBinding.runId) setResearchCancelling(true)
+      requestResearchStop()
+    } else if (state.agentMode === 'research' && researchStartingRef.current && researchStartingRequestRef.current) {
+      setResearchError(null)
+      setResearchCancelling(true)
+      cancelResearchStartup(researchStartingRequestRef.current)
     } else ordinaryAbort()
-  }, [ordinaryAbort])
+  }, [ordinaryAbort, requestResearchStop])
   const permissionMode = useSessionStore((s) => s.permissionMode)
   const setPermissionMode = useSessionStore((s) => s.setPermissionMode)
   const agentMode = useSessionStore(s => s.agentMode)
@@ -127,7 +138,18 @@ export const Composer: React.FC<ComposerProps> = ({ onOpenModelSettings, welcome
   const isResearch = agentMode === 'research'
   const researchBinding = useSessionStore(s => s.researchBinding)
   const researchConnectionError = useSessionStore(s => s.researchConnectionError)
+  const researchLatestDelivery = useSessionStore(s => {
+    const rows = s.researchConversation.messages
+    for (let index = rows.length - 1; index >= 0; index -= 1) {
+      const row = rows[index]
+      if (row.role === 'user' && row.requestId) {
+        return `${row.requestId}:${row.deliveryStatus}:${row.submissionError || ''}:${row.executionError || ''}`
+      }
+    }
+    return ''
+  })
   const researchCard = useSessionStore(s => s.researchBinding?.runId ? s.researchCards[s.researchBinding.runId] : undefined)
+  const researchTeam = useSessionStore(s => s.researchTeam)
 
   const currentModel = useSettingsStore((s) => s.currentModel)
   const models = useSettingsStore(s => s.models)
@@ -161,6 +183,23 @@ export const Composer: React.FC<ComposerProps> = ({ onOpenModelSettings, welcome
   }, [permissionMode, isResearch])
 
   const CurrentModeIcon = currentModeConfig.icon
+
+  useEffect(() => { setResearchError(null) }, [isResearch, researchBinding?.sessionId, researchBinding?.streamId])
+  useEffect(() => {
+    if (isResearch) return
+    researchStartingRef.current = false
+    researchStartingRequestRef.current = null
+    setResearchStarting(false)
+    setResearchCancelling(false)
+  }, [isResearch])
+  useEffect(() => {
+    const message = [...useSessionStore.getState().researchConversation.messages].reverse().find(row => row.role === 'user' && row.requestId)
+    // A fast retry can pass through pending and accepted in one React batch.
+    // Clear its old local error on either state, not only on a visible pending row.
+    if (message && ['pending', 'accepted', 'created'].includes(message.deliveryStatus || '') &&
+      !message.submissionError && !message.executionError) setResearchError(null)
+  }, [researchLatestDelivery])
+  useEffect(() => { if (!researchStarting) setResearchCancelling(false) }, [researchStarting])
 
   useEffect(() => {
     const handleClickOutside = (e: MouseEvent) => {
@@ -220,7 +259,34 @@ export const Composer: React.FC<ComposerProps> = ({ onOpenModelSettings, welcome
   }, [showSendMenu, isStreaming, isSessionLoading, sessionLoadError, isAborting])
 
   const submitText = (mode: 'steer' | 'followUp' = 'steer') => {
-    if (researchStartingRef.current) return
+    const submissionState = useSessionStore.getState()
+    if (composing.current) return
+    const commandText = text.trim()
+    // Stop is control input, not another message: it must pass a pending input's
+    // delivery gate, while retaining explicit target and syntax validation.
+    if (isResearch && /^\/(?:research\s+)?stop(?:\s|$)/i.test(commandText)) {
+      const stopCommand = /^\/(?:research\s+)?stop(?:\s+(\S+))?$/i.exec(commandText)
+      if (!stopCommand) {
+        setResearchError('停止命令仅接受一个研究 ID；原始输入已保留。')
+        return
+      }
+      if (stopCommand[1] && stopCommand[1] !== submissionState.researchBinding?.runId) {
+        setResearchError('停止目标与当前研究不一致，请打开对应的研究会话。')
+        return
+      }
+      if (!submissionState.researchBinding) {
+        setResearchError('当前研究宿主尚未就绪，请等待启动完成。')
+        return
+      }
+      if (submissionState.researchConversation.isAborting || researchCancelling) return
+      abortGeneration()
+      setText('')
+      setResearchError(null)
+      setShowSendMenu(false)
+      return
+    }
+    if (isResearch && researchStartingRef.current) return
+    if (isResearch && !submissionState.researchBinding?.runId && submissionState.researchPendingCreationRequestId) return
     if (isPickingFiles || attachments.some(item => item.status !== 'ready') || isSessionLoading || sessionLoadError || isAborting || sessionOperation || isCompacting || composing.current) return
     if (!text.trim() && !attachments.length) return
     const attachedText = attachments.map(item => item.text).filter(Boolean)
@@ -245,35 +311,68 @@ export const Composer: React.FC<ComposerProps> = ({ onOpenModelSettings, welcome
         setResearchError('请先结束或停止当前对话，再开始研究。')
         return
       }
+      if (researchBinding?.runId && researchCard?.status === 'stopping') {
+        setResearchError('研究正在停止，请等待停止完成后再发送。')
+        return
+      }
       if (images.length) {
         setResearchError('研究消息请使用文字或文本附件；图片仍保留在草稿中。')
         return
       }
+      useSessionStore.setState({ researchConnectionError: null })
       const requestId = newRequestId('research_input')
+      recordResearchSubmissionDiagnostic({ requestId, text: messageText, sessionId: researchBinding?.sessionId })
+      let owner = researchBinding
+      const ownsContext = () => {
+        const current = useSessionStore.getState()
+        return current.agentMode === 'research' && current.currentWorkspace === currentWorkspace &&
+          (owner ? current.researchBinding?.sessionId === owner.sessionId && current.researchBinding?.streamId === owner.streamId : !current.researchBinding)
+      }
       researchStartingRef.current = true
+      researchStartingRequestRef.current = requestId
       setResearchStarting(true)
       setResearchError(null)
       void startComposerResearch({ question: messageText, workspace: researchBinding?.workspace || currentWorkspace,
-        model: currentModel, thinkingLevel, binding: researchBinding, requestId,
+        model: currentModel, thinkingLevel, binding: researchBinding, requestId, startNew: !researchBinding?.runId,
         onBound: host => {
+          if (!ownsContext()) return
           useSessionStore.getState().bindResearchConversation(host)
+          owner = useSessionStore.getState().researchBinding
           useSessionStore.getState().queueResearchMessage(requestId, messageText)
         },
+        onSubmission: submission => {
+          if (!ownsContext() || !owner) return
+          useSessionStore.getState().rememberResearchSubmission(requestId, submission, {
+            text, attachmentPaths: attachments.map(item => item.path), sessionId: owner.sessionId, streamId: owner.streamId, mode: 'research', revision: submissionState.draftRevision,
+          })
+        },
         onAccepted: () => useSessionStore.getState().acceptResearchMessage(requestId),
+        onUnconfirmed: (error, reconciled) => useSessionStore.getState().unconfirmResearchMessage(requestId, error.message, (error as Error & { retryable?: boolean }).retryable, reconciled),
       }).then(host => {
+        if (!ownsContext()) return
         useSessionStore.getState().bindResearchConversation(host)
-        if (useSessionStore.getState().draft === text) setText('')
-        for (const attachment of attachments) removeAttachment(attachment.path)
+        const state = useSessionStore.getState()
+        if (state.draft === text && state.draftRevision === submissionState.draftRevision && state.attachments.length === attachments.length && state.attachments.every((item, index) => item === attachments[index])) {
+          setText('')
+          for (const attachment of attachments) removeAttachment(attachment.path)
+        }
+        if (host.syncError) useSessionStore.setState({ researchConnectionError: host.syncError })
         setAttachmentNotice(null)
         setShowSendMenu(false)
         useSessionStore.getState().fetchResearchRuns()
         onResearchStarted?.()
       }).catch(error => {
         const message = error instanceof Error ? error.message : String(error)
-        useSessionStore.getState().failResearchMessage(requestId, message)
+        const state = useSessionStore.getState()
+        if (!ownsContext()) return
+        if (isResearchStartupFailure(error)) state.failResearchExecution(requestId, message)
+        else if ((error instanceof Error && error.name === 'ResearchRequestTimeoutError') || error?.errorCode === 'RESEARCH_DELIVERY_UNCONFIRMED') state.unconfirmResearchMessage(requestId, message, error?.retryable)
+        else state.failResearchMessage(requestId, message, error?.retryable)
         setResearchError(message)
       }).finally(() => {
+        if (researchStartingRequestRef.current !== requestId) return
         researchStartingRef.current = false
+        researchStartingRequestRef.current = null
         setResearchStarting(false)
       })
       return
@@ -281,6 +380,7 @@ export const Composer: React.FC<ComposerProps> = ({ onOpenModelSettings, welcome
     if (images.length) sendMessage(messageText, mode, images)
     else sendMessage(messageText, mode)
     setText('')
+    setResearchError(null)
     clearAttachments()
     setAttachmentNotice(null)
     setShowSendMenu(false)
@@ -317,6 +417,16 @@ export const Composer: React.FC<ComposerProps> = ({ onOpenModelSettings, welcome
   const pendingLabel = researchStarting ? '研究启动中' : sessionLoadError ? '会话尚未就绪' : isSessionLoading ? '会话加载中' : isAborting ? '停止中' : sessionOperation ? '会话操作中' : isCompacting ? '压缩中' : ''
   const sendDisabled = Boolean(pendingLabel) || !hasContent || hasPendingAttachment || hasAttachmentError || hasUnsupportedImageModel
   const sendLabel = isStreaming ? '干预当前运行 (Enter)' : isResearch ? (researchBinding?.runId ? '发送研究消息 (Enter)' : '开始研究 (Enter)') : '发送指令 (Enter)'
+  // A start without a run id is cancelled on the research host, so its button is never the ordinary abort.
+  const cancellingStartup = isResearch && researchStarting && !researchBinding?.runId
+  // Say which step the startup is on, so a slow deep-research initialization does not read as
+  // a frozen app: recruitment has its own visible ending, and the planner takes over after it.
+  const recruitedCount = researchTeam?.members.length ?? 0
+  const researchStartupLabel = recruitedCount
+    ? `研究团队已就绪（${recruitedCount} 名成员），正在启动研究规划…`
+    : '正在准备研究团队…（招募可能需要数分钟，可随时取消）'
+  const stopLabel = cancellingStartup ? (researchCancelling ? '取消中' : '取消研究启动') : isAborting ? '停止中' : '中止生成 (Esc)'
+  const stopDisabled = cancellingStartup ? researchCancelling : Boolean(pendingLabel)
 
   return (
     <div className={'conversation-composer-dock pointer-events-none z-10' + (welcome ? ' conversation-composer-dock--welcome' : '')}>
@@ -370,8 +480,8 @@ export const Composer: React.FC<ComposerProps> = ({ onOpenModelSettings, welcome
           {(attachmentNotice || hasUnsupportedImageModel) && <div role="status" className="text-[11px] text-warning">
             {attachmentNotice || '当前模型不支持图片输入，请切换到支持图片的模型。附件仍保留在草稿中。'}
           </div>}
-          {(researchError || researchConnectionError && isResearch) && <div role="alert" className="text-[11px] text-danger">{researchError || researchConnectionError}</div>}
-          {researchStarting && !researchBinding?.runId && <div role="status" className="text-[11px] text-dim">正在准备研究团队…</div>}
+          {isResearch && (researchError || researchConnectionError) && <div role="alert" className="text-[11px] text-danger">{researchError || researchConnectionError}</div>}
+          {researchStarting && !researchBinding?.runId && <div role="status" className="text-[11px] text-dim">{researchStartupLabel}</div>}
 
           {/* Bottom Toolbar */}
           <div className="conversation-composer-toolbar flex items-center justify-between pt-1 border-t border-border-subtle/50 text-xs select-none">
@@ -525,10 +635,10 @@ export const Composer: React.FC<ComposerProps> = ({ onOpenModelSettings, welcome
                 </div>}
               </>}
               </div>
-              {isStreaming && <button type="button" onClick={abortGeneration} disabled={Boolean(pendingLabel)}
-                aria-label={isAborting ? '停止中' : '中止生成 (Esc)'} title={isAborting ? '停止中' : '中止生成 (Esc)'}
+              {(isStreaming || (isResearch && (isAborting || researchStarting))) && <button type="button" onClick={abortGeneration} disabled={stopDisabled}
+                aria-label={stopLabel} title={stopLabel}
                 className="conversation-stop-button h-8 min-w-8 px-2 rounded-full flex items-center justify-center gap-1 bg-danger text-on-danger hover:opacity-90 disabled:opacity-50 disabled:cursor-wait">
-                {isAborting ? <><Loader2 className="w-4 h-4 animate-spin" /><span className="text-[11px]">停止中</span></> : <Square className="w-3.5 h-3.5 fill-current" />}
+                {(isAborting || researchCancelling) ? <><Loader2 className="w-4 h-4 animate-spin" /><span className="text-[11px]">{stopLabel}</span></> : <Square className="w-3.5 h-3.5 fill-current" />}
               </button>}
             </div>
           </div>

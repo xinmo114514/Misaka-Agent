@@ -101,3 +101,17 @@ it('keeps an unacknowledged local target visible when polling repeats the earlie
   deliver({ type: 'ack', requestId: research[0].requestId, ok: true, data: { modelBinding: binding(2, 'switching', { provider: 'fixture', modelId: 'b' }) } })
   await Promise.resolve(); await Promise.resolve()
 })
+it('keeps the fresh pick over an old team binding until the binding catches up', () => {
+  // Ordinary-mode pick: no research binding exists yet, so this writes the model
+  // on the ordinary path and records the choice as still uncommitted for research.
+  useSessionStore.setState({ agentMode: 'agent', researchBinding: null } as any)
+  useSettingsStore.getState().setSessionModel('fixture', 'b')
+  expect(useSettingsStore.getState().currentModel?.modelId).toBe('b')
+  // Entering research mode adopts the team's settled (old) binding; the fresh pick wins.
+  useSessionStore.setState({ agentMode: 'research', researchBinding: { sessionId: 'root', sessionFile: '/root.jsonl', workspace: '/work', runId: 'run' } } as any)
+  useSettingsStore.getState().applyResearchModelBinding('root', binding(4) as any)
+  expect(useSettingsStore.getState().currentModel?.modelId).toBe('b')
+  // Once the team commits the choice, the binding legitimately paints it.
+  useSettingsStore.getState().applyResearchModelBinding('root', { effective: { provider: 'fixture', modelId: 'b' }, target: null, epoch: 5, state: 'ready' })
+  expect(useSettingsStore.getState().currentModel?.modelId).toBe('b')
+})

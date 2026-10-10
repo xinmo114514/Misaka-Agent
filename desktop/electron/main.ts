@@ -471,7 +471,7 @@ app.whenReady().then(() => {
       'start_research', 'resume_research', 'stop_research', 'prompt', 'get_research_host',
       'get_stats', 'compact_session', 'cancel_session_operation',
       'set_permission_mode', 'set_model', 'set_thinking',
-      'send_research_message',
+      'send_research_message', 'abort',
       'desktop_set_team_model', 'desktop_retain_roles',
     ])
     if (typeof value.type !== 'string' || !allowed.has(value.type)) return

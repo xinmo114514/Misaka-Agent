@@ -93,4 +93,37 @@ describe('target history is independent from runtime activation', () => {
     useSettingsStore.getState().setThinkingLevel('high')
     expect(vi.mocked(window.bridge.send)).not.toHaveBeenCalled()
   })
+
+  it('switches back to agent mode when opening another session from research mode', () => {
+    useSessionStore.setState({
+      agentMode: 'research',
+      researchBinding: { sessionId: 'research-1', sessionFile: 'research.jsonl', workspace: 'C:/project', runId: null },
+    })
+    useSessionStore.getState().openSession('normal.jsonl')
+    expect(useSessionStore.getState().agentMode).toBe('agent')
+    expect(command().type).toBe('load_session')
+    expect(command().path).toBe('normal.jsonl')
+  })
+
+  it('allows switching to currentSessionPath from research mode and resets agent mode', () => {
+    useSessionStore.setState({
+      currentSessionPath: 'current.jsonl',
+      agentMode: 'research',
+      researchBinding: { sessionId: 'research-1', sessionFile: 'research.jsonl', workspace: 'C:/project', runId: null },
+    })
+    useSessionStore.getState().openSession('current.jsonl')
+    expect(useSessionStore.getState().agentMode).toBe('agent')
+    expect(command().type).toBe('load_session')
+    expect(command().path).toBe('current.jsonl')
+  })
+
+  it('clears research-local connection errors when leaving for an ordinary session', () => {
+    useSessionStore.setState({
+      agentMode: 'research',
+      researchConnectionError: '旧研究连接错误',
+      researchBinding: { sessionId: 'research-1', sessionFile: 'research.jsonl', workspace: 'C:/project', runId: 'run-1' },
+    })
+    useSessionStore.getState().openSession('normal.jsonl')
+    expect(useSessionStore.getState().researchConnectionError).toBeNull()
+  })
 })

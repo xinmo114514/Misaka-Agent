@@ -3,16 +3,88 @@ import { afterEach, beforeEach, expect, it, vi } from 'vitest'
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { Composer } from '../Composer'
 import { useSessionStore } from '../../../store/useSessionStore'
-const research = vi.hoisted(() => ({ start: vi.fn() }))
-vi.mock('../../../lib/startComposerResearch', () => ({ startComposerResearch: research.start }))
+const research = vi.hoisted(() => ({ start: vi.fn(), stop: vi.fn(), cancelStartup: vi.fn(() => true),
+  host: vi.fn(async () => ({ session: { sessionId: 's1' }, run: null })) }))
+vi.mock('../../../lib/startComposerResearch', () => ({ startComposerResearch: research.start, cancelResearchStartup: research.cancelStartup }))
+vi.mock('../../../lib/researchBridge', () => ({ executeResearchControl: research.stop, requestResearch: research.host,
+  isResearchRequestTimeout: (error: unknown) => error instanceof Error && error.name === 'ResearchRequestTimeoutError' }))
 
 afterEach(cleanup)
+it('preserves nonretryable research request errors on the failed user row', async () => {
+  research.start.mockImplementationOnce(async input => {
+    input.onBound?.(researchSnapshot)
+    throw Object.assign(new Error('原会话身份冲突'), { retryable: false })
+  })
+  useSessionStore.setState({ agentMode: 'research', draft: '保留课题' })
+  render(<Composer />)
+  fireEvent.keyDown(screen.getByRole('textbox'), { key: 'Enter' })
+  expect(await screen.findByRole('alert')).toHaveTextContent('原会话身份冲突')
+  expect(useSessionStore.getState().researchConversation.messages[0]).toMatchObject({ deliveryStatus: 'failed', deliveryRetryable: false })
+})
+it('preserves a draft edited and restored to the original text during submission', async () => {
+  let finish!: (host: any) => void
+  research.start.mockImplementationOnce(input => {
+    input.onBound?.(researchSnapshot)
+    return new Promise(resolve => { finish = resolve })
+  })
+  useSessionStore.setState({ agentMode: 'research', draft: '原课题' })
+  render(<Composer />)
+  const input = screen.getByRole('textbox')
+  fireEvent.keyDown(input, { key: 'Enter' })
+  fireEvent.change(input, { target: { value: '编辑后的草稿' } })
+  fireEvent.change(input, { target: { value: '原课题' } })
+  finish({ ...researchSnapshot, runId: 'new-run' })
+  await waitFor(() => expect(screen.queryByRole('button', { name: '研究启动中' })).not.toBeInTheDocument())
+  expect(useSessionStore.getState().draft).toBe('原课题')
+})
+it('retains draft after accepted research startup execution fails without marking submission failed', async () => {
+  research.start.mockImplementationOnce(async input => {
+    input.onBound?.({ ...researchSnapshot, run: null })
+    input.onAccepted?.()
+    throw Object.assign(new Error('模型初始化失败'), { accepted: true, stage: 'startup' })
+  })
+  useSessionStore.setState({ agentMode: 'research', draft: '保留已接收课题' })
+  render(<Composer />)
+  fireEvent.keyDown(screen.getByRole('textbox'), { key: 'Enter' })
+  expect(await screen.findByRole('alert')).toHaveTextContent('模型初始化失败')
+  expect(useSessionStore.getState().draft).toBe('保留已接收课题')
+  expect(useSessionStore.getState().researchConversation.messages[0]).toMatchObject({ deliveryStatus: 'accepted', executionError: '模型初始化失败', submissionError: undefined })
+})
+it('preserves a mode-switched draft when an earlier research submission succeeds', async () => {
+  let finish!: (host: any) => void
+  research.start.mockImplementationOnce(input => {
+    input.onBound?.(researchSnapshot)
+    return new Promise(resolve => { finish = resolve })
+  })
+  useSessionStore.setState({ agentMode: 'research', draft: '相同草稿' })
+  render(<Composer />)
+  fireEvent.keyDown(screen.getByRole('textbox'), { key: 'Enter' })
+  useSessionStore.setState({ agentMode: 'agent', draft: '相同草稿' })
+  finish({ ...researchSnapshot, runId: 'new-run' })
+  await waitFor(() => expect(screen.queryByRole('button', { name: '研究启动中' })).not.toBeInTheDocument())
+  expect(useSessionStore.getState().draft).toBe('相同草稿')
+})
+
+it('shows snapshot synchronization failure as connection warning after accepted submission', async () => {
+  research.start.mockImplementationOnce(async input => {
+    input.onBound?.(researchSnapshot)
+    input.onAccepted?.()
+    return { ...researchSnapshot, runId: 'new-run', syncError: '状态刷新失败' }
+  })
+  useSessionStore.setState({ agentMode: 'research', draft: '已接受课题' })
+  render(<Composer />)
+  fireEvent.keyDown(screen.getByRole('textbox'), { key: 'Enter' })
+  expect(await screen.findByRole('alert')).toHaveTextContent('状态刷新失败')
+  expect(useSessionStore.getState().draft).toBe('')
+  expect(useSessionStore.getState().researchConversation.messages[0]).toMatchObject({ deliveryStatus: 'accepted', submissionError: undefined })
+})
 const send = vi.fn()
 const stop = vi.fn()
 const researchSnapshot = { enabled: true, session: { sessionId: 'research-root', file: 'root.jsonl', cwd: 'C:/project' },
   messages: [], historyVersion: 'v1', lastEventSeq: 0, run: { id: 'new-run', status: 'active', phase: 'plan' }, stats: {}, contextUsage: {} }
 beforeEach(() => {
-  send.mockClear(); stop.mockClear()
+  send.mockClear(); stop.mockClear(); research.stop.mockReset().mockResolvedValue(undefined)
+  research.cancelStartup.mockReset().mockReturnValue(true)
   research.start.mockReset().mockImplementation(async input => { input.onBound?.(researchSnapshot); input.onAccepted?.(); return { ...researchSnapshot, runId: 'new-run' } })
   useSessionStore.setState({ researchBinding: null, researchConnectionError: null,
     researchConversation: { currentSessionId: '', messages: [], isStreaming: false, isAborting: false, streamingMessageId: null, lastEventSeq: 0 },
@@ -273,4 +345,167 @@ it('routes followup text to the bound coordinator during research streaming and 
   expect(research.start).toHaveBeenCalledWith(expect.objectContaining({ question: '只考虑公开证据', binding }))
   expect(send).not.toHaveBeenCalled()
   expect(useSessionStore.getState().messages.map(m => m.content)).toEqual(['普通聊天'])
+})
+
+it('keeps research stop pending through acknowledgement and ignores duplicates until a terminal notice', async () => {
+  let acceptStop!: () => void
+  research.stop.mockImplementationOnce(() => new Promise<void>(resolve => { acceptStop = resolve }))
+  useSessionStore.getState().bindResearchConversation({ ...researchSnapshot, streamId: 'stream-1' })
+  useSessionStore.setState(state => ({ agentMode: 'research', researchConversation: {
+    ...state.researchConversation, isStreaming: true,
+  } }))
+  render(<Composer />)
+  const input = screen.getByRole('textbox')
+  fireEvent.change(input, { target: { value: '/research stop' } })
+  fireEvent.keyDown(input, { key: 'Enter' })
+  expect(research.stop).toHaveBeenCalledOnce()
+  expect(screen.getByRole('button', { name: '停止中' })).toBeDisabled()
+  fireEvent.change(input, { target: { value: '/stop' } })
+  fireEvent.keyDown(input, { key: 'Enter' })
+  expect(research.stop).toHaveBeenCalledOnce()
+  acceptStop()
+  await Promise.resolve()
+  expect(screen.getByRole('button', { name: '停止中' })).toBeDisabled()
+  useSessionStore.getState().handleResearchBridgeMessage({ seq: 1, streamId: 'stream-1', sessionId: 'research-root', event: {
+    type: 'message_end', message: { role: 'custom', customType: 'research-final', content: 'stopped',
+      details: { run_id: 'new-run', result: { status: 'stopped' } }, timestamp: 1 },
+  } })
+  await waitFor(() => expect(screen.queryByRole('button', { name: '停止中' })).not.toBeInTheDocument())
+})
+
+it('cancels a pending research start on the research host instead of aborting the ordinary session', async () => {
+  let finishStart!: (host: any) => void
+  research.start.mockImplementationOnce(input => {
+    input.onBound?.({ ...researchSnapshot, run: null })
+    return new Promise<any>(resolve => { finishStart = resolve })
+  })
+  useSessionStore.setState({ agentMode: 'research' })
+  render(<Composer />)
+  const input = screen.getByRole('textbox')
+  fireEvent.change(input, { target: { value: '尚未确认的研究课题' } })
+  fireEvent.keyDown(input, { key: 'Enter' })
+  await waitFor(() => expect(research.start).toHaveBeenCalledOnce())
+  expect(useSessionStore.getState().researchBinding?.runId).toBeFalsy()
+
+  fireEvent.click(screen.getByRole('button', { name: '取消研究启动' }))
+  // The cancel now asks the owning host whether a run already exists before it decides
+  // between "stop that research" and "cancel this startup", so it settles on a later tick.
+  await waitFor(() => expect(research.cancelStartup).toHaveBeenCalledWith('research-root'))
+  expect(stop).not.toHaveBeenCalled()
+  expect(screen.getByRole('button', { name: '取消中' })).toBeDisabled()
+  fireEvent.click(screen.getByRole('button', { name: '取消中' }))
+  expect(research.cancelStartup).toHaveBeenCalledOnce()
+  finishStart({ ...researchSnapshot, runId: 'late-run' })
+  await waitFor(() => expect(screen.queryByRole('button', { name: '取消中' })).not.toBeInTheDocument())
+})
+
+it('cancels a slow research host launch by its input identity without aborting ordinary chat', async () => {
+  research.start.mockImplementationOnce(() => new Promise(() => {}))
+  useSessionStore.setState({ agentMode: 'research', draft: '等待宿主连接的研究课题', researchPendingCreationRequestId: null })
+  render(<Composer />)
+  fireEvent.keyDown(screen.getByRole('textbox'), { key: 'Enter' })
+  await waitFor(() => expect(research.start).toHaveBeenCalledOnce())
+  expect(useSessionStore.getState().researchBinding).toBeNull()
+  const requestId = research.start.mock.calls[0][0].requestId
+  fireEvent.click(screen.getByRole('button', { name: '取消研究启动' }))
+  await waitFor(() => expect(research.cancelStartup).toHaveBeenCalledWith(requestId))
+  expect(stop).not.toHaveBeenCalled()
+  expect(screen.getByRole('button', { name: '取消中' })).toBeDisabled()
+})
+
+it('allows ordinary chat input after switching away from a pending research submission', async () => {
+  research.start.mockImplementationOnce(() => new Promise(() => {}))
+  useSessionStore.setState({ agentMode: 'research', draft: 'pending research' })
+  render(<Composer />)
+  fireEvent.keyDown(screen.getByRole('textbox'), { key: 'Enter' })
+  useSessionStore.setState({ agentMode: 'agent', draft: 'ordinary message' })
+  await waitFor(() => expect(screen.getByRole('textbox')).toHaveValue('ordinary message'))
+  fireEvent.keyDown(screen.getByRole('textbox'), { key: 'Enter' })
+  expect(send).toHaveBeenCalledWith('ordinary message', 'steer')
+})
+
+it('keeps the draft and warns instead of failing an input while the run is stopping', async () => {
+  useSessionStore.getState().bindResearchConversation(researchSnapshot)
+  useSessionStore.setState({ agentMode: 'research', researchCards: {
+    'new-run': { runId: 'new-run', question: '课题', status: 'stopping', phase: 'stopping', tasks: [], updatedAt: 1 },
+  } })
+  render(<Composer />)
+  const input = screen.getByRole('textbox')
+  fireEvent.change(input, { target: { value: '稍后再补充' } })
+  fireEvent.keyDown(input, { key: 'Enter' })
+  expect(await screen.findByRole('alert')).toHaveTextContent('正在停止')
+  expect(input).toHaveValue('稍后再补充')
+  expect(research.start).not.toHaveBeenCalled()
+})
+
+it('clears the current research connection error as soon as a new submit begins', () => {
+  research.start.mockImplementationOnce(() => new Promise(() => {}))
+  useSessionStore.setState({ agentMode: 'research', researchConnectionError: '旧连接错误' })
+  render(<Composer />)
+  expect(screen.getByRole('alert')).toHaveTextContent('旧连接错误')
+  fireEvent.change(screen.getByRole('textbox'), { target: { value: '重新提交' } })
+  fireEvent.keyDown(screen.getByRole('textbox'), { key: 'Enter' })
+  expect(screen.queryByText('旧连接错误')).not.toBeInTheDocument()
+})
+
+it('clears a local delivery error when that research row is retried', async () => {
+  research.start.mockImplementationOnce(async input => {
+    input.onBound?.({ ...researchSnapshot, streamId: 'stream-1' })
+    throw new Error('本次提交失败')
+  })
+  useSessionStore.setState({ agentMode: 'research' })
+  render(<Composer />)
+  fireEvent.change(screen.getByRole('textbox'), { target: { value: '重试同一条' } })
+  fireEvent.keyDown(screen.getByRole('textbox'), { key: 'Enter' })
+  expect(await screen.findByRole('alert')).toHaveTextContent('本次提交失败')
+  const row = useSessionStore.getState().researchConversation.messages.find(message => message.submissionError)!
+  useSessionStore.getState().retryResearchMessage(row.id)
+  await waitFor(() => expect(screen.queryByText('本次提交失败')).not.toBeInTheDocument())
+})
+
+it('shows stopping after /stop from a waiting-input research run', () => {
+  useSessionStore.getState().bindResearchConversation({ ...researchSnapshot, streamId: 'stream-waiting',
+    isStreaming: false, isIdle: true, run: { id: 'new-run', status: 'waiting_input', phase: 'waiting_input' } })
+  useSessionStore.setState({ agentMode: 'research' })
+  render(<Composer />)
+  fireEvent.change(screen.getByRole('textbox'), { target: { value: '/stop' } })
+  fireEvent.keyDown(screen.getByRole('textbox'), { key: 'Enter' })
+  expect(research.stop).toHaveBeenCalledOnce()
+  expect(screen.getByRole('button', { name: '停止中' })).toBeDisabled()
+})
+
+it('preserves a stop command aimed at a different research run without stopping the current one', () => {
+  useSessionStore.getState().bindResearchConversation(researchSnapshot)
+  useSessionStore.setState({ agentMode: 'research', draft: '/research stop r_other' })
+  render(<Composer />)
+  fireEvent.keyDown(screen.getByRole('textbox'), { key: 'Enter' })
+  expect(research.stop).not.toHaveBeenCalled()
+  expect(research.start).not.toHaveBeenCalled()
+  expect(screen.getByRole('textbox')).toHaveValue('/research stop r_other')
+  expect(screen.getByRole('alert')).toHaveTextContent('不一致')
+})
+
+it('preserves malformed stop arguments instead of silently stopping a research run', () => {
+  useSessionStore.getState().bindResearchConversation(researchSnapshot)
+  useSessionStore.setState({ agentMode: 'research', draft: '/stop r_other extra-argument' })
+  render(<Composer />)
+  fireEvent.keyDown(screen.getByRole('textbox'), { key: 'Enter' })
+  expect(research.stop).not.toHaveBeenCalled()
+  expect(research.start).not.toHaveBeenCalled()
+  expect(screen.getByRole('textbox')).toHaveValue('/stop r_other extra-argument')
+  expect(screen.getByRole('alert')).toHaveTextContent('停止命令')
+})
+
+it('accepts a slash stop while a research supplement is awaiting its acknowledgement', () => {
+  research.start.mockImplementationOnce(() => new Promise(() => {}))
+  useSessionStore.getState().bindResearchConversation(researchSnapshot)
+  useSessionStore.setState({ agentMode: 'research', draft: 'pending supplement' })
+  render(<Composer />)
+  const input = screen.getByRole('textbox')
+  fireEvent.keyDown(input, { key: 'Enter' })
+  expect(research.start).toHaveBeenCalledOnce()
+  fireEvent.change(input, { target: { value: '/STOP' } })
+  fireEvent.keyDown(input, { key: 'Enter' })
+  expect(research.stop).toHaveBeenCalledOnce()
+  expect(screen.getByRole('button', { name: '停止中' })).toBeDisabled()
 })

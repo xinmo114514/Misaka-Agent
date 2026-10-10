@@ -51,6 +51,8 @@ export interface ResearchHostSnapshot {
   streamId?: string
   session: { sessionId: string; file: string; cwd: string; name?: string | null }
   messages: ChatMessage[]
+  submissionReceipts?: Array<{ requestId: string; state: 'prepared' | 'accepted' | 'applied' | 'rejected' | 'unconfirmed'; runId?: string | null; mode?: string;
+    retryable?: boolean; errorStage?: string; errorCode?: string; error?: string }>
   historyVersion: string | null
   lastEventSeq: number
   /** Native host lifecycle also covers follow-ups to a finished research run. */

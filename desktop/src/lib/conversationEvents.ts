@@ -51,6 +51,9 @@ export function reduceConversationEvent(state: ConversationState, envelope: Brid
   if (envelope.seq <= state.lastEventSeq) return state
   let next = { ...state, lastEventSeq: envelope.seq }
   const raw = ev.message ?? {}
+  // Tool events are not timestamped by the engine, so arrival time is the only
+  // real clock available; persisted transcripts therefore report no duration.
+  const now = Date.now()
 
   if (ev.type === 'agent_start') return { ...next, isStreaming: true }
   // agent_end is an inner-loop boundary; retries and queued continuations may still follow.
@@ -62,7 +65,7 @@ export function reduceConversationEvent(state: ConversationState, envelope: Brid
         if (block.type === 'toolCall') {
           const tc = block.toolCall
           return tc.status === 'pending' || tc.status === 'running'
-            ? { ...block, toolCall: { ...tc, status: 'cancelled' as const } } : block
+            ? { ...block, toolCall: { ...tc, status: 'cancelled' as const, endedAt: tc.endedAt ?? now } } : block
         }
         return { ...block, isStreaming: false }
       })
@@ -84,11 +87,11 @@ export function reduceConversationEvent(state: ConversationState, envelope: Brid
     next.messages = updateTool(next.messages, ev.toolCallId, tc => {
       if (ev.type === 'tool_execution_end') {
         const fields = resultFields(ev)
-        return { ...tc, ...fields, partialResult: undefined, status: ev.isError ? 'error' : 'success', error: ev.isError ? contentText(fields.result) : undefined }
+        return { ...tc, ...fields, partialResult: undefined, status: ev.isError ? 'error' : 'success', error: ev.isError ? contentText(fields.result) : undefined, endedAt: tc.endedAt ?? now }
       }
       // Delayed starts/partial outputs must never reopen a completed call.
       if (tc.status === 'success' || tc.status === 'error' || tc.status === 'cancelled') return tc
-      return { ...tc, arguments: ev.args ?? tc.arguments, status: 'running', ...(ev.type === 'tool_execution_update' ? { partialResult: ev.partialResult } : {}) }
+      return { ...tc, arguments: ev.args ?? tc.arguments, status: 'running', startedAt: tc.startedAt ?? now, ...(ev.type === 'tool_execution_update' ? { partialResult: ev.partialResult } : {}) }
     })
     return next
   }
@@ -97,6 +100,7 @@ export function reduceConversationEvent(state: ConversationState, envelope: Brid
     next.messages = updateTool(next.messages, raw.toolCallId, tc => ({
       ...tc, status: raw.isError ? 'error' : 'success', result: raw.content,
       details: raw.details ?? tc.details, partialResult: undefined, error: raw.isError ? contentText(raw.content) : undefined,
+      endedAt: tc.endedAt ?? now,
     }))
     return next
   }
@@ -204,7 +208,7 @@ export function reduceConversationEvent(state: ConversationState, envelope: Brid
         }
         blocks = [...complete.values()].sort((a,b) => a.contentIndex-b.contentIndex).map(b => b.type === 'toolCall' ? b : { ...b, isStreaming:false })
         blocks = blocks.map(b => b.type === 'toolCall' && (b.toolCall.status === 'pending' || b.toolCall.status === 'running')
-          ? { ...b, toolCall: { ...b.toolCall, status: 'cancelled' as const } } : b)
+          ? { ...b, toolCall: { ...b.toolCall, status: 'cancelled' as const, endedAt: b.toolCall.endedAt ?? now } } : b)
       }
       return projectMessage({
         ...message, isStreaming: false, timestamp: raw.timestamp ?? message.timestamp,
