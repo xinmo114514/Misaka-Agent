@@ -14,6 +14,9 @@ __pycache__/
 # build artefacts
 /dist/
 
+# A vite cache appears here when a desktop tool is run from the repo root; desktop/ has its own rule.
+/node_modules/
+
 # Disposable project LCM cache and content-free lifetime locks
 /.misaka/lcm/
 /.misaka/lcm.gate
