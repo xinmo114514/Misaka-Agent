@@ -28,17 +28,19 @@ describe('ordered conversation blocks', () => {
     expect(screen.queryByText('legacy combined')).not.toBeInTheDocument()
   })
 
-  it('retains an expanded execution group while more tools arrive', () => {
-    const first = { type: 'toolCall', id: 'first', contentIndex: 0, toolCall: { id: 'first', name: 'read', status: 'success' } }
-    const { rerender } = render(<MessageItem message={{ ...base, blocks: [first] } as ChatMessage} />)
+  it('keeps a collapsed group collapsed while more tools arrive', () => {
+    const row = (id: string, status: 'success' | 'running') => ({ type: 'toolCall' as const, id, contentIndex: 0, toolCall: { id, name: id, status } })
+    const { rerender } = render(<MessageItem message={{ ...base, blocks: [row('read', 'success'), row('write', 'running')] } as ChatMessage} />)
     const toggle = screen.getByRole('button', { name: /执行记录/ })
-    // Default rows stay visible; exercise both explicit collapse and reopen.
+    // A live lane is open by default; an explicit collapse must outlive later calls.
+    expect(toggle).toHaveAttribute('aria-expanded', 'true')
     fireEvent.click(toggle)
     expect(toggle).toHaveAttribute('aria-expanded', 'false')
-    fireEvent.click(toggle)
-    rerender(<MessageItem message={{ ...base, blocks: [first, { type: 'toolCall', id: 'second', contentIndex: 1, toolCall: { id: 'second', name: 'write', status: 'running' } }] } as ChatMessage} />)
+    rerender(<MessageItem message={{ ...base, blocks: [row('read', 'success'), row('write', 'success'), row('fetch', 'running')] } as ChatMessage} />)
+    expect(screen.getByRole('button', { name: /执行记录/ })).toHaveAttribute('aria-expanded', 'false')
+    fireEvent.click(screen.getByRole('button', { name: /执行记录/ }))
     expect(screen.getByRole('button', { name: /执行记录/ })).toHaveAttribute('aria-expanded', 'true')
-    expect(screen.getByRole('button', { name: /write/ })).toBeVisible()
+    expect(screen.getByRole('button', { name: /fetch/ })).toBeVisible()
   })
 })
 
@@ -76,7 +78,7 @@ describe('tool details', () => {
     const serialize = vi.fn(() => 'large output')
     render(<ToolCallCard toolCall={{ id: 'lazy-result', name: 'read', status: 'success', result: { toJSON: serialize } }} />)
     expect(serialize).not.toHaveBeenCalled()
-    fireEvent.click(screen.getByRole('button', { name: /read.*完成/ }))
+    fireEvent.click(screen.getByRole('button', { name: /读取文件.*完成/ }))
     expect(serialize).toHaveBeenCalledTimes(1)
     expect(screen.getByText('"large output"')).toBeVisible()
   })
@@ -96,10 +98,10 @@ it('preserves a manual tool disclosure after a virtualized row remounts', () => 
   useSessionStore.setState({ currentSessionPath: 'disclosure-remount.jsonl' })
   const toolCall = { id: 'persistent-tool', name: 'read', status: 'success' as const, result: '工具内容' }
   const first = render(<ToolCallCard toolCall={toolCall} />)
-  fireEvent.click(screen.getByRole('button', { name: /read.*完成/ }))
+  fireEvent.click(screen.getByRole('button', { name: /读取文件.*完成/ }))
   first.unmount()
   render(<ToolCallCard toolCall={toolCall} />)
-  expect(screen.getByRole('button', { name: /read.*完成/ })).toHaveAttribute('aria-expanded', 'true')
+  expect(screen.getByRole('button', { name: /读取文件.*完成/ })).toHaveAttribute('aria-expanded', 'true')
   expect(screen.getByText('工具内容')).toBeVisible()
 })
 
@@ -211,7 +213,8 @@ it('keeps the visible paragraph anchored when historical details expand above it
   try {
     useSessionStore.setState({ messages: [{ ...base, blocks: [
       { type: 'toolCall', id: 'history', contentIndex: 0, toolCall: { id: 'history', name: 'read', status: 'success', result: 'long output' } },
-      { type: 'text', id: 'visible', contentIndex: 1, text: '正在阅读的段落' },
+      { type: 'toolCall', id: 'history-2', contentIndex: 1, toolCall: { id: 'history-2', name: 'edit', status: 'success', result: 'more output' } },
+      { type: 'text', id: 'visible', contentIndex: 2, text: '正在阅读的段落' },
     ] }], currentSessionPath: 'anchor-test' })
     const { container } = render(<Timeline />)
     const viewport = screen.getByLabelText('对话记录')
@@ -242,11 +245,16 @@ it('keeps a manually expanded thinking body visible when its segment completes',
   expect(screen.getByText('保留阅读的思考')).toBeVisible()
 })
 
-it('shows historical tool status rows while keeping only their details folded', () => {
+it('folds a finished history lane until the reader asks for the status rows', () => {
   render(<MessageItem message={{ ...base, blocks: [
     { type: 'toolCall', id: 'completed', contentIndex: 0, toolCall: { id: 'completed', name: '读取资料', status: 'success', result: '完整输出' } },
     { type: 'toolCall', id: 'failure', contentIndex: 1, toolCall: { id: 'failure', name: '验证资料', status: 'error', error: '验证失败原因' } },
   ] }} />)
+  const group = screen.getByRole('button', { name: /执行记录/ })
+  expect(group).toHaveAttribute('aria-expanded', 'false')
+  expect(group).toHaveAccessibleName(/部分失败/)
+  expect(screen.queryByRole('button', { name: /读取资料/ })).not.toBeInTheDocument()
+  fireEvent.click(group)
   expect(screen.getByRole('button', { name: /读取资料.*完成/ })).toBeVisible()
   expect(screen.getByRole('button', { name: /验证资料.*失败/ })).toBeVisible()
   expect(screen.getByRole('button', { name: /读取资料.*完成/ })).toHaveAttribute('aria-expanded', 'false')

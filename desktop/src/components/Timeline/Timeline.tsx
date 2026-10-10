@@ -3,19 +3,20 @@ import { ArrowDown, Loader2 } from 'lucide-react'
 import { MisakaLogo } from '../MisakaLogo'
 import { observeElementRect, useVirtualizer } from '@tanstack/react-virtual'
 import { useSessionStore } from '../../store/useSessionStore'
-import { messageHeights, readPosition, savePosition } from '../../lib/sessionViewState'
+import { messageHeights, readPosition, savePosition, useSessionViewKey } from '../../lib/sessionViewState'
 import { MessageItem } from './MessageItem'
 
 const LANDMARKS = '.conversation-markdown > *, .conversation-group-toggle, .conversation-row-toggle, .conversation-tool-details pre, .conversation-thinking-content, .conversation-user-message, [data-custom-type]'
 const ESTIMATED_HEIGHT = 320
 
 export const Timeline: React.FC = () => {
-  const path = useSessionStore(s => s.agentMode === 'research' && s.researchBinding ? s.researchBinding.sessionFile : s.currentSessionPath)
+  const path = useSessionViewKey()
   return <TimelineContent key={path ?? 'new-session'} path={path} />
 }
 
 function TimelineContent({ path }: { path: string | null }) {
   const messages = useSessionStore(s => s.agentMode === 'research' && s.researchBinding ? s.researchConversation.messages : s.messages)
+  const startingResearch = useSessionStore(s => s.agentMode === 'research' && Boolean(s.researchPendingCreationRequestId) && !s.researchBinding?.runId)
   const loading = useSessionStore(s => s.isSessionLoading)
   const loadError = useSessionStore(s => s.sessionLoadError)
   const retry = useSessionStore(s => s.retrySessionLoad)
@@ -146,9 +147,11 @@ function TimelineContent({ path }: { path: string | null }) {
     <div ref={scrollRef} onScroll={handleScroll} onWheel={() => { autoScroll.current = false }} onTouchStart={() => { autoScroll.current = false }} onClickCapture={rememberAnchor} className="conversation-scroll" aria-label="对话记录">
       <div ref={contentRef} className="conversation-content">
         {messages.length === 0 ? <div className="conversation-empty text-muted">
-          <div className="conversation-empty-icon">{loading ? <Loader2 className="w-6 h-6 text-rose-lite animate-spin" /> : <MisakaLogo size={26} />}</div>
-          <p className="text-sm font-medium text-text-main">{loading ? '正在加载对话' : loadError ? '会话尚未就绪' : '开始新的研究对话'}</p>
-          <p className="text-xs text-dim">{loading || loadError ? '你可以先在下方写草稿，准备完成后再发送。' : '在下方输入框中提出问题或课题，Misaka 将开始研究。'}</p>
+          <div className="conversation-empty-icon">{loading || startingResearch ? <Loader2 className="w-6 h-6 text-rose-lite animate-spin" /> : <MisakaLogo size={26} />}</div>
+          <p className="text-sm font-medium text-text-main">{loading ? '正在加载对话' : loadError ? '会话尚未就绪' : startingResearch ? '研究正在启动' : '开始新的研究对话'}</p>
+          <p className="text-xs text-dim">{loading || loadError ? '你可以先在下方写草稿，准备完成后再发送。'
+            : startingResearch ? '正在准备研究团队与规划；这一刻可能持续较长时间，状态会随研究事件更新。'
+              : '在下方输入框中提出问题或课题，Misaka 将开始研究。'}</p>
         </div> : virtual ? <div className="conversation-virtual-content" style={{ height: virtualizer.getTotalSize() }}>
           {virtualizer.getVirtualItems().map(item => <div key={item.key} ref={virtualizer.measureElement} data-index={item.index} data-message-anchor={messages[item.index].id} className="conversation-virtual-row" style={{ transform: `translateY(${item.start}px)` }}>
             <MessageItem message={messages[item.index]} />

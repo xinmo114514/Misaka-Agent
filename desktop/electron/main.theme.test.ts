@@ -107,6 +107,7 @@ it.each([
   { type: 'set_model', provider: 'fixture', modelId: 'fixture-model' },
   { type: 'set_thinking', level: 'high' },
   { type: 'send_research_message', sessionId: 'owner', text: '补充研究要求' },
+  { type: 'abort' },
   { type: 'desktop_set_team_model', sessionId: 'owner', provider: 'fixture', modelId: 'b' },
   { type: 'desktop_retain_roles', sessionId: 'owner', selections: [] },
 ])('forwards research host configuration through the real IPC route: $type', async command => {

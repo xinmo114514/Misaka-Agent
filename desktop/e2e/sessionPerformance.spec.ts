@@ -39,7 +39,7 @@ test('virtual history retains tool disclosure and scroll-up reading during live 
   await expect.poll(() => scroll.evaluate(e => e.scrollHeight - e.scrollTop - e.clientHeight)).toBeLessThan(3)
   await scroll.evaluate(e => { e.scrollTop = 0; e.dispatchEvent(new Event('scroll')) })
   const first = page.locator('[data-message-anchor="long.jsonl:0"]')
-  const toggle = first.getByRole('button', { name: /read.*完成/ })
+  const toggle = first.getByRole('button', { name: /读取文件.*完成/ })
   await expect(toggle).toBeVisible()
   await toggle.click()
   await expect(toggle).toHaveAttribute('aria-expanded', 'true')

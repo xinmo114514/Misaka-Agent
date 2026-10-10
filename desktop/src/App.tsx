@@ -78,6 +78,18 @@ export default function App() {
   const handleSettingsBridgeMessage = useSettingsStore((s) => s.handleBridgeMessage)
   const setActiveSettingsSection = useSettingsStore((s) => s.setActiveSection)
 
+  // Native window close events must reach the renderer even during a research run.
+  useEffect(() => {
+    return window.app?.onRequestClose?.(() => {
+      const action = useSettingsStore.getState().closeWindowAction
+      if (action === 'tray' || action === 'quit') {
+        void window.app?.confirmClose?.(action)
+      } else {
+        setCloseConfirmOpen(true)
+      }
+    })
+  }, [])
+
   useEffect(() => {
     if (researchScene && researchTeamSessionId && researchTeamModelBinding) {
       applyResearchModelBinding(researchTeamSessionId, researchTeamModelBinding)
@@ -405,7 +417,12 @@ export default function App() {
 
   const messages = useSessionStore(s => s.agentMode === 'research' && s.researchBinding ? s.researchConversation.messages : s.messages)
   const isStreaming = useSessionStore(s => s.agentMode === 'research' && s.researchBinding ? s.researchConversation.isStreaming : s.isStreaming)
-  const isWelcome = viewMode === 'timeline' && messages.length === 0 && !isSessionLoading && !isStreaming && !sessionLoadError
+  // A research conversation is never the empty welcome state: once its own host is bound -- or a
+  // start is still being created there -- the surface belongs to that host, whose run may exist
+  // while its first transcript row has not landed yet. Falling back to the welcome page hid a
+  // live research conversation behind the composer.
+  const researchSurface = useSessionStore(s => s.agentMode === 'research' && (Boolean(s.researchBinding) || Boolean(s.researchPendingCreationRequestId)))
+  const isWelcome = viewMode === 'timeline' && !researchSurface && messages.length === 0 && !isSessionLoading && !isStreaming && !sessionLoadError
   // Render the existing switcher in exactly one place so its ref and menu stay shared.
   const workspaceSwitcher = (
     <div className="relative" ref={workspaceMenuRef}>

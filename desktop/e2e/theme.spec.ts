@@ -116,7 +116,7 @@ test('markdown, tool output and errors consume their independent theme roles', a
   await expect(page.locator('.conversation-markdown a')).toHaveCSS('color', 'rgb(85, 221, 255)')
   await expect(page.locator('.conversation-inline-code')).toHaveCSS('color', 'rgb(255, 170, 221)')
   await expect(page.locator('.conversation-markdown blockquote')).toHaveCSS('color', 'rgb(170, 255, 221)')
-  await page.getByRole('button', { name: /read.*失败/ }).click()
+  await page.getByRole('button', { name: /读取文件.*失败/ }).click()
   await expect(page.locator('.conversation-tool-error pre')).toHaveCSS('color', 'rgb(255, 119, 85)')
   await expect(page.locator('.conversation-tool-details pre').first()).toHaveCSS('color', 'rgb(153, 238, 255)')
 })

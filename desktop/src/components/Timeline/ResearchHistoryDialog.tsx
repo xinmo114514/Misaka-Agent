@@ -41,7 +41,7 @@ export const ResearchHistoryDialog: React.FC = () => {
     setError(null)
     try {
       const snapshot = await openResearchConversation(run.id, run.workspace)
-      useSessionStore.getState().bindResearchConversation(snapshot)
+      useSessionStore.getState().bindResearchConversation(snapshot, true)
       useSessionStore.getState().setAgentMode('research')
       useSessionStore.setState({ researchRunId: run.id })
       await fetchCardDetails(run.id)

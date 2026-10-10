@@ -55,7 +55,8 @@ test('keeps committed model during pending switch, supports cancel and retry, an
   await page.getByRole('button', { name: 'Misaka · 研究推理', exact: true }).click()
   await page.getByRole('button', { name: /两档推理模型.*2 档/ }).click()
   await page.evaluate(() => (window as any).desktopResearchTeamFixture.failSwitch())
-  await expect(page.getByRole('status')).toContainText('团队成员启动失败')
+  // A delivered research row announces its own status, so scope the live region to this error.
+  await expect(page.getByRole('status').filter({ hasText: '团队成员启动失败' })).toBeVisible()
   await page.getByRole('button', { name: '重试模型切换' }).click()
   await page.evaluate(() => (window as any).desktopResearchTeamFixture.completeSwitch())
   await expect(page.getByTitle('模型与思考深度')).toContainText('两档推理模型')

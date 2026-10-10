@@ -92,7 +92,7 @@ export const ResearchRunPill: React.FC<ResearchRunPillProps> = ({ runId, default
     try {
       const state = useSessionStore.getState()
       if (state.researchBinding?.runId !== runId) {
-        state.bindResearchConversation(await openResearchConversation(runId, card?.workspace || runSummary?.workspace))
+        state.bindResearchConversation(await openResearchConversation(runId, card?.workspace || runSummary?.workspace), true)
       }
       const binding = useSessionStore.getState().researchBinding!
       const requestId = newRequestId('research_input')

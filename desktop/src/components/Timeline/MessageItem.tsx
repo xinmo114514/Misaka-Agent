@@ -4,6 +4,7 @@ import type { ChatMessage } from '../../types/session'
 import { useSessionStore } from '../../store/useSessionStore'
 import { clipboardErrorMessage, copyTextToClipboard } from '../../lib/clipboard'
 import { ExecutionGroup } from './ExecutionGroup'
+import { ToolCallCard } from './ToolCallCard'
 import { CustomNotice } from './CustomNotice'
 import { MarkdownContent } from './MarkdownContent'
 import { getMessageBlocks } from '../../lib/messageBlocks'
@@ -20,7 +21,13 @@ export const MessageItem = React.memo(function MessageItem({ message }: MessageI
   const copyTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const forkSession = useSessionStore((s) => s.forkSession)
   const retryMessage = useSessionStore(s => s.retryMessage)
-  const retryDisabled = useSessionStore(s => s.isSessionLoading || Boolean(s.sessionLoadError) || s.isAborting)
+  const retryResearchMessage = useSessionStore(s => s.retryResearchMessage)
+  const canRetryStartupExecution = useSessionStore(s => s.agentMode === 'research' && Boolean(s.researchBinding) && !s.researchBinding?.runId)
+  const retryDisabled = useSessionStore(s => s.isSessionLoading || Boolean(s.sessionLoadError) ||
+    message.deliveryRetryable === false ||
+    (s.agentMode === 'research' ? !s.researchBinding || s.researchConversation.isAborting ||
+      Boolean(!s.researchBinding.runId && s.researchPendingCreationRequestId) ||
+      s.researchConversation.messages.some(row => row.requestId === message.requestId && row.deliveryStatus === 'pending') : s.isAborting))
   const isUser = message.role === 'user'
   const researchView = useSessionStore(s => s.agentMode === 'research' && Boolean(s.researchBinding))
   // Only persisted messages carry a real session entry; a live/unsaved turn cannot be a fork point.
@@ -86,7 +93,11 @@ export const MessageItem = React.memo(function MessageItem({ message }: MessageI
           {message.content}
         </div>
         {message.deliveryStatus === 'pending' && <p role="status" className="mt-1 text-[11px] text-dim">发送中…</p>}
+        {message.deliveryStatus === 'unconfirmed' && <p role="status" className="mt-1 text-[11px] text-warning">{message.deliveryReconciled
+          ? '发送结果尚未确认，已核对研究记录' : '发送结果尚未确认，正在核对研究记录…'}</p>}
         {message.deliveryStatus === 'accepted' && <p role="status" className="mt-1 text-[11px] text-dim">已接收，等待协调 Agent 处理</p>}
+        {message.deliveryStatus === 'created' && <p role="status" className="mt-1 text-[11px] text-dim">已记录</p>}
+        {message.executionError && <p role="status" className="mt-1 text-xs text-warning">执行异常：{message.executionError}</p>}
         {message.images?.length ? <div className="mt-2 flex flex-wrap gap-2" aria-label="已发送图片">
           {message.images.map((image, index) => <img
             key={`${message.id}-image-${index}`}
@@ -96,11 +107,17 @@ export const MessageItem = React.memo(function MessageItem({ message }: MessageI
             className="max-h-64 max-w-full rounded-lg border border-border-subtle object-contain"
           />)}
         </div> : null}
-        {message.submissionError && <div className="mt-2 flex items-center gap-2 text-xs text-danger">
+        {message.submissionError && message.deliveryStatus !== 'unconfirmed' && <div className="mt-2 flex items-center gap-2 text-xs text-danger">
           <span role="status">提交失败：{message.submissionError}</span>
-          <button type="button" disabled={retryDisabled} onClick={() => researchView ? useSessionStore.getState().setDraft(message.content) : retryMessage(message.id)}
+          <button type="button" disabled={retryDisabled} onClick={() => researchView ? retryResearchMessage(message.id) : retryMessage(message.id)}
             className="shrink-0 rounded-md border border-border-subtle px-2 py-1 hover:bg-surface-2 disabled:opacity-40">重试</button>
         </div>}
+        {message.executionError && message.researchSubmission && canRetryStartupExecution && !message.submissionError &&
+          message.deliveryStatus !== 'pending' && message.deliveryRetryable !== false &&
+          <button type="button" disabled={retryDisabled} onClick={() => retryResearchMessage(message.id)}
+            className="mt-2 rounded-md border border-border-subtle px-2 py-1 text-xs hover:bg-surface-2 disabled:opacity-40">重试</button>}
+        {message.deliveryStatus === 'unconfirmed' && message.deliveryReconciled && message.deliveryRetryable !== false && <button type="button" disabled={retryDisabled}
+          onClick={() => retryResearchMessage(message.id)} className="mt-2 shrink-0 rounded-md border border-border-subtle px-2 py-1 text-xs hover:bg-surface-2 disabled:opacity-40">重试</button>}
       </div>
     )
   }
@@ -122,9 +139,17 @@ export const MessageItem = React.memo(function MessageItem({ message }: MessageI
       </div>
 
       <div className="conversation-message-body">
-        {segments.map(segment => segment.kind === 'text'
-          ? <MarkdownContent key={segment.block.id} content={segment.block.text} isStreaming={Boolean(segment.block.isStreaming)} />
-          : <ExecutionGroup key={segment.blocks[0].id} stateKey={`${message.entryId ?? message.id}:${segment.blocks[0].contentIndex}`} blocks={segment.blocks} />)}
+        {segments.map((segment, index) => {
+          if (segment.kind === 'text') {
+            return <MarkdownContent key={segment.block.id} content={segment.block.text} isStreaming={Boolean(segment.block.isStreaming)} />
+          }
+          const [only] = segment.blocks
+          if (segment.blocks.length === 1 && only?.type === 'toolCall') {
+            return <ToolCallCard key={only.id} toolCall={only.toolCall} />
+          }
+          return <ExecutionGroup key={only.id} stateKey={`${message.entryId ?? message.id}:${only.contentIndex}`}
+            blocks={segment.blocks} active={Boolean(message.isStreaming) && index === segments.length - 1} />
+        })}
       </div>
       {message.errorMessage && <p className="conversation-message-error" role="status">{message.errorMessage}</p>}
       {/* Message action bar matching screenshot: Copy, Fork, Timestamp */}

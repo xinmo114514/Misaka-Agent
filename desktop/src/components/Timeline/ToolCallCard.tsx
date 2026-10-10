@@ -1,7 +1,9 @@
 import React, { useId, useMemo } from 'react'
-import { Terminal, CheckCircle2, AlertCircle, Loader2, ChevronRight, CircleMinus } from 'lucide-react'
+import { Terminal, CheckCircle2, AlertCircle, Loader2, ChevronRight, CircleMinus, Clock } from 'lucide-react'
 import type { ToolCall } from '../../types/session'
 import { useDisclosure } from '../../lib/sessionViewState'
+import { formatDuration, redactSecrets, toolCallElapsed, toolCallSummary, toolDisplayName } from '../../lib/toolDisplay'
+import { useLiveClock } from '../../lib/useLiveClock'
 
 // Bridge outputs use content arrays, strings, and structured details. Render their
 // actual text rather than dumping transport wrappers into the reading surface.
@@ -22,27 +24,38 @@ export function readableToolValue(value: unknown): string {
 }
 
 const STATUS = { pending: '等待中', running: '执行中', success: '完成', error: '失败', cancelled: '已取消' }
+const STATUS_ICON = { pending: Clock, running: Loader2, success: CheckCircle2, error: AlertCircle, cancelled: CircleMinus }
+const STATUS_CLASS = { pending: 'text-dim', running: 'text-warning', success: 'text-success', error: 'text-danger', cancelled: 'text-dim' }
 
-export const ToolCallCard: React.FC<{ toolCall: ToolCall }> = ({ toolCall }) => {
+export const ToolCallRow: React.FC<{ toolCall: ToolCall; now?: number }> = ({ toolCall, now: suppliedNow }) => {
   const [manualExpanded, setExpanded] = useDisclosure(`tool:${toolCall.id}`)
   const expanded = manualExpanded ?? false
   const contentId = useId()
   const isRunning = toolCall.status === 'running' || toolCall.status === 'pending'
-  const isError = toolCall.status === 'error'
-  const StatusIcon = isRunning ? Loader2 : isError ? AlertCircle : toolCall.status === 'cancelled' ? CircleMinus : CheckCircle2
-  const statusClass = isRunning ? 'text-warning' : isError ? 'text-danger' : toolCall.status === 'cancelled' ? 'text-dim' : 'text-success'
+  const now = useLiveClock(isRunning)
+  const clock = suppliedNow ?? now
+  const StatusIcon = STATUS_ICON[toolCall.status]
+  const summary = useMemo(() => toolCallSummary(toolCall), [toolCall])
+  const elapsed = useMemo(() => toolCallElapsed(toolCall, clock), [toolCall, clock])
   const sections = useMemo(() => expanded ? [
-    ['参数', toolCall.arguments === undefined ? '' : JSON.stringify(toolCall.arguments, null, 2)],
+    // One-line summaries only read scalar arguments; MCP tools often pass nested objects,
+    // so the expanded view is gated on having arguments, not on having a summary.
+    ['参数', toolCall.arguments && Object.keys(toolCall.arguments).length ? redactSecrets(JSON.stringify(toolCall.arguments, null, 2)) : ''],
     ['实时输出', readableToolValue(toolCall.partialResult)],
     ['输出', readableToolValue(toolCall.result)],
     ['详情', readableToolValue(toolCall.details)],
-    ['错误', readableToolValue(toolCall.error)],
+    ['错误', redactSecrets(readableToolValue(toolCall.error))],
   ] : [], [expanded, toolCall])
-  return <section className="conversation-execution-row" data-tool-status={toolCall.status}>
-    <button type="button" className="conversation-row-toggle" aria-expanded={expanded} aria-controls={contentId} onClick={() => setExpanded(!expanded)}>
+  return <li className="conversation-execution-row" data-tool-status={toolCall.status}>
+    <button type="button" className="conversation-row-toggle" aria-expanded={expanded} aria-controls={contentId}
+      title={toolCall.name} onClick={() => setExpanded(!expanded)}>
       <Terminal className="conversation-row-icon text-dim" />
-      <span className="conversation-tool-name">{toolCall.name}</span>
-      <span className={'conversation-tool-status ' + statusClass}><StatusIcon className={'conversation-status-icon ' + (isRunning ? 'animate-spin' : '')} />{STATUS[toolCall.status]}</span>
+      <span className="conversation-tool-name">{toolDisplayName(toolCall.name)}</span>
+      {summary && <span className="conversation-tool-summary" title={summary}>{summary}</span>}
+      <span className={'conversation-tool-status ' + STATUS_CLASS[toolCall.status]}>
+        <StatusIcon className={'conversation-status-icon ' + (isRunning ? 'animate-spin' : '')} />{STATUS[toolCall.status]}
+        {elapsed !== null && <span className="conversation-tool-elapsed" aria-hidden="true">{formatDuration(elapsed)}</span>}
+      </span>
       <ChevronRight className={'conversation-chevron ' + (expanded ? 'is-expanded' : '')} />
     </button>
     <div id={contentId} hidden={!expanded} className="conversation-tool-details">
@@ -51,5 +64,10 @@ export const ToolCallCard: React.FC<{ toolCall: ToolCall }> = ({ toolCall }) => 
       </div>)}
       {expanded && !sections.some(([, value]) => value) && <p className="text-dim">暂无详细输出</p>}
     </div>
-  </section>
+  </li>
 }
+
+/** Standalone row for a turn that touched exactly one tool: same vocabulary, no timeline chrome. */
+export const ToolCallCard: React.FC<{ toolCall: ToolCall; now?: number }> = ({ toolCall, now }) => (
+  <ul className="conversation-execution-list is-standalone"><ToolCallRow toolCall={toolCall} now={now} /></ul>
+)
