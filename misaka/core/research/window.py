@@ -206,7 +206,8 @@ class WindowLO:
             with budget.usage_context(options.get("usage_db"), options.get("usage_task_id"),
                                       options.get("usage_generation"), options.get("usage_token_cap")):
                 if preflight is not None:
-                    await session.prompt(prompt, {"streamingBehavior": "steer", "preflightResult": preflight})
+                    await session.prompt(prompt, {"streamingBehavior": "steer", "preflightResult": preflight,
+                                                  **options.get('input_options', {})})
                 else:
                     from misaka.core.moments import TURN
 
@@ -280,15 +281,17 @@ async def node_session(con, cfg, run, node):
             control = for_session(session)
             control.check_active = check_active
 
-            async def human_input(text, preflight):
+            async def human_input(text, preflight, input_options=None):
                 if session.isStreaming:
-                    await session.prompt(text, {"streamingBehavior": "steer", "preflightResult": preflight})
+                    await session.prompt(text, {"streamingBehavior": "steer", "preflightResult": preflight,
+                                                **(input_options or {})})
                 else:
                     _obj, _answer, error = await bridge._execute(text, {
                         "session_dir": directory, "tools": planner.session_tools(bridge),
                         "extra_tools": list(getattr(control, "review_tools", ()) or ()),
                         "usage_db": cfg["db"], "usage_task_id": run["id"], "usage_generation": 1,
                         "usage_token_cap": None,
+                        'input_options': input_options or {},
                     }, preflight=preflight)
                     if error:
                         raise RuntimeError(error)

@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-import re
 import signal
 import socket
 import sys
@@ -38,7 +37,16 @@ from misaka.core.output_guard import (
 )
 from misaka.core.provider_brands import build_provider_groups, visible_provider_ids
 from misaka.core.provider_display_names import BUILT_IN_PROVIDER_DISPLAY_NAMES
-from misaka.core.research.ingress import ResearchMessageIngress, session_run
+from misaka.core.research import submissions
+from misaka.core.research.ingress import (
+    ResearchMessageIngress,
+    normalize_research_command,
+    parse_research_control,
+    render_research_command,
+    research_command_body,
+    session_run,
+    split_research_command,
+)
 from misaka.core.session_manager import (
     SessionInfo,
     SessionManager,
@@ -115,7 +123,8 @@ def research_host_payload(session: Any, con: Any = None, *, last_event_seq: int 
             "contextUsage": to_jsonable(session.getContextUsage()),
             "isStreaming": bool(getattr(session, "isStreaming", False)),
             "isIdle": bool(getattr(session, "isIdle", not getattr(session, "isStreaming", False))),
-            "messages": _serialize_session_entries(entries), "historyVersion": version,
+            "messages": _serialize_session_entries(entries, submission_entries=submissions.entries(session)), "historyVersion": version,
+            "submissionReceipts": submissions.public_receipts(session),
             "lastEventSeq": last_event_seq, **({"streamId": stream_id} if stream_id else {}),
             "run": {"id": run["id"], "status": run["status"], "phase": run["phase"]} if run is not None else None}
 
@@ -132,9 +141,9 @@ SESSION_OPERATION_GUARDED_COMMANDS = frozenset({
 })
 
 RESEARCH_SESSION_MUTATING_COMMANDS = frozenset({
-    "prompt", "steer", "follow_up", "followup", "set_model", "setmodel", "set_thinking", "setthinking",
-    "load_session", "loadsession", "switch_workspace", "switchworkspace", "set_workspace", "setworkspace",
-    "new_session", "newsession", "fork_session", "forksession", "navigate_tree", "compact_session",
+    "prompt", "steer", "follow_up", "followup",
+    "set_model", "setmodel", "set_thinking", "setthinking",
+    "fork_session", "forksession", "navigate_tree", "compact_session",
 })
 
 # Aliases collapse so the guard reads one name per capability.
@@ -216,7 +225,7 @@ def _content_text(blocks: Any) -> str:
     return "".join(parts)
 
 
-def _serialize_session_entries(entries: list[Any]) -> list[dict[str, Any]]:
+def _serialize_session_entries(entries: list[Any], *, submission_entries: list[Any] | None = None) -> list[dict[str, Any]]:
     """Turn persisted entries into stable, ordered desktop timeline messages.
 
     Assistant ``blocks`` retain the persisted content order and raw content indices. Tool results
@@ -224,6 +233,9 @@ def _serialize_session_entries(entries: list[Any]) -> list[dict[str, Any]]:
     ``toolCalls`` projection, so old consumers and ordered renderers cannot disagree after reopen.
     """
     messages: list[dict[str, Any]] = []
+    original_inputs = {row['requestId']: row['input'] for row in submissions.receipts_from_entries(
+                       entries if submission_entries is None else submission_entries)
+                       if isinstance(row.get('input'), dict)}
     tool_calls_by_id: dict[str, dict[str, Any]] = {}
     unresolved_tool_calls: dict[str, dict[str, Any]] = {}
 
@@ -254,6 +266,7 @@ def _serialize_session_entries(entries: list[Any]) -> list[dict[str, Any]]:
                     "entryId": entry_id,
                     "role": "user",
                     "content": _content_text(read_field(message, "content")),
+                    **({'requestId': read_field(message, 'requestId')} if read_field(message, 'requestId') else {}),
                     **({"images": images} if images else {}),
                     "timestamp": timestamp,
                 })
@@ -398,6 +411,13 @@ def _serialize_session_entries(entries: list[Any]) -> list[dict[str, Any]]:
                         tool_call["error"] = str(result_error)
                     unresolved_tool_calls.pop(tool_call_id, None)
 
+    for message in messages:
+        request_id = message.get('requestId') or (message.get('details') or {}).get('requestId')
+        original = original_inputs.get(request_id)
+        if original is not None and (message.get('role') == 'user'
+                                    or message.get('customType') in {'research-question', 'research-input'}):
+            message['researchSubmission'] = {key: original[key] for key in
+                ('text', 'sessionId', 'requestId', 'runId', 'limits') if key in original}
     return messages
 
 def _session_started_payload(session: Any) -> dict[str, Any]:
@@ -625,10 +645,10 @@ def _research_workspace(obj: dict[str, Any], session: Any) -> str | None:
     return os.path.realpath(cwd) if cwd else None
 
 
-def session_belongs_to_active_research(con: Any, session_path: str | None) -> bool:
-    """True when editing this transcript could change the context of a live research driver."""
+def find_session_active_research_run(con: Any, session_path: str | None) -> dict[str, Any] | None:
+    """Returns the active research run row if session_path belongs to one."""
     if not session_path:
-        return False
+        return None
     from misaka.config import home
     from misaka.core.research import runs
 
@@ -640,8 +660,53 @@ def session_belongs_to_active_research(con: Any, session_path: str | None) -> bo
         candidates.extend(node["session_file"] for node in runs.nodes(con, run["id"]))
         if any(value and os.path.normcase(os.path.realpath(str(home.from_stored(value)))) == target
                for value in candidates):
-            return True
-    return False
+            return dict(run)
+    return None
+
+
+def session_belongs_to_active_research(con: Any, session_path: str | None) -> bool:
+    """True when editing this transcript could change the context of a live research driver."""
+    return find_session_active_research_run(con, session_path) is not None
+
+
+def find_root_session_research_run(con: Any, session_path: str | None,
+                                   workspace: str | None, *, status: str | None = None) -> dict[str, Any] | None:
+    """Find the run owned by this exact root transcript and workspace.
+
+    This intentionally differs from the mutation guard above: node transcripts
+    must stay protected, but prose typed into one must never resume the root.
+    """
+    if not session_path or not workspace:
+        return None
+    from misaka.config import home
+    from misaka.core.research import runs
+
+    target = os.path.normcase(os.path.realpath(str(session_path)))
+    project = os.path.normcase(os.path.realpath(str(workspace)))
+    for run in runs.listing(con):
+        if status is not None and run["status"] != status:
+            continue
+        root = run["root_session"]
+        if not root:
+            continue
+        root_path = os.path.normcase(os.path.realpath(str(home.from_stored(root))))
+        run_workspace = os.path.normcase(os.path.realpath(str(home.from_stored(run["workspace"]))))
+        if root_path == target and run_workspace == project:
+            return dict(run)
+    return None
+
+
+def find_research_prompt_replay(con: Any, session: Any, request_id: Any) -> dict[str, Any] | None:
+    """A root clarification remains replayable after its resume makes the run active."""
+    if not isinstance(request_id, str) or not request_id:
+        return None
+    receipt = submissions.lookup(session, request_id)
+    if receipt is None or receipt.get('mode') != 'resume':
+        return None
+    manager = getattr(session, 'sessionManager', None)
+    owned = find_root_session_research_run(con, getattr(manager, 'sessionFile', None),
+                                          _research_workspace({}, session))
+    return owned if owned and receipt.get('runId') == owned['id'] else None
 
 
 def _latest_run_row(runs: Any, con: Any, workspace: str | None) -> Any:
@@ -947,6 +1012,7 @@ async def run_desktop_bridge(runtime_host: Any, options: Any = None) -> int:
     research_controller = None
     desktop_research = bool(read_field(options, "desktop_research") or getattr(session, "research_host", False))
     desktop_tasks: set[asyncio.Task[None]] = set()
+    research_input_tasks: set[asyncio.Task[None]] = set()
     took_over = False
     pending_permissions: dict[str, asyncio.Future[Any]] = {}
     pending_permission_tool_names: dict[str, str] = {}
@@ -1187,19 +1253,25 @@ async def run_desktop_bridge(runtime_host: Any, options: Any = None) -> int:
         if cmd in RESEARCH_SESSION_MUTATING_COMMANDS:
             manager = getattr(session, "sessionManager", None)
             candidates = [getattr(manager, "sessionFile", None), obj.get("path"), obj.get("sessionPath")]
+            text = str(obj.get("text") or "")
             research_board = _open_research_readonly()
             try:
                 active_owner = (next((value for value in candidates
                                       if value and research_board is not None
                                       and session_belongs_to_active_research(research_board, value)), None))
+                waiting_root_prompt = bool(
+                    cmd == "prompt" and active_owner and text.strip() and not text.lstrip().startswith("/")
+                    and research_board is not None and (find_root_session_research_run(
+                        research_board, getattr(manager, "sessionFile", None),
+                        _research_workspace({}, session), status="waiting_input")
+                        or find_research_prompt_replay(research_board, session, req_id)))
             finally:
                 if research_board is not None:
                     research_board.close()
             if active_owner:
-                text = str(obj.get("text") or "")
-                research_control = cmd == "prompt" and bool(re.match(
-                    r"^\s*/research\s+(?:stop|resume|status|help)\b", text, re.IGNORECASE))
-                if not research_control:
+                keyword = split_research_command(text) if cmd == "prompt" else None
+                research_control = keyword is not None and keyword[0] in {"stop", "resume", "status", "help"}
+                if not research_control and not waiting_root_prompt:
                     write_ack(req_id, ok=False,
                               error="Stop the owning research run before editing, forking, navigating, or compacting this conversation.")
                     return
@@ -1264,10 +1336,52 @@ async def run_desktop_bridge(runtime_host: Any, options: Any = None) -> int:
             if not isinstance(text, str):
                 write_ack(req_id, ok=False, error="prompt requires 'text' string")
                 return
-            if research_controller is not None and re.match(r"^\s*/research\b", text):
+            manager = getattr(session, "sessionManager", None)
+            session_file = getattr(manager, "sessionFile", None)
+            research_board = _open_research_readonly()
+            active_run = None
+            replay_run = None
+            try:
+                if research_board is not None and session_file:
+                    active_run = find_root_session_research_run(
+                        research_board, session_file, _research_workspace({}, session), status="waiting_input")
+                    replay_run = find_research_prompt_replay(research_board, session, req_id)
+            finally:
+                if research_board is not None:
+                    research_board.close()
+
+            from misaka.core.research.wiring.research import ResearchPart
+            coordinator = any(isinstance(part, ResearchPart)
+                              for part in getattr(getattr(session, 'moments', None), 'parts', ()))
+            root_reply = active_run or replay_run
+            if coordinator and root_reply and text.strip() and not text.lstrip().startswith('/'):
+                # Use the same durable ingress as the research transport, rather
+                # than a bare slash prompt that can record a clarification twice.
+                await dispatch_command({'type': 'send_research_message', 'sessionId': session.sessionId,
+                    'runId': root_reply['id'], 'text': text, 'requestId': req_id}, queued_at)
+                return
+
+            if active_run and research_command_body(text) is None:
+                text = render_research_command("resume", active_run["id"], text.strip())
+                obj["text"] = text
+
+            normalized = normalize_research_command(text)
+            if normalized is not None:
+                text = obj["text"] = normalized
+            control_spec = parse_research_control(text)
+            if coordinator and research_controller is None and control_spec is not None:
+                await dispatch_command({'type': 'send_research_message', 'sessionId': session.sessionId,
+                    'runId': control_spec.get('run_id'), 'text': text, 'requestId': req_id}, queued_at)
+                return
+            if research_controller is not None and research_command_body(text) is not None:
                 from misaka.core.research.wiring.research import parse_command
                 try:
-                    specification = parse_command(re.sub(r"^\s*/research\s*", "", text, count=1))
+                    if control_spec is not None:
+                        await dispatch_command({"type": "send_research_message", "sessionId": session.sessionId,
+                            "runId": control_spec.get("run_id"), "text": text,
+                            "requestId": req_id}, queued_at)
+                        return
+                    specification = parse_command(research_command_body(text))
                     if specification.get("question"):
                         await dispatch_command({"type": "send_research_message", "sessionId": session.sessionId,
                             "text": specification["question"], "limits": specification.get("limits"),
@@ -1369,8 +1483,23 @@ async def run_desktop_bridge(runtime_host: Any, options: Any = None) -> int:
                 write_ack(req_id, ok=False, error=str(error))
 
         elif cmd == "abort":
+            if obj.get('sessionId') is not None and obj['sessionId'] != session.sessionId:
+                write_ack(req_id, ok=False, error='研究会话已变更，取消请求未发送到新会话。',
+                          errorCode='RESEARCH_SESSION_CHANGED', errorStage='validation', retryable=False,
+                          sessionId=session.sessionId, streamId=stream_id)
+                return
+            if obj.get('streamId') is not None and obj['streamId'] != stream_id:
+                write_ack(req_id, ok=False, error='研究连接已变更，取消请求未发送到新连接。',
+                          errorCode='RESEARCH_STREAM_CHANGED', errorStage='validation', retryable=False,
+                          sessionId=session.sessionId, streamId=stream_id)
+                return
             try:
                 abort_session = session
+                intakes = [task for task in research_input_tasks if not task.done()]
+                for task in intakes:
+                    task.cancel()
+                if intakes:
+                    await asyncio.gather(*intakes, return_exceptions=True)
                 preparations = [task for task, owner in preparing_prompts.items() if owner is abort_session]
                 for task in preparations:
                     task.cancel()
@@ -1382,6 +1511,20 @@ async def run_desktop_bridge(runtime_host: Any, options: Any = None) -> int:
                 pending_permissions.clear()
                 pending_permission_tool_names.clear()
                 await abort_session.abort()
+                # A run may have been created just before the renderer received its
+                # discipline notice. Cancel that owned startup via the native stop door.
+                if research_controller is not None:
+                    con = _open_research_readonly()
+                    try:
+                        owned = session_run(abort_session, con)
+                        if owned and owned['status'] not in {'done', 'stopped', 'failed'}:
+                            await research_controller.ingress.send({
+                                'sessionId': abort_session.sessionId, 'runId': owned['id'],
+                                'text': render_research_command('stop', owned['id']),
+                                'requestId': req_id or f'cancel-startup-{uuid.uuid4().hex}'}, con)
+                    finally:
+                        if con is not None:
+                            con.close()
                 # Cancelling an idle preflight never enters the engine's run-finally path.
                 if preparations and abort_session is session and not abort_session.isStreaming:
                     handle_event({"type": "agent_settled"})
@@ -1691,29 +1834,54 @@ async def run_desktop_bridge(runtime_host: Any, options: Any = None) -> int:
                     con.close()
 
         elif cmd in ("send_research_message", "sendresearchmessage"):
+            submissions.trace_input(obj, stage='bridge', session_id=session.sessionId, stream_id=stream_id,
+                                    model=getattr(session, 'model', None))
+            if obj.get('streamId') is not None and obj['streamId'] != stream_id:
+                write_ack(req_id, ok=False, error='研究连接已变更，请重新打开原研究会话。',
+                          errorCode='RESEARCH_STREAM_CHANGED', errorStage='validation', retryable=False,
+                          sessionId=session.sessionId, streamId=stream_id)
+                return
+
+            def submission_failure(error):
+                submissions.trace_failure(obj, error, session_id=session.sessionId, stream_id=stream_id,
+                                          model=getattr(session, 'model', None))
+                known = isinstance(error, submissions.ResearchInputError)
+                return {'error': str(error) if known else '研究消息暂未接收，请检查连接后重试。',
+                        'errorCode': error.errorCode if known else 'RESEARCH_SUBMISSION_FAILED',
+                        'errorStage': error.errorStage if known else 'submission',
+                        'retryable': error.retryable if known else True,
+                        'sessionId': session.sessionId, 'streamId': stream_id}
+
             if research_controller is not None:
                 async def send_desktop_input() -> None:
                     con = _open_research_readonly()
                     try:
                         payload = await research_controller.send_message(obj, con)
-                        write_ack(req_id, ok=True, data=payload)
+                        write_ack(req_id, ok=True, data=payload, sessionId=session.sessionId, streamId=stream_id)
+                    except asyncio.CancelledError:
+                        write_ack(req_id, ok=False, error='研究启动已取消，原始问题已保留。',
+                                  errorCode='RESEARCH_STARTUP_CANCELLED', errorStage='startup', retryable=True,
+                                  sessionId=session.sessionId, streamId=stream_id)
+                        raise
                     except Exception as error:  # noqa: BLE001 - true correlated input failures
-                        write_ack(req_id, ok=False, error=str(error))
+                        write_ack(req_id, ok=False, **submission_failure(error))
                     finally:
                         if con is not None:
                             con.close()
 
                 task = loop.create_task(send_desktop_input())
                 desktop_tasks.add(task)
+                research_input_tasks.add(task)
                 task.add_done_callback(desktop_tasks.discard)
+                task.add_done_callback(research_input_tasks.discard)
                 await asyncio.sleep(0)
                 return
             con = _open_research_readonly()
             try:
                 payload = await research_ingress.send(obj, con)
-                write_ack(req_id, ok=True, data=payload)
+                write_ack(req_id, ok=True, data=payload, sessionId=session.sessionId, streamId=stream_id)
             except Exception as error:  # noqa: BLE001 - input acceptance is not run creation
-                write_ack(req_id, ok=False, error=str(error))
+                write_ack(req_id, ok=False, **submission_failure(error))
             finally:
                 if con is not None:
                     con.close()
@@ -1754,12 +1922,12 @@ async def run_desktop_bridge(runtime_host: Any, options: Any = None) -> int:
                     if not run_id:
                         raise ValueError("resume_research requires runId")
                     clarification = str(obj.get("clarification") or "").strip()
-                    text = f"/research resume {run_id}" + (f" {clarification}" if clarification else "")
+                    text = render_research_command("resume", run_id, clarification)
                 else:
                     run_id = str(obj.get("runId") or "").strip()
                     if not run_id:
                         raise ValueError("stop_research requires runId")
-                    text = f"/research stop {run_id}"
+                    text = render_research_command("stop", run_id)
                 prompt_command = {"type": "prompt", "text": text, "requestId": req_id}
                 if cmd not in ("start_research", "startresearch"):
                     # Slash commands are handled before the model turn. Steering lets Stop/Resume

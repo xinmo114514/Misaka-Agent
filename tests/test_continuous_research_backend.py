@@ -119,6 +119,62 @@ async def test_first_input_starts_automatic_research_and_prepares_experts(coordi
     assert set(roster.roster_names(str(tmp_path / "profiles"))) == {"research-generalist", "research-reviewer"}
 
 
+async def test_start_new_refuses_to_fold_into_a_settled_run(coordinator):
+    con, session, control, received, tmp_path = coordinator
+    ingress = ingress_for(session, tmp_path)
+    own_run(con, session, status="done", phase="done")
+    ack = await ingress.send({"text": "A brand new question", "sessionId": session.sessionId,
+                              "requestId": "new-1", "startNew": True}, con)
+    await asyncio.gather(*control.inputs)
+    assert ack["mode"] == "start"
+    assert ack["runId"] is None
+    assert "--plan-approval automatic -- A brand new question" in received[0]
+
+
+async def test_start_new_still_yields_to_an_active_run(coordinator):
+    con, session, _control, _received, tmp_path = coordinator
+    ingress = ingress_for(session, tmp_path)
+    own_run(con, session, status="active", phase="active")
+    with pytest.raises(ValueError):
+        await ingress.send({"text": "second question", "sessionId": session.sessionId,
+                            "requestId": "new-2", "startNew": True}, con)
+
+
+async def test_settled_run_is_adopted_without_start_new(coordinator):
+    con, session, control, _received, tmp_path = coordinator
+    ingress = ingress_for(session, tmp_path)
+    run = own_run(con, session, status="done", phase="done")
+    ack = await ingress.send({"text": "Follow up on the finished report", "sessionId": session.sessionId,
+                              "requestId": "cont-1"}, con)
+    await asyncio.gather(*control.inputs)
+    assert ack["runId"] == run["id"]
+    assert ack["mode"] == "followUp"
+
+
+async def test_receipt_write_failure_does_not_leave_a_phantom_start(coordinator):
+    con, session, _control, _received, tmp_path = coordinator
+    entries = []
+    fail = True
+
+    def append(kind, data):
+        if fail:
+            raise OSError('disk full')
+        entries.append({'type': 'custom', 'customType': kind, 'data': data})
+
+    session.sessionManager.getEntries = lambda: entries
+    session.sessionManager.appendCustomEntry = append
+    ingress = ingress_for(session, tmp_path)
+    with pytest.raises(OSError, match='disk full'):
+        await ingress.send({'sessionId': session.sessionId, 'requestId': 'failed-write',
+                            'text': '原始研究问题'}, con)
+    assert ingress.starting is False
+    assert ingress.pending == []
+    fail = False
+    result = await ingress.send({'sessionId': session.sessionId, 'requestId': 'next-input',
+                                 'text': '下一个研究问题'}, con)
+    assert result['mode'] == 'start'
+
+
 async def test_stale_active_run_resumes_original_workflow_and_persists_answer(coordinator):
     con, session, control, received, tmp_path = coordinator
     run = own_run(con, session, status="active")
@@ -330,6 +386,38 @@ async def test_desktop_dispatch_uses_ingress_without_relaxing_generic_prompt_gua
     assert acks["research"]["ok"] is True
     assert acks["research"]["data"]["runId"] == run["id"]
     assert received == ["Later evidence"]
+
+
+async def test_stop_and_resume_controls_render_one_canonical_command(coordinator, monkeypatch):
+    from test_desktop_bridge import MockAgent, MockRuntimeHost
+
+    con, session, _, received, _ = coordinator
+    run = own_run(con, session, status="active")
+    session.agent = MockAgent()
+    session.subscribe = lambda fn: lambda: None
+    session.bindExtensions = lambda *_: asyncio.sleep(0)
+    output = io.StringIO()
+    monkeypatch.setattr(bridge, "writeRawStdout", output.write)
+    monkeypatch.setattr(bridge, "_open_research_readonly", lambda: SimpleNamespace(
+        execute=con.execute, close=lambda: None))
+    cmds = [
+        {"type": "stop_research", "runId": run["id"], "requestId": "stop-1"},
+        {"type": "resume_research", "runId": run["id"], "clarification": "掌权30年吧", "requestId": "resume-1"},
+        {"type": "resume_research", "runId": run["id"], "requestId": "resume-2"},
+        {"type": "resume_research", "requestId": "resume-3"},
+        {"type": "shutdown", "requestId": "bye"},
+    ]
+    monkeypatch.setattr(sys, "stdin", io.StringIO("".join(json.dumps(cmd) + "\n" for cmd in cmds)))
+    assert await bridge.run_desktop_bridge(MockRuntimeHost(session)) == 0
+    acks = {row["requestId"]: row for row in map(json.loads, output.getvalue().splitlines()) if row.get("type") == "ack"}
+    assert acks["stop-1"]["ok"] is True
+    assert acks["resume-3"]["ok"] is False
+    assert "resume_research requires runId" in acks["resume-3"]["error"]
+    assert received == [
+        f"/research stop {run['id']}",
+        f"/research resume {run['id']} 掌权30年吧",
+        f"/research resume {run['id']}",
+    ]
 
 
 def test_desktop_research_flag_builds_real_host_parts(tmp_path, monkeypatch):

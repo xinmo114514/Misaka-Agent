@@ -264,6 +264,85 @@ async def test_real_original_agent_recruits_roles_before_native_planner(prompt_h
         await session.moments.session_shutdown({'type':'session_shutdown','reason':'test'})
         session.dispose()
 
+
+async def test_a_failed_recruitment_intake_retries_the_start_without_redelivering_it(prompt_home):  # noqa: F811
+    """One requestId records one intake turn; its retry continues the start, it never re-recruits."""
+    from misaka.ai.models import get_models
+    from misaka.ai.types import AssistantMessage, DoneEvent
+    from misaka.ai.utils.event_stream import AssistantMessageEventStream
+    from misaka.core import wiring
+    from misaka.core.auth_storage import AuthStorage
+    from misaka.core.resource_loader import DefaultResourceLoader
+    from misaka.core.sdk import create_agent_session
+    from misaka.core.session_manager import SessionManager
+    from misaka.core.settings_manager import SettingsManager
+    from misaka.desktop_research.runtime import DesktopResearchController
+    workspace = prompt_home / 'workspace'
+    workspace.mkdir()
+    _, assembly, _ = wiring.role_session_setup(str(prompt_home/'profiles/last_order'), str(workspace),
+        research_context=True, research_host=True)
+    loader = DefaultResourceLoader({'cwd':str(workspace),'agentDir':str(prompt_home/'agent'),
+        'noExtensions':True,'noPromptTemplates':True,'noThemes':True})
+    await loader.reload()
+    model = next(iter(get_models('openai')))
+    auth = AuthStorage.inMemory()
+    auth.setRuntimeApiKey(model.provider, 'deterministic-fixture')
+    result = await create_agent_session({'cwd':str(workspace),'agentDir':str(prompt_home/'agent'),
+        'model':model,'authStorage':auth,'resourceLoader':loader,
+        'settingsManager':SettingsManager.inMemory({'compaction':{'enabled':False},'retry':{'enabled':False}}),
+        'sessionManager':SessionManager.create(str(workspace),str(prompt_home/'sessions')),
+        'parts':assembly.parts,'customTools':assembly.custom_tools})
+    session = result['session']
+    session.research_host = True
+    observed = []
+    replies = [
+        [{'type':'toolCall','id':'recruit-1','name':'desktop_recruit_agent','arguments':{
+          'name':'archive-specialist','responsibility':'Archive provenance','goal':'Establish reliable sources',
+          'instructions':'Cite page evidence, report uncertainties, message peers'}}],
+        [{'type':'text','text':'Team recruited; native planner owns the handoff.'}],
+        [{'type':'toolCall','id':'plan-clarify','name':'misaka_research_assign','arguments':{
+            'status':'clarify','plan_markdown':'Original question: compare archives. Goal: provenance.',
+            'tasks':[], 'clarifying_questions':['Which century?']}}],
+        [{'type':'text','text':'Which century should the archive comparison cover?'}],
+    ]
+    transient = [True]
+
+    def stream(actual_model, context, options=None):
+        observed.append(context)
+        if transient[0]:
+            transient[0] = False
+            raise RuntimeError('fixture transient failure')
+        assert replies, 'Unexpected native model request'
+        content = replies.pop(0)
+        reply = AssistantMessage(content=content,api=model.api,provider=model.provider,model=model.id,
+          stopReason='toolUse' if content[0]['type']=='toolCall' else 'stop',timestamp=1,
+          usage={'input':1,'output':1,'cacheRead':0,'cacheWrite':0,'totalTokens':2,
+          'cost':{'input':0,'output':0,'cacheRead':0,'cacheWrite':0,'total':0}})
+        out = AssistantMessageEventStream()
+        out.push(DoneEvent(reason=reply.stopReason,message=reply))
+        out.end(reply)
+        return out
+    session.agent.streamFn = stream
+    controller = DesktopResearchController(session, lambda payload: None).attach()
+    await session.bindExtensions({'mode':'json'})
+    con = controller.scope.native.module('misaka.core.research.wiring.research')._con()
+    payload = {'sessionId':session.sessionId,'requestId':'same-start','text':'Compare the archival evidence',
+               'limits':{'max_depth':0,'max_nodes':1}}
+    try:
+        with pytest.raises(ValueError, match='has not recruited'):
+            await controller.send_message(dict(payload), con)
+        ack = await controller.send_message(dict(payload), con)
+        assert ack['accepted'] is True and ack['mode'] == 'start'
+        intakes = [entry for entry in session.sessionManager.buildContextEntries()
+                   if entry.get('type') == 'custom_message' and entry.get('customType') == 'desktop-intake'
+                   and (entry.get('details') or {}).get('requestId') == 'same-start']
+        assert len(intakes) == 1
+    finally:
+        await controller.close()
+        await session.moments.session_shutdown({'type':'session_shutdown','reason':'test'})
+        session.dispose()
+
+
 def test_scoped_subagent_part_uses_scoped_manager_not_native_manager(tmp_path):
     from misaka.config.product import current_config
     from misaka.core.subagent.runtime import RoleContext, SubagentManager
@@ -289,6 +368,7 @@ async def test_real_native_agent_child_uses_desktop_bootstrap_and_exact_team_pai
     from misaka.desktop_research.runtime import DesktopExecutionScope
     from misaka.desktop_research.team import DesktopResearchTeam
     from tests.test_agent_model_runtime import opened
+    from tests.test_subagent_native_startup import _complete_native_turn
     root, requests = local_models
     monkeypatch.setenv('MISAKA_SUBAGENT_MODEL', 'fixture-b/different')
     team = DesktopResearchTeam(root/'team-session',root/'profiles/sisters','fixture-lo','shared')
@@ -314,8 +394,9 @@ async def test_real_native_agent_child_uses_desktop_bootstrap_and_exact_team_pai
                     failures.append(traceback.format_exc())
                     raise
             manager._run_turn=traced_turn
-            async with asyncio.timeout(30):
-                await manager._drive(task,'CHILD_MODEL_MARKER',notify=False)
+            # Match the native startup contract: up to 45s before the real model
+            # request, then the unchanged 20s response/teardown budget.
+            await _complete_native_turn(manager._drive(task, 'CHILD_MODEL_MARKER', notify=False), task, requests)
             assert task.status=='completed',(task.error,list(task.stderr),failures)
             assert 'Loopback fixture answer.' in str(task.result)
             assert [(provider,payload['model']) for provider,payload in requests] == [('fixture-lo','shared')]

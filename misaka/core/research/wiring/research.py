@@ -426,6 +426,11 @@ class ResearchPart:
                 token_start=budget.spent(con),
                 origin_session=getattr(getattr(ctx, "sessionManager", None), "sessionId", None),
             )
+            from misaka.core.research import submissions
+            from misaka.core.research.ingress import current_request_id
+            request_id = current_request_id.get()
+            if request_id and submissions.lookup(self.session, request_id):
+                submissions.record(self.session, request_id, 'applied', runId=run['id'])
             # The discipline itself is not written into the transcript: `context` puts it in
             # front of the model on every request while a run of this conversation is open
             # (2026-09-18, B31: the one-off copy scrolled away, and after a while Last Order
@@ -434,7 +439,7 @@ class ResearchPart:
                 {"customType": "research-discipline", "display": True,
                  "content": f"Research mode is on for run {run['id']}: the research workflow's "
                             "rules apply to this conversation for as long as the run is open.",
-                 "details": {"run_id": run["id"]}},
+                 "details": {"run_id": run["id"], **({"requestId": request_id} if request_id else {})}},
                 {"deliverAs": "followUp", "triggerTurn": False},
             )
             launch(run["id"], ctx)
@@ -450,6 +455,12 @@ class ResearchPart:
                 await begin(question, choice, ctx)
             except Exception as error:  # noqa: BLE001 - the failure is shown and the question is kept for a retry
                 pending["choice"] = choice
+                from misaka.core.research import submissions
+                from misaka.core.research.ingress import current_request_id
+                request_id = current_request_id.get()
+                if request_id and submissions.lookup(self.session, request_id):
+                    submissions.record(self.session, request_id, 'rejected',
+                                       errorCode='RESEARCH_STARTUP_FAILED', errorStage='startup', retryable=True)
                 send_progress(
                     f"Research startup failed: {type(error).__name__}: {error}\n"
                     "Research mode is still waiting for a question: send it again, or enter /research to leave research mode.",
@@ -467,7 +478,8 @@ class ResearchPart:
                  "details": {"question": question, **choice["limits"], "workspace": choice["workspace"],
                              "plan_approval": choice["plan_approval"], "session": choice["session"] or {},
                              **({"requestId": request_id} if request_id else {})}},
-                {"deliverAs": "followUp", "triggerTurn": False},
+                {"deliverAs": "followUp", "triggerTurn": False,
+                 **({'_deliveryId': f'research-question:{self.session.sessionId}:{request_id}'} if request_id else {})},
             )
             task = asyncio.create_task(begin_safely(question, choice, ctx))
             starts.add(task)

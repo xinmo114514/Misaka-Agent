@@ -11,7 +11,12 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import ClassVar
 
-from misaka.core.research.ingress import session_run
+from misaka.core.research import submissions
+from misaka.core.research.ingress import (
+    adoptable_run,
+    session_run,
+    validate_research_input,
+)
 from misaka.utils.values import read_field
 
 from .auxiliary import prepare_desktop_assembly
@@ -21,6 +26,11 @@ from .team import DesktopResearchTeam
 
 logger = logging.getLogger(__name__)
 __all__ = ['DesktopExecutionScope', 'DesktopResearchController', 'prepare_desktop_assembly']
+
+# A recruitment turn is a real model conversation (it inspects the question, then recruits each
+# role), so it is slow by design. The bound exists only to turn "never settles" into a visible,
+# retryable failure; it is far above a healthy recruitment and does not limit a started run.
+RECRUITMENT_TURN_TIMEOUT_SECONDS = 600.0
 
 
 async def _maybe(value):
@@ -685,16 +695,15 @@ class DesktopResearchController:
     async def send_message(self, obj, con):
         async with self.lock:
             # Validate before the recruitment turn, not only after changing the transcript.
-            if obj.get('sessionId') != self.session.sessionId:
-                raise ValueError('Research session changed; refresh before sending.')
-            text, request_id = obj.get('text'), obj.get('requestId')
-            if not isinstance(text, str) or not text.strip() or text.lstrip().startswith('/'):
-                raise ValueError('Enter prose in this research conversation.')
-            if not isinstance(request_id, str) or not request_id.strip():
-                raise ValueError('send_research_message requires requestId')
+            submissions.trace_input(obj, stage='controller', session_id=self.session.sessionId,
+                                    model=getattr(self.session, 'model', None))
+            stripped, control_spec = validate_research_input(obj, self.session.sessionId)
+            request_id = obj['requestId']
+            obj = {**obj, 'text': stripped}
             if obj.get('runId') and session_run(self.session, con) is None:
                 raise ValueError('The research run does not belong to this root session.')
-            if session_run(self.session, con) is None and not self.ingress.starting and request_id not in self.intake_requests:
+            if (control_spec is None and adoptable_run(self.session, con, obj, run_lookup=session_run) is None
+                    and not self.ingress.starting and submissions.lookup(self.session, request_id) is None):
                 from misaka.core.session_control import for_session
                 control = for_session(self.session)
                 if control is None or not control.accepting:
@@ -710,12 +719,42 @@ class DesktopResearchController:
                 try:
                     # Hidden native custom intake preserves the user's exact input once;
                     # the workflow publishes its existing research-question entry on start.
-                    await self.session.sendCustomMessage({'customType': 'desktop-intake',
-                        'display': False, 'content': text.strip(),
-                        'details': {'requestId': request_id}},
-                        {'triggerTurn': True, 'prepareTurn': True,
-                         '_deliveryId': f'desktop-intake:{self.session.sessionId}:{request_id}'})
-                    await self.session.waitForIdle()
+                    previous = submissions.recorded_input(self.session, request_id, 'desktop-intake')
+                    if previous and str(previous.get('content') or '').strip() != stripped:
+                        raise submissions.request_conflict()
+                    members = self.team.snapshot()['team']['members']
+                    last = getattr(self.session, '_find_last_assistant_message', lambda: None)()
+                    interrupted = last is not None and read_field(last, 'stopReason') != 'stop'
+                    if previous is None and request_id not in self.intake_requests:
+                        await self.session.sendCustomMessage({'customType': 'desktop-intake',
+                            'display': False, 'content': stripped,
+                            'details': {'requestId': request_id}},
+                            {'triggerTurn': True, 'prepareTurn': True,
+                             '_deliveryId': f'desktop-intake:{self.session.sessionId}:{request_id}'})
+                    elif not members or interrupted:
+                        # This is an internal continuation, not another copy of user intent.
+                        attempt = 1 + sum(entry.get('customType') == 'desktop-intake-resume'
+                            and (entry.get('details') or {}).get('requestId') == request_id
+                            for entry in submissions.entries(self.session))
+                        await self.session.sendCustomMessage({'customType': 'desktop-intake-resume',
+                            'display': False,
+                            'content': 'Continue preparing the task-specific research team for the original '
+                                       'desktop-intake question already recorded in this conversation. '
+                                       'Complete recruitment before handing off to the native planner.',
+                            'details': {'requestId': request_id, 'kind': 'recruitment-continuation'}},
+                            {'triggerTurn': True, 'prepareTurn': True,
+                             '_deliveryId': f'desktop-intake-resume:{self.session.sessionId}:{request_id}:{attempt}'})
+                    # The intake turn is now durably recorded, so a retry of this requestId must
+                    # resume with the start instead of re-delivering (and re-recruiting) it.
+                    # Recruitment is a real model turn, so it is allowed to take a long time --
+                    # but not forever. Without a bound, a stalled provider left the caller with
+                    # no ack and no failure event, and the desktop waited out its whole startup
+                    # budget before reporting nothing.
+                    await asyncio.wait_for(self.session.waitForIdle(), RECRUITMENT_TURN_TIMEOUT_SECONDS)
+                except TimeoutError as error:
+                    raise submissions.ResearchInputError(
+                        '研究团队招募未在预期时间内完成，研究尚未启动；原始课题已保留，可以重试。',
+                        'RESEARCH_RECRUITMENT_TIMEOUT', stage='recruitment', retryable=True) from error
                 finally:
                     current_request_id.reset(token)
                     self.scene.intake = False

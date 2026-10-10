@@ -1862,6 +1862,7 @@ async def test_ordinary_session_cannot_compact_a_live_research_root(monkeypatch,
     monkeypatch.setattr(bridge_module, "_open_research_readonly", open_readonly)
     session = MockSession()
     session.sessionManager.sessionFile = str(root_session)
+    session.sessionManager.getCwd = lambda: str(workspace)
     output = io.StringIO()
     commands = [
         {"type": "compact_session", "requestId": "compact-live-root"},
@@ -1875,6 +1876,263 @@ async def test_ordinary_session_cannot_compact_a_live_research_root(monkeypatch,
                if item.get("requestId") == "compact-live-root")
     assert ack["ok"] is False
     assert "Stop the owning research run" in ack["error"]
+
+
+@pytest.mark.asyncio
+async def test_active_research_session_permits_load_session_to_switch_session(monkeypatch, tmp_path):
+    import sqlite3
+    from contextlib import closing
+
+    import misaka.cli.desktop_bridge as bridge_module
+    from misaka.core.platform import tasks
+    from misaka.core.research import runs
+
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+    board = tmp_path / "board.db"
+    root_session = workspace / "root.jsonl"
+    root_session.write_text("{}", encoding="utf-8")
+    target_session = workspace / "target.jsonl"
+    target_session.write_text("{}", encoding="utf-8")
+    with closing(tasks.connect(str(board))) as con:
+        runs.init(con)
+        run = runs.create(con, workspace=str(workspace), question="Live project research")
+        runs.set_state(con, run["id"], status="active", root_session=str(root_session))
+
+    def open_readonly():
+        con = sqlite3.connect(board.as_uri() + "?mode=ro", uri=True)
+        con.row_factory = sqlite3.Row
+        con.execute("PRAGMA query_only=ON")
+        return con
+
+    monkeypatch.setattr(bridge_module, "_open_research_readonly", open_readonly)
+    session = MockSession()
+    session.sessionManager.sessionFile = str(root_session)
+    runtime = MockRuntimeHost(session)
+    output = io.StringIO()
+    commands = [
+        {"type": "load_session", "requestId": "load-other", "path": str(target_session)},
+        {"type": "shutdown"},
+    ]
+    monkeypatch.setattr(sys, "stdin", io.StringIO("".join(json.dumps(item) + chr(10) for item in commands)))
+    monkeypatch.setattr(bridge_module, "writeRawStdout", output.write)
+
+    assert await run_desktop_bridge(runtime) == 0
+    ack = next(item for item in map(json.loads, output.getvalue().splitlines())
+               if item.get("requestId") == "load-other")
+    assert ack["ok"] is True
+    assert runtime.switch_session_calls == [str(target_session)]
+
+
+@pytest.mark.asyncio
+async def test_waiting_input_research_session_adapts_plain_prompt_to_resume(monkeypatch, tmp_path):
+    import sqlite3
+    from contextlib import closing
+
+    import misaka.cli.desktop_bridge as bridge_module
+    from misaka.core.platform import tasks
+    from misaka.core.research import runs
+
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+    board = tmp_path / "board.db"
+    root_session = workspace / "root.jsonl"
+    root_session.write_text("{}", encoding="utf-8")
+    with closing(tasks.connect(str(board))) as con:
+        runs.init(con)
+        run = runs.create(con, workspace=str(workspace), question="Live project research")
+        runs.set_state(con, run["id"], status="waiting_input", root_session=str(root_session))
+
+    def open_readonly():
+        con = sqlite3.connect(board.as_uri() + "?mode=ro", uri=True)
+        con.row_factory = sqlite3.Row
+        con.execute("PRAGMA query_only=ON")
+        return con
+
+    monkeypatch.setattr(bridge_module, "_open_research_readonly", open_readonly)
+    session = MockSession()
+    session.sessionManager.sessionFile = str(root_session)
+    session.sessionManager.getCwd = lambda: str(workspace)
+    prompted_texts = []
+    async def capture_prompt(text, *args, **kwargs):
+        prompted_texts.append(text)
+    session.prompt = capture_prompt
+
+    runtime = MockRuntimeHost(session)
+    output = io.StringIO()
+    commands = [
+        {"type": "prompt", "requestId": "p1", "text": "掌权30年吧"},
+        {"type": "shutdown"},
+    ]
+    monkeypatch.setattr(sys, "stdin", io.StringIO("".join(json.dumps(item) + chr(10) for item in commands)))
+    monkeypatch.setattr(bridge_module, "writeRawStdout", output.write)
+
+    assert await run_desktop_bridge(runtime) == 0
+    ack = next(item for item in map(json.loads, output.getvalue().splitlines())
+               if item.get("requestId") == "p1")
+    assert ack["ok"] is True
+    assert len(prompted_texts) == 1
+    assert prompted_texts[0] == f"/research resume {run['id']} 掌权30年吧"
+
+
+@pytest.mark.asyncio
+async def test_waiting_input_node_session_keeps_generic_prompt_guard(monkeypatch, tmp_path):
+    import sqlite3
+    from contextlib import closing
+
+    import misaka.cli.desktop_bridge as bridge_module
+    from misaka.core.platform import tasks
+    from misaka.core.research import runs
+
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+    board = tmp_path / "board.db"
+    root_session = workspace / "root.jsonl"
+    node_session = workspace / "node.jsonl"
+    root_session.write_text("{}", encoding="utf-8")
+    node_session.write_text("{}", encoding="utf-8")
+    with closing(tasks.connect(str(board))) as con:
+        runs.init(con)
+        run = runs.create(con, workspace=str(workspace), question="Live project research")
+        root = runs.root(con, run["id"])
+        node = runs.create_node(con, run["id"], question="Branch", parents=[root["id"]])
+        runs.set_state(con, run["id"], status="waiting_input", root_session=str(root_session))
+        runs.set_node(con, node["id"], session_file=str(node_session))
+
+    def open_readonly():
+        con = sqlite3.connect(board.as_uri() + "?mode=ro", uri=True)
+        con.row_factory = sqlite3.Row
+        con.execute("PRAGMA query_only=ON")
+        return con
+
+    monkeypatch.setattr(bridge_module, "_open_research_readonly", open_readonly)
+    session = MockSession()
+    session.sessionManager.sessionFile = str(node_session)
+    session.sessionManager.getCwd = lambda: str(workspace)
+    prompted_texts = []
+
+    async def capture_prompt(text, *args, **kwargs):
+        prompted_texts.append(text)
+
+    session.prompt = capture_prompt
+    output = io.StringIO()
+    commands = [
+        {"type": "prompt", "requestId": "node-prompt", "text": "ordinary node message"},
+        {"type": "shutdown"},
+    ]
+    monkeypatch.setattr(sys, "stdin", io.StringIO("".join(json.dumps(item) + chr(10) for item in commands)))
+    monkeypatch.setattr(bridge_module, "writeRawStdout", output.write)
+
+    assert await run_desktop_bridge(MockRuntimeHost(session)) == 0
+    ack = next(item for item in map(json.loads, output.getvalue().splitlines())
+               if item.get("requestId") == "node-prompt")
+    assert ack["ok"] is False
+    assert "Stop the owning research run" in ack["error"]
+    assert prompted_texts == []
+
+
+@pytest.mark.asyncio
+async def test_active_root_session_keeps_generic_prompt_guard(monkeypatch, tmp_path):
+    import sqlite3
+    from contextlib import closing
+
+    import misaka.cli.desktop_bridge as bridge_module
+    from misaka.core.platform import tasks
+    from misaka.core.research import runs
+
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+    board = tmp_path / "board.db"
+    root_session = workspace / "root.jsonl"
+    root_session.write_text("{}", encoding="utf-8")
+    with closing(tasks.connect(str(board))) as con:
+        runs.init(con)
+        run = runs.create(con, workspace=str(workspace), question="Live project research")
+        runs.set_state(con, run["id"], status="active", root_session=str(root_session))
+
+    def open_readonly():
+        con = sqlite3.connect(board.as_uri() + "?mode=ro", uri=True)
+        con.row_factory = sqlite3.Row
+        con.execute("PRAGMA query_only=ON")
+        return con
+
+    monkeypatch.setattr(bridge_module, "_open_research_readonly", open_readonly)
+    session = MockSession()
+    session.sessionManager.sessionFile = str(root_session)
+    session.sessionManager.getCwd = lambda: str(workspace)
+    prompted_texts = []
+
+    async def capture_prompt(text, *args, **kwargs):
+        prompted_texts.append(text)
+
+    session.prompt = capture_prompt
+    output = io.StringIO()
+    commands = [
+        {"type": "prompt", "requestId": "active-prompt", "text": "generic active edit"},
+        {"type": "shutdown"},
+    ]
+    monkeypatch.setattr(sys, "stdin", io.StringIO("".join(json.dumps(item) + chr(10) for item in commands)))
+    monkeypatch.setattr(bridge_module, "writeRawStdout", output.write)
+
+    assert await run_desktop_bridge(MockRuntimeHost(session)) == 0
+    ack = next(item for item in map(json.loads, output.getvalue().splitlines())
+               if item.get("requestId") == "active-prompt")
+    assert ack["ok"] is False
+    assert "Stop the owning research run" in ack["error"]
+    assert prompted_texts == []
+
+
+@pytest.mark.asyncio
+async def test_waiting_root_prompt_cannot_spoof_the_session_workspace(monkeypatch, tmp_path):
+    import sqlite3
+    from contextlib import closing
+
+    import misaka.cli.desktop_bridge as bridge_module
+    from misaka.core.platform import tasks
+    from misaka.core.research import runs
+
+    workspace = tmp_path / "project"
+    other_workspace = tmp_path / "other-project"
+    workspace.mkdir()
+    other_workspace.mkdir()
+    board = tmp_path / "board.db"
+    root_session = workspace / "root.jsonl"
+    root_session.write_text("{}", encoding="utf-8")
+    with closing(tasks.connect(str(board))) as con:
+        runs.init(con)
+        run = runs.create(con, workspace=str(workspace), question="Live project research")
+        runs.set_state(con, run["id"], status="waiting_input", root_session=str(root_session))
+
+    def open_readonly():
+        con = sqlite3.connect(board.as_uri() + "?mode=ro", uri=True)
+        con.row_factory = sqlite3.Row
+        con.execute("PRAGMA query_only=ON")
+        return con
+
+    monkeypatch.setattr(bridge_module, "_open_research_readonly", open_readonly)
+    session = MockSession()
+    session.sessionManager.sessionFile = str(root_session)
+    session.sessionManager.getCwd = lambda: str(other_workspace)
+    prompted_texts = []
+
+    async def capture_prompt(text, *args, **kwargs):
+        prompted_texts.append(text)
+
+    session.prompt = capture_prompt
+    output = io.StringIO()
+    commands = [
+        {"type": "prompt", "requestId": "spoof", "workspace": str(workspace), "text": "generic edit"},
+        {"type": "shutdown"},
+    ]
+    monkeypatch.setattr(sys, "stdin", io.StringIO("".join(json.dumps(item) + chr(10) for item in commands)))
+    monkeypatch.setattr(bridge_module, "writeRawStdout", output.write)
+
+    assert await run_desktop_bridge(MockRuntimeHost(session)) == 0
+    ack = next(item for item in map(json.loads, output.getvalue().splitlines())
+               if item.get("requestId") == "spoof")
+    assert ack["ok"] is False
+    assert "Stop the owning research run" in ack["error"]
+    assert prompted_texts == []
 
 
 def test_session_mutation_guard_detects_active_research_root_and_node_sessions(tmp_path):
@@ -1900,6 +2158,55 @@ def test_session_mutation_guard_detects_active_research_root_and_node_sessions(t
         assert session_belongs_to_active_research(con, str(node_path))
         runs.set_state(con, run["id"], status="done")
         assert session_belongs_to_active_research(con, str(root_path)) is False
+
+
+@pytest.mark.asyncio
+async def test_prompt_folds_research_command_keyword_case_and_keeps_the_body(monkeypatch, tmp_path):
+    import sqlite3
+    from contextlib import closing
+
+    import misaka.cli.desktop_bridge as bridge_module
+    from misaka.core.platform import tasks
+    from misaka.core.research import runs
+
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+    board = tmp_path / "board.db"
+    with closing(tasks.connect(str(board))) as con:
+        runs.init(con)
+
+    def open_readonly():
+        con = sqlite3.connect(board.as_uri() + "?mode=ro", uri=True)
+        con.row_factory = sqlite3.Row
+        con.execute("PRAGMA query_only=ON")
+        return con
+
+    monkeypatch.setattr(bridge_module, "_open_research_readonly", open_readonly)
+    session = MockSession()
+    session.sessionManager.sessionFile = str(workspace / "root.jsonl")
+    session.sessionManager.getCwd = lambda: str(workspace)
+    prompted_texts = []
+
+    async def capture_prompt(text, *args, **kwargs):
+        prompted_texts.append(text)
+
+    session.prompt = capture_prompt
+    output = io.StringIO()
+    commands = [
+        {"type": "prompt", "requestId": "status-cmd", "text": "/RESEARCH STATUS"},
+        {"type": "prompt", "requestId": "resume-cmd", "text": "/Research ReSuMe r_fixture   第一个词  keep?!"},
+        {"type": "prompt", "requestId": "activation", "text": "/research 关于 宪法 的起源"},
+        {"type": "shutdown"},
+    ]
+    monkeypatch.setattr(sys, "stdin", io.StringIO("".join(json.dumps(item) + chr(10) for item in commands)))
+    monkeypatch.setattr(bridge_module, "writeRawStdout", output.write)
+
+    assert await run_desktop_bridge(MockRuntimeHost(session)) == 0
+    assert prompted_texts == [
+        "/research status",
+        "/research resume r_fixture   第一个词  keep?!",
+        "/research 关于 宪法 的起源",
+    ]
 
 
 def test_bridge_direct_entry_installs_meter_before_opening_session(monkeypatch, tmp_path):

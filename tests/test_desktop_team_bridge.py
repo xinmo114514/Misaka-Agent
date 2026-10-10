@@ -105,6 +105,52 @@ async def test_legacy_desktop_start_also_uses_team_intake(monkeypatch):
     assert ack["ok"] is True
     assert ("send", "Compare sources") in Controller.calls
 
+
+async def test_abort_cancels_pending_research_intake_before_a_run_can_start(monkeypatch):
+    async def intake(self, obj, con):
+        self.calls.append('intake-entered')
+        try:
+            await self.gate.wait()
+        except asyncio.CancelledError:
+            self.calls.append('intake-cancelled')
+            raise
+        self.calls.append('unintended-run-start')
+        return {'accepted': True, 'mode': 'start'}
+
+    monkeypatch.setattr(Controller, 'send_message', intake)
+    replies = await bridge(monkeypatch, [
+        {'type': 'send_research_message', 'requestId': 'pending-input',
+         'sessionId': 'test-session-123', 'text': '研究要求'},
+        {'type': 'abort', 'requestId': 'cancel-intake'},
+        {'type': 'desktop_set_team_model', 'sessionId': 'test-session-123',
+         'action': 'cancel', 'requestId': 'release-fixture'},
+    ])
+    assert 'intake-entered' in Controller.calls
+    assert 'intake-cancelled' in Controller.calls
+    assert 'unintended-run-start' not in Controller.calls
+    original = next(row for row in replies if row.get('requestId') == 'pending-input')
+    assert original['ok'] is False
+    assert original['errorCode'] == 'RESEARCH_STARTUP_CANCELLED'
+
+
+@pytest.mark.parametrize('scope,code', [('sessionId', 'RESEARCH_SESSION_CHANGED'), ('streamId', 'RESEARCH_STREAM_CHANGED')])
+async def test_foreign_abort_does_not_cancel_the_current_research_host(monkeypatch, scope, code):
+    async def intake(self, obj, con):
+        await self.gate.wait()
+        return {'accepted': True, 'mode': 'start'}
+
+    monkeypatch.setattr(Controller, 'send_message', intake)
+    result = await bridge(monkeypatch, [
+        {'type': 'send_research_message', 'requestId': 'owned-input',
+         'sessionId': 'test-session-123', 'text': '本会话研究'},
+        {'type': 'abort', 'requestId': 'foreign-abort', 'sessionId': 'test-session-123', scope: 'foreign-owner'},
+        {'type': 'desktop_set_team_model', 'sessionId': 'test-session-123',
+         'action': 'cancel', 'requestId': 'release-fixture'},
+    ])
+    ack = next(row for row in result if row.get('requestId') == 'foreign-abort')
+    assert ack['ok'] is False and ack['errorCode'] == code
+    assert next(row for row in result if row.get('requestId') == 'owned-input')['ok'] is True
+
 @pytest.mark.asyncio
 async def test_desktop_research_prompt_question_also_uses_team_intake(monkeypatch):
     result = await bridge(monkeypatch, [{"type": "prompt", "requestId": "slash-start", "text": "/research Compare sources"}])

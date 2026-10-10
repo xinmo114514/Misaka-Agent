@@ -229,6 +229,8 @@ class PromptOptions:
     streamingBehavior: str | None = None
     source: str = "interactive"
     preflightResult: Callable[[bool], None] | None = None
+    requestId: str | None = None
+    deliveryId: str | None = None
 
 
 @dataclass(slots=True)
@@ -323,6 +325,7 @@ class AgentSession:
         self._pendingBashMessages: list[BashExecutionMessage] = []
         self._pendingCustomMessages: list[dict[str, Any]] = []
         self._customMessageReceipts: dict[str, dict[str, Any]] = {}
+        self._promptDeliveryIds: set[str] = set()
         self._bashAbortControllers: set[AbortController] = set()
         self._auto_compaction_abort_controller: AbortController | None = None
         self._compactionAbortController: AbortController | None = None
@@ -684,6 +687,12 @@ class AgentSession:
 
         try:
             # MISAKA fork: skill commands prepare text for this same submission.
+            if resolved.deliveryId:
+                from misaka.core.research.submissions import native_delivery
+                if (resolved.deliveryId in getattr(self, '_promptDeliveryIds', set())
+                        or native_delivery(self, resolved.deliveryId)):
+                    report_preflight(True)
+                    return
             # Keep its images, delivery mode, preflight and cancellation ownership.
             prompt_command = self.getCorePromptCommand(text) if resolved.expandPromptTemplates else None
             if (
@@ -730,11 +739,17 @@ class AgentSession:
 
             if self.isStreaming:
                 if resolved.streamingBehavior == "followUp":
-                    await self._queue_follow_up(current_text, current_images)
+                    await self._queue_follow_up(current_text, current_images,
+                                               request_id=resolved.requestId, delivery_id=resolved.deliveryId)
+                    if resolved.deliveryId:
+                        self._promptDeliveryIds.add(resolved.deliveryId)
                     report_preflight(True)
                     return
                 if resolved.streamingBehavior == "steer":
-                    await self._queue_steer(current_text, current_images)
+                    await self._queue_steer(current_text, current_images,
+                                            request_id=resolved.requestId, delivery_id=resolved.deliveryId)
+                    if resolved.deliveryId:
+                        self._promptDeliveryIds.add(resolved.deliveryId)
                     report_preflight(True)
                     return
                 raise RuntimeError(
@@ -772,7 +787,8 @@ class AgentSession:
             normalized_images, hints = await self._normalize_prompt_images(current_images)
             user_text = f"{current_text}\n\n" + "\n".join(hints) if hints else current_text
             messages: list[Any] = []
-            messages.append(self._build_user_message(user_text, normalized_images))
+            messages.append(self._build_user_message(user_text, normalized_images,
+                            request_id=resolved.requestId, delivery_id=resolved.deliveryId))
             pending_next_turn = self._pendingNextTurnMessages
             messages.extend(pending_next_turn)
             self._pendingNextTurnMessages = []
@@ -933,15 +949,17 @@ class AgentSession:
             }
         )
 
-    async def _queue_steer(self, text: str, images: Sequence[ImageContent] | None = None) -> None:
+    async def _queue_steer(self, text: str, images: Sequence[ImageContent] | None = None,
+                         *, request_id=None, delivery_id=None) -> None:
         self._steeringMessages.append(text)
         self._emit_queue_update()
-        self.agent.steer(self._build_user_message(text, images))
+        self.agent.steer(self._build_user_message(text, images, request_id=request_id, delivery_id=delivery_id))
 
-    async def _queue_follow_up(self, text: str, images: Sequence[ImageContent] | None = None) -> None:
+    async def _queue_follow_up(self, text: str, images: Sequence[ImageContent] | None = None,
+                             *, request_id=None, delivery_id=None) -> None:
         self._followUpMessages.append(text)
         self._emit_queue_update()
-        self.agent.followUp(self._build_user_message(text, images))
+        self.agent.followUp(self._build_user_message(text, images, request_id=request_id, delivery_id=delivery_id))
 
     def _throw_if_extension_command(self, text: str) -> None:
         command_text = text.removeprefix("/")
@@ -2387,7 +2405,19 @@ class AgentSession:
         if role == "custom":
             return self._append_custom_message(message)
         if role in {"system", "user", "assistant", "toolResult"}:
-            return self.sessionManager.appendMessage(_message_dict(message))
+            entry_id = self.sessionManager.appendMessage(_message_dict(message))
+            request_id = read_field(message, 'requestId')
+            delivery_id = read_field(message, 'deliveryId')
+            if role == 'user' and delivery_id:
+                # Only a written entry proves delivery: a turn that fails before this point
+                # must stay retryable under the same deliveryId, and one after it must not
+                # be delivered twice.
+                self._promptDeliveryIds.add(delivery_id)
+            if role == 'user' and request_id and delivery_id:
+                from misaka.core.research import submissions
+                if submissions.lookup(self, request_id):
+                    submissions.record(self, request_id, 'applied', entryId=entry_id)
+            return entry_id
         return None
 
     def _apply_extension_bindings(self, runner: ExtensionRunner) -> None:
@@ -2976,11 +3006,14 @@ class AgentSession:
         self,
         text: str,
         images: Sequence[ImageContent] | None = None,
+        *, request_id: str | None = None, delivery_id: str | None = None,
     ) -> dict[str, Any]:
         content: list[dict[str, Any]] = [TextContent(text=text).model_dump()]
         if images:
             content.extend(image.model_dump() if hasattr(image, "model_dump") else image for image in images)
-        return {"role": "user", "content": content, "timestamp": int(time.time() * 1000)}
+        return {"role": "user", "content": content, "timestamp": int(time.time() * 1000),
+                **({'requestId': request_id} if request_id else {}),
+                **({'deliveryId': delivery_id} if delivery_id else {})}
 
     def _extract_user_message_text(self, content: str | list[Any]) -> str:
         # `read_field` rather than `block.get`: a user message that came through

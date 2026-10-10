@@ -84,3 +84,15 @@ async def test_the_saved_window_and_an_explicit_here_both_resume(chat, tmp_path)
     await chat.command(f"resume {chat.run['id']} --here", chat.ctx)
     await asyncio.wait_for(chat.started.wait(), 3)
     assert len(chat.driven) == 2 and chat.driven[-1]["clarification"] == ""
+
+
+async def test_stop_reenters_a_waiting_run_with_no_live_driver(chat, board, tmp_path):
+    chat.ctx.sessionManager.sessionFile = str(tmp_path / "root-window.jsonl")
+    runs.set_state(board, chat.run["id"], status="waiting_input", phase="waiting_input")
+
+    await chat.command(f"stop {chat.run['id']}", chat.ctx)
+    await asyncio.wait_for(chat.started.wait(), 3)
+
+    assert chat.driven[-1]["run_id"] == chat.run["id"]
+    assert chat.driven[-1].get("resume") is not True
+    assert "Stop request recorded" in chat.notices[-1][0]
