@@ -73,6 +73,7 @@ from misaka.ai.utils.diagnostics import (
 from misaka.ai.utils.event_stream import AssistantMessageEventStream, spawn_stream_task
 from misaka.ai.utils.headers import headers_to_record
 from misaka.ai.utils.json_parse import StreamingArgs, parse_streaming_json
+from misaka.ai.utils.network_route import httpx_client_options
 from misaka.ai.utils.provider_env import get_provider_env_value
 from misaka.core.http_dispatcher import createHttpxIdleTimeout
 from misaka.utils.values import maybe_await, signal_aborted
@@ -83,6 +84,20 @@ DIAGNOSTIC_BODY_MAX_LENGTH = 8192
 Compared against ``len(str)``, so the unit is code points here and UTF-16 code units in
 upstream's ``value.length`` -- neither is bytes.
 """
+
+
+class _BorrowedAsyncTransport(httpx.AsyncBaseTransport):
+    """Delegate requests while leaving a caller-owned transport open."""
+
+    def __init__(self, transport: httpx.AsyncBaseTransport) -> None:
+        self.transport = transport
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        return await self.transport.handle_async_request(request)
+
+    async def aclose(self) -> None:
+        # The wrapper owns no connection pool; the injected transport's caller does.
+        pass
 
 
 class PiMessagesOptions(TypedDict, total=False):
@@ -536,8 +551,16 @@ def stream_pi_messages(
             request_headers.update(_provider_headers_to_record(_option(options, "headers")) or {})
 
             transport = _option(options, "httpTransport")
+            # An explicit injected fetch/transport is authoritative, including
+            # its routing. Proxy mounts must not supersede that seam.
+            client_options = (
+                {"trust_env": False, "proxy": None}
+                if transport is not None
+                else httpx_client_options(url, _option(options, "env"))
+            )
             client = httpx.AsyncClient(
-                transport=transport,
+                **client_options,
+                transport=_BorrowedAsyncTransport(transport) if transport is not None else None,
                 timeout=createHttpxIdleTimeout(_option(options, "timeoutMs")),
                 follow_redirects=True,
             )
@@ -591,13 +614,9 @@ def stream_pi_messages(
                 finally:
                     await response.aclose()
             finally:
-                # Only a client that owns its transport is closed. ``AsyncClient.aclose``
-                # closes the transport it was handed, and upstream never disposes of the
-                # ``fetch`` the caller injected -- a caller that reuses one transport across
-                # calls (a connection pool, a test's MockTransport) would find it shut after
-                # the first request.
-                if transport is None:
-                    await client.aclose()
+                # Always release wrapper state and any owned resources; the
+                # borrowed-transport wrapper deliberately keeps caller pools open.
+                await client.aclose()
         except Exception as error:  # noqa: BLE001 - every failure leaves as an error event
             event_stream.push(_create_error_event(model, error, signal_aborted(signal)), cause=error)
         finally:

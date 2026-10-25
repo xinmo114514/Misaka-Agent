@@ -1,10 +1,11 @@
-from types import SimpleNamespace
-from contextlib import closing
 import json
+import os
+import socket
 import time
+from contextlib import closing
 
-from misaka.core.research import desktop_view, runs
 from misaka.core.platform import tasks
+from misaka.core.research import desktop_view, runs
 
 
 def test_registered_artifact_returns_full_text_and_workspace_relative_path(tmp_path):
@@ -155,3 +156,86 @@ def test_node_detail_returns_errata_against_that_node_with_the_complete_correcti
         detail = desktop_view.node_detail(con, run["id"], root["id"])
 
         assert detail["errata"] == [{"raised_by": reviewer["id"], **payload}]
+
+
+def _hold_lease(con, run_id, lock, *, expires_in=300):
+    con.execute("UPDATE research_runs SET driver_lock=?, driver_expires=? WHERE id=?",
+                (lock, int(time.time()) + expires_in, run_id))
+
+
+def test_session_list_reports_driving_from_the_board_lease_rule(tmp_path):
+    """The desktop's resume entry needs ownership on the list read, not only on the detail read."""
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+    with closing(tasks.connect(str(tmp_path / "board.db"))) as con:
+        runs.init(con)
+        run = runs.create(con, workspace=str(workspace), question="A question")
+        assert desktop_view.sessions_payload(con, run["id"])["run"]["driving"] is False
+
+        _hold_lease(con, run["id"], f"driver:{socket.gethostname()}:{os.getpid()}:live")
+        assert desktop_view.sessions_payload(con, run["id"])["run"]["driving"] is True
+
+        # An expired lease is not a live driver: the run is resumable again.
+        con.execute("UPDATE research_runs SET driver_expires=1 WHERE id=?", (run["id"],))
+        assert desktop_view.sessions_payload(con, run["id"])["run"]["driving"] is False
+
+
+def test_session_list_and_run_detail_agree_on_driving(tmp_path):
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+    with closing(tasks.connect(str(tmp_path / "board.db"))) as con:
+        runs.init(con)
+        run = runs.create(con, workspace=str(workspace), question="A question")
+        _hold_lease(con, run["id"], f"driver:{socket.gethostname()}:{os.getpid()}:live")
+
+        listed = desktop_view.sessions_payload(con, run["id"])["run"]
+        detailed = runs.get(con, run["id"])
+
+        assert listed["driving"] is runs.driver_is_live(detailed) is True
+        assert listed["driverLock"] == detailed["driver_lock"]
+
+
+def test_session_list_does_not_invent_a_driver_when_the_run_is_absent(tmp_path):
+    """No board row is unknown state: the read reports nothing instead of a false lease."""
+    with closing(tasks.connect(str(tmp_path / "board.db"))) as con:
+        runs.init(con)
+        assert desktop_view.sessions_payload(con, "no-such-run") is None
+
+
+def test_session_list_reports_a_plan_wait_separately_from_a_lost_driver(tmp_path):
+    """A plan wait keeps the run active with a free lease; the desktop must not read that as lost."""
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+    with closing(tasks.connect(str(tmp_path / "board.db"))) as con:
+        runs.init(con)
+        run = runs.create(con, workspace=str(workspace), question="A question")
+        node = runs.node(con, runs.nodes(con, run["id"])[0]["id"])
+        assert desktop_view.sessions_payload(con, run["id"])["run"]["awaitingApproval"] is False
+
+        runs.set_node(con, node["id"], status="awaiting_approval")
+        waiting = desktop_view.sessions_payload(con, run["id"])["run"]
+        # The wait and the free lease travel together: `driving` is false and that is legitimate.
+        assert waiting["awaitingApproval"] is True
+        assert waiting["status"] == "active"
+        assert waiting["driving"] is False
+
+        runs.set_node(con, node["id"], status="running")
+        assert desktop_view.sessions_payload(con, run["id"])["run"]["awaitingApproval"] is False
+
+
+def test_session_list_reports_an_unapplied_reconciliation_as_awaiting_approval(tmp_path):
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+    session_file = tmp_path / "root.jsonl"
+    session_file.write_text("", encoding="utf-8")
+    with closing(tasks.connect(str(tmp_path / "board.db"))) as con:
+        runs.init(con)
+        run = runs.create(con, workspace=str(workspace), question="A question")
+        runs.record_reconcile(con, run, 1, {"summary": "Two branches meet"},
+                              session_file=str(session_file), tool_call_id="rec_1")
+
+        assert desktop_view.sessions_payload(con, run["id"])["run"]["awaitingApproval"] is True
+
+        runs.approve_reconcile(con, run, 1)
+        # Approved but not yet applied still waits for the engine, not for an absent driver.
+        assert desktop_view.sessions_payload(con, run["id"])["run"]["awaitingApproval"] is True

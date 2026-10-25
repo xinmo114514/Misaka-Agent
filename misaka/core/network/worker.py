@@ -526,6 +526,14 @@ def build_submission(con, task, summary):
     if con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='research_run_tasks'").fetchone():
         link = con.execute("SELECT kind FROM research_run_tasks WHERE task_id=?", (task["id"],)).fetchone()
         from misaka.core.research import runs
+        if link and link["kind"] == "research" and con.execute(
+            "SELECT 1 FROM events WHERE task_id=? AND kind='research_evidence' AND generation=? LIMIT 1",
+            (task["id"], task["generation"]),
+        ).fetchone() is None:
+            raise IncompleteSubmission(
+                "Record final evidence-backed findings and concrete uncertainties with misaka_card_note "
+                "before completing this research card (findings=[] when no finding is supported)."
+            )
         if link and link["kind"] in runs.CRITIQUE_KINDS and "issues" not in submission:
             raise IncompleteSubmission(
                 "Record the red-team issues with misaka_card_note before completing the card "
@@ -634,13 +642,14 @@ def run_card(
     flags, assembly, prompt, ro_root, role = card_session_setup(
         task, workspace, profile_dir, provider, default_model
     )
-    if task.get("_say") is not None:
+    if task.get("_say") is not None or int(task.get("generation") or 1) > 1 or task.get("last_failure_error"):
         # A settled card continued with a message (``dispatch.run_task(say=...)``): the turn goes on
         # in her own conversation and is the message alone, as ``card-shell --resume --say`` is in
         # a pane -- the contract she already worked from is not sent again.
         from misaka.config import sessions as session_roots
         flags += continue_flags(task.get("session_file"), session_roots.card_session_dir(task)) or []
-        prompt = task["_say"]
+        if task.get("_say") is not None:
+            prompt = task["_say"]
     from misaka.config import env as env_file
 
     env = {**env_file.role_overlay(profile_dir),      # the Sister's own .env, then the card's hand-off names

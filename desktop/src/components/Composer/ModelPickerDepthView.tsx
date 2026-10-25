@@ -1,20 +1,20 @@
+import { useResearchEditorModel } from '../../lib/useResearchEditorModel'
 import { ChevronRight } from 'lucide-react'
 import { ThinkingSlider } from '../Thinking/ThinkingSlider'
 import { resetTarget, type ThinkingStops } from '../../lib/thinkingLevels'
 import { useSettingsStore } from '../../store/useSettingsStore'
 import { useSessionStore } from '../../store/useSessionStore'
 
-export function ModelPickerDepthView({ stops, onModels }: { stops: ThinkingStops; onModels: () => void }) {
-  const currentModel = useSettingsStore(s => s.currentModel)
-  const thinkingLevel = useSettingsStore(s => s.thinkingLevel)
+export function ModelPickerDepthView({ stops, onModels, role = 'sister' }: { stops: ThinkingStops; onModels: () => void; role?: 'sister' | 'last_order' }) {
+  const { currentModel, thinkingLevel, local } = useResearchEditorModel(role)
   const defaultLevel = useSettingsStore(s => s.configPaths?.defaultThinkingLevel)
   const busy = useSettingsStore(s => s.modelSwitchPending)
-  const researchReadOnly = useSessionStore(s => s.agentMode === 'research' && Boolean(s.researchBinding))
+  const researchReadOnly = useSessionStore(s => s.agentMode === 'research' && s.researchPageView !== 'new' && Boolean(s.researchBinding))
   const setThinkingLevel = useSettingsStore(s => s.setThinkingLevel)
   const target = resetTarget(defaultLevel, stops.levels)
   const name = currentModel?.name || '选择模型'
   return <div className="misaka-picker-layer">
-    <ThinkingSlider size="compact" levels={stops.levels} value={thinkingLevel} isFallback={stops.isFallback} busy={busy} readOnly={researchReadOnly}
+    <ThinkingSlider size="compact" levels={stops.levels} value={thinkingLevel} isFallback={stops.isFallback} busy={!local && busy} readOnly={researchReadOnly}
       modelDefault={Boolean(stops.isDefault || stops.isFallback)}
       resetTo={target} onReset={() => setThinkingLevel(target)} onChange={setThinkingLevel}
       afterHeader={<button type="button" onClick={onModels} aria-label={name} title={name} aria-haspopup="true"

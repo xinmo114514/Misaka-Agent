@@ -28,6 +28,12 @@ const DETAIL_KEYS: Record<string, string[]> = {
 
 const SECRET_KEY = /(token|secret|password|passwd|api[-_]?key|access[-_]?key|private[-_]?key|authorization|cookie|credential)/i
 const MAX_DETAIL = 320
+/**
+ * The summary never shows more than MAX_DETAIL characters, so redacting further than that is pure
+ * cost -- and this runs on every streamed snapshot of a call whose arguments can be tens of KiB.
+ * The margin keeps a credential that starts before the cut from being sliced out of view.
+ */
+const REDACT_WINDOW = MAX_DETAIL * 8
 
 function scalar(value: unknown): string {
   if (typeof value === 'string') return value
@@ -70,7 +76,7 @@ export function toolCallSummary(toolCall: ToolCall): string {
       if (raw.trim()) break
     }
   }
-  const flat = redactSecrets(raw).replace(/\s+/g, ' ').trim()
+  const flat = redactSecrets(raw.length > REDACT_WINDOW ? raw.slice(0, REDACT_WINDOW) : raw).replace(/\s+/g, ' ').trim()
   if (!flat) return ''
   return flat.length > MAX_DETAIL ? `${flat.slice(0, MAX_DETAIL)}…` : flat
 }

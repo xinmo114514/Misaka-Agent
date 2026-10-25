@@ -11,6 +11,7 @@ import {
   Info,
   Search,
   X,
+  Network,
 } from 'lucide-react'
 import type { SettingsSectionId } from '../../types/settings'
 import { useSettingsStore } from '../../store/useSettingsStore'
@@ -48,6 +49,7 @@ const NAV_GROUPS: NavGroup[] = [
     groupTitle: '系统',
     items: [
       { id: 'data', label: '会话存储与导出', icon: Database },
+      { id: 'network', label: '网络与代理', icon: Network },
       { id: 'shortcuts', label: '快捷键', icon: Keyboard },
       { id: 'about', label: '关于与诊断', icon: Info },
     ],

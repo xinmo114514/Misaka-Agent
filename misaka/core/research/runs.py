@@ -833,6 +833,8 @@ def _resume(con, run_id, *, driver_lock, clarification):
         if previous and previous["payload"].get("status") == "clarify":
             delete_action(con, run_id, branch["id"], plan_key(round))
     reopen_cards(con, run_id)
+    from misaka.core.research.suspension import resolve_suspensions
+    resolve_suspensions(con, run_id)
     # A failed node replans: every phase of ``_expand`` is idempotent over what it already
     # produced (saved plans, cards and project-local artifacts), so it picks up its own work.
     con.execute(
@@ -911,6 +913,8 @@ def retry_node(con, run, node_id, *, session_file, tool_call_id):
         raise ValueError(f"Node {node_id} was already retried {tried} times; its failure needs the user.")
     with task_store.write_txn(con):
         reopen_cards(con, run["id"], node_id)
+        from misaka.core.research.suspension import resolve_suspensions
+        resolve_suspensions(con, run["id"], node_id=node_id)
         con.execute("UPDATE research_branches SET status='planning',last_error=NULL,updated_at=? WHERE id=?",
                     (int(time.time()), node_id))
         con.execute("INSERT INTO research_actions VALUES (?,?,?,?,?,?,?)",
@@ -1385,9 +1389,9 @@ def check_owner(con, run, branch=None, *, allow_stop=False):
 
 
 @contextmanager
-def owned_txn(con, run, branch=None, *, allow_stop=False):
+def owned_txn(con, run, branch=None, *, allow_stop=False, card_ids=(), field_updates=None, targets=None):
     """Check the captured identity under the same writer lock as its state transition."""
-    with task_store.write_txn(con):
+    with task_store.write_txn(con, card_ids=card_ids, field_updates=field_updates, targets=targets):
         check_owner(con, run, branch, allow_stop=allow_stop)
         yield
 
@@ -1748,7 +1752,14 @@ def summary(con, run_id):
     run = get(con, run_id)
     if not run:
         return None
+    from misaka.core.research.delivery import snapshot as delivery_snapshot
+    activity = con.execute("SELECT MAX(created_at) FROM events WHERE "
+                           "(task_id=? OR task_id IN (SELECT task_id FROM research_run_tasks WHERE run_id=?)) "
+                           "AND kind NOT IN ('heartbeat','lease_renewed','driver_heartbeat')", (run_id, run_id)).fetchone()[0]
     return {
+        # Epoch milliseconds; unlike updated_at this never advances on a polling/lease refresh.
+        "lastActivityAt": max(int(run['created_at']), int(activity or 0)) * 1000,
+        "reportDelivery": delivery_snapshot(con, run_id),
         "id": run["id"], "workspace": run["workspace"], "phase": run["phase"],
         "status": run["status"], "wave": run["wave"], "limits": limits(run),
         "tasks": task_count(con, run_id), "nodes": len(nodes(con, run_id)),

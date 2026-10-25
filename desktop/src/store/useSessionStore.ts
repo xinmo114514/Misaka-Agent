@@ -1,24 +1,96 @@
+import { researchActivity, subscribeResearchRun, retainResearchActivity, beginResearchControl, upsertActivityDetail } from '../lib/researchActivityStore'
+import { useSettingsStore } from './useSettingsStore'
+import { emptyResearchEditor, newResearchOwner, type ResearchEditor, type ResearchView, type ResearchViewSelection, type ResearchControlTarget } from '../lib/researchView'
 import { create } from 'zustand'
 import type { ChatMessage, PermissionMode, PermissionRequestPayload, ProjectGroup, SessionFilterScope, SessionInfoOut, SessionOperationKind, SessionOperationResult, SessionTreePayload, TreeFilterMode } from '../types/session'
-import type { DesktopResearchTeam, ResearchModelBinding, ResearchTeamSnapshot, ResearchConversationBinding, ResearchGraphPayload, ResearchHostSnapshot, ResearchRunDetail, ResearchRunSummary } from '../types/research'
+import type { DesktopResearchTeam, ResearchModelBinding, ResearchTeamSnapshot, ResearchConversationBinding, ResearchGraphPayload, ResearchHostSnapshot, ResearchRunSummary, ResearchFailureMetadata } from '../types/research'
 import {
   applyResearchNoticeToCard,
-  hydrateCardFromDetail,
+  mergeResearchCard,
   hydrateCardsFromRuns,
   type ResearchRunCard,
 } from '../lib/researchCards'
 import type { BridgeMessage, BridgeEventEnvelope } from '../types/global'
 import { reduceConversationEvent, type ConversationState } from '../lib/conversationEvents'
+import { createResearchIngest } from '../lib/researchEventIngest'
 import { normalizeChatMessage } from '../lib/messageBlocks'
-import { emptyResearchConversation, hydrateResearchHistoryCards, isResearchRunActive, isResearchStartupFailure, projectResearchHistory, reconcileResearchPendingHistory, reduceResearchConversationEvent, researchNoticeRunId } from '../lib/researchConversation'
+import { clearResearchStartupRequest, emptyResearchConversation, hydrateResearchHistoryCards, isResearchRunActive, isResearchStartupFailure, projectResearchHistory, reconcileResearchPendingHistory, reduceResearchConversationEvent, researchNoticeRunId } from '../lib/researchConversation'
 import { newRequestId, request } from '../lib/bridge'
+import {
+  beginResearchStop,
+  clearResearchStop,
+  confirmResearchStopped,
+  failResearchStop,
+  noteResearchStopAck,
+  researchRunAtRest,
+  unconfirmResearchStop,
+} from '../lib/researchStop'
+import { researchStopEntry } from './useResearchStopStore'
+import { refreshResearchStopTarget, sameResearchStopPath, type ResearchStopTarget } from '../lib/researchStopRecovery'
 import { cancelResearchStartup, startComposerResearch, type ResearchSubmissionInput } from '../lib/startComposerResearch'
 import { executeResearchControl, isResearchRequestTimeout, requestResearch } from '../lib/researchBridge'
 import { sessionHistoryCache } from '../lib/sessionHistoryCache'
 import { forgetSessionView, migrateEntryDisclosures } from '../lib/sessionViewState'
 import type { AttachmentPreparation, PreparedAttachment, PromptImage } from '../types/attachment'
 
+/**
+ * Settle a pending stop from the root session's own final notice.
+ *
+ * A final report can arrive before the driver's finally block releases its lease. A stopped
+ * label alone is not lease evidence: retain the shared wait until an authoritative read.
+ */
+function settleStopFromFinalNotice(runId: string | undefined, raw: ChatMessage | null): void {
+  if (!runId || !raw || raw.customType !== 'research-final') return
+  const status = String(raw.details?.result?.status ?? raw.details?.status ?? '')
+  if (!status) return
+  const driving = raw.details?.result?.driving ?? raw.details?.driving
+  if (!confirmResearchStopped(runId, status, typeof driving === 'boolean' ? driving : undefined)
+    && status === 'stopped' && researchStopEntry(runId)) {
+    void Promise.resolve().then(() => useSessionStore.getState().fetchResearchCardDetails(runId)).catch(() => {})
+  }
+}
+
+function failureMetadata(metadata?: ResearchFailureMetadata): ResearchFailureMetadata {
+  if (!metadata) return {}
+  return { errorDetails: metadata.errorDetails, errorCode: metadata.errorCode, errorStage: metadata.errorStage,
+    researchNeedsConfiguration: metadata.researchNeedsConfiguration }
+}
+
+function clearConfirmedSnapshotStartup(state: ConversationState, snapshot: ResearchHostSnapshot): ConversationState {
+  if (!snapshot.run) return state
+  const successful = snapshot.messages.filter(message => (message.role === 'user' || message.customType === 'research-question') &&
+    message.deliveryStatus !== 'failed' && message.deliveryStatus !== 'unconfirmed')
+  const ids = new Set<string>(successful.map(message => message.requestId || message.details?.requestId).filter(Boolean))
+  for (const receipt of snapshot.submissionReceipts || []) {
+    if (receipt.state === 'applied' && receipt.runId === snapshot.run.id) ids.add(receipt.requestId)
+  }
+  let next = state
+  for (const requestId of ids) next = clearResearchStartupRequest(next, requestId)
+  return next
+}
+
+function ownedResearchMutation(original: SessionState, requestId: string, update: (state: SessionState) => Partial<SessionState> | SessionState): Partial<SessionState> | SessionState {
+ const owner = researchDeliveryBindings.get(requestId)
+ if (!owner || deliveryBelongsToBinding(requestId, original.researchBinding)) return update(original)
+ const binding = original.researchBindings[owner.sessionId]
+ const conversation = original.researchConversations[owner.sessionId]
+ if (!binding || !conversation) return original
+ const state = {...original, researchBinding:binding, researchConversation:conversation}
+ const result = update(state)
+ return result.researchConversation ? {researchConversations:{...original.researchConversations,[owner.sessionId]:result.researchConversation}} : original
+}
+
 const STORAGE_RECENT_WORKSPACES_KEY = 'misaka_recent_workspaces'
+
+/**
+ * Research events arrive one per streamed token, each carrying the whole message so far. Applying
+ * them as they land means one render per token, and the reader's own click queues behind all of
+ * them. `createResearchIngest` keeps the order and every state-changing event, merges only the
+ * superseded whole-message snapshots, and spends a bounded slice of each task.
+ */
+const researchIngest = createResearchIngest({
+  apply: message => useSessionStore.getState().handleResearchBridgeMessage(message),
+})
 
 /** What the compact dialog and the auto-compaction notices show while an operation runs. */
 export interface CompactStatus {
@@ -137,10 +209,12 @@ interface SessionState {
   researchContextUsage: ResearchHostSnapshot['contextUsage']
   researchTeam: DesktopResearchTeam | null
   researchModelBinding: ResearchModelBinding | null
+  researchModelBindings: ResearchTeamSnapshot['modelBindings']
   researchTeamEventSeq: number
   activeResearchTaskId: { runId: string; taskId: string } | null
   activeResearchGraphRunId: string | null
   researchHistoryOpen: boolean
+  researchHistoryGeneration: number
   currentModel: {
     provider: string
     modelId: string
@@ -149,6 +223,21 @@ interface SessionState {
   }
   permissionMode: PermissionMode
   agentMode: 'agent' | 'research'
+  researchPageView: 'new' | 'conversation'
+  researchView: ResearchView
+  researchNewEntryId: string
+  researchEditors: Record<string, ResearchEditor>
+  ordinaryEditor: { text: string; revision: number; attachments: PreparedAttachment[] }
+  researchSnapshots: Record<string, ResearchHostSnapshot>
+  researchConversations: Record<string, ConversationState>
+  researchBindings: Record<string, ResearchConversationBinding>
+  selectResearchView: (view: ResearchViewSelection) => void
+  setResearchEditorConfig: (config: Partial<Pick<ResearchEditor, 'model' | 'lastOrderModel' | 'thinkingLevel'>>, ownerKey?: string) => void
+  clearResearchEditor: (ownerKey: string, revision: number, attachmentIdentities?: Array<{attachmentId: string; preparationId: string}>) => void
+  researchPageVersion: number
+  newResearchDraft: string
+  setResearchPageView: (view: 'new' | 'conversation') => void
+  setNewResearchDraft: (text: string) => void
   pendingPermissionRequest: PermissionRequestPayload | null
   /** The composer's text, mirrored here so a tree navigation can hand a message back to it. */
   draft: string
@@ -172,25 +261,30 @@ interface SessionState {
   // Actions
   sendMessage: (text: string, streamingBehavior?: 'steer' | 'followUp', images?: PromptImage[]) => void
   attachments: PreparedAttachment[]
-  prepareAttachments: (paths: string[]) => Promise<void>
+  prepareAttachments: (paths: string[], ownerKey?: string | null) => Promise<void>
   retryAttachment: (path: string) => Promise<void>
   removeAttachment: (path: string) => void
   clearAttachments: () => void
   retryMessage: (messageId: string) => void
   retryResearchMessage: (messageId: string) => void
+  restoreResearchMessageDraft: (messageId: string) => void
   abortGeneration: () => void
   handleBridgeMessage: (msg: BridgeMessage) => void
   bindResearchConversation: (snapshot: ResearchHostSnapshot, force?: boolean) => void
   applyResearchTeamSnapshot: (sessionId: string, snapshot: ResearchTeamSnapshot, seq?: number) => void
   handleResearchBridgeMessage: (msg: BridgeMessage) => void
+  /** Queue an event for bounded-slice application; an ack is applied immediately. */
+  ingestResearchBridgeMessage: (msg: BridgeMessage) => void
+  /** Apply everything waiting, in order, before the caller reads the transcript back. */
+  flushResearchIngest: () => void
   clearResearchConversation: () => void
-  queueResearchMessage: (requestId: string, text: string) => void
+  queueResearchMessage: (requestId: string, text: string, binding?: ResearchConversationBinding) => void
   acceptResearchMessage: (requestId: string) => void
-  unconfirmResearchMessage: (requestId: string, error: string, retryable?: boolean, reconciled?: boolean) => void
-  failResearchMessage: (requestId: string, error: string, retryable?: boolean) => void
-  failResearchExecution: (requestId: string, error: string) => void
+  unconfirmResearchMessage: (requestId: string, error: string, retryable?: boolean, reconciled?: boolean, metadata?: ResearchFailureMetadata) => void
+  failResearchMessage: (requestId: string, error: string, retryable?: boolean, metadata?: ResearchFailureMetadata) => void
+  failResearchExecution: (requestId: string, error: string, metadata?: ResearchFailureMetadata) => void
   rememberResearchSubmission: (requestId: string, submission: ResearchSubmissionInput, draft?: ChatMessage['researchDraft']) => void
-  requestResearchStop: () => void
+  requestResearchStop: (target?: ResearchControlTarget) => void
   fetchSessions: () => void
   openSession: (path: string) => void
   retrySessionLoad: () => void
@@ -304,6 +398,8 @@ let retryTargetPath: string | undefined
 let listRequestId: string | null = null
 let listTimer: number | null = null
 let listDirty = false
+let pendingResearchOpenCancel: (() => void) | null = null
+let researchOpenRetryPath: string | null = null
 const confirmedDeletedSessions = new Set<string>()
 const pendingPrompts = new Map<string, { sessionId: string; userMessageId: string; placeholderId: string | null }>()
 const researchDeliveryBindings = new Map<string, { sessionId: string; streamId?: string }>()
@@ -366,6 +462,8 @@ function resetSessionOperationState(): Partial<SessionState> {
 }
 
 function beginHydration(command: HydrationCommand, targetPath?: string, keepDisplayedHistory = false): void {
+  cancelResearchSessionOpen()
+  if (useSessionStore.getState().agentMode === 'research') useSessionStore.getState().setAgentMode('agent')
   const state = useSessionStore.getState()
   flushDeltaBuffer(events => useSessionStore.setState(current => replayEvents(current, events)))
   cacheCurrentSession(useSessionStore.getState())
@@ -390,12 +488,91 @@ function beginHydration(command: HydrationCommand, targetPath?: string, keepDisp
   useSessionStore.setState({ ...resetSessionOperationState(), isSessionLoading: true, isStreaming: true, isAborting: false,
     streamingMessageId: null, pendingPermissionRequest: null, sessionLoadError: null, treeOpen: false,
     agentMode: 'agent', researchConnectionError: null,
+    researchPageView: 'new', researchPageVersion: state.researchPageVersion + 1,
     sessionHistoryVersion: cached?.historyVersion ?? null,
     ...(targetPath ? { currentSessionPath: targetPath, currentSessionId: cached?.sessionId ?? known?.id ?? '',
       currentTitle: cached?.title ?? (known ? deriveTitle(known) : '加载会话'),
       currentWorkspace: cached?.workspace ?? known?.cwd ?? state.currentWorkspace,
       messages: cached?.messages ?? [] } : { messages: [], currentSessionPath: null, currentSessionId: '', currentTitle: '新对话' }) })
   sendBridge(command)
+}
+
+function cancelResearchSessionOpen(): void {
+  pendingResearchOpenCancel?.()
+  if (researchOpenRetryPath) {
+    researchOpenRetryPath = null
+    useSessionStore.setState({ sessionLoadError: null })
+  }
+}
+
+function sameModelChoice(left?: { provider?: string; modelId?: string } | null, right?: { provider?: string; modelId?: string } | null): boolean {
+  return left?.provider === right?.provider && left?.modelId === right?.modelId
+}
+
+/** Reconnect persisted research intent; opening history never submits a topic. */
+function openResearchSession(path: string, sessionId: string, cwd: string): void {
+  cancelResearchSessionOpen()
+  clearPendingHydration()
+  const captured = useSessionStore.getState()
+  const settings = useSettingsStore.getState()
+  researchOpenRetryPath = path
+  useSessionStore.setState({ isSessionLoading: true, sessionLoadError: null, researchConnectionError: null })
+  let active = true
+  let timer: number
+  let unsubscribeSession = () => {}
+  let unsubscribeSettings = () => {}
+  const retire = () => {
+    if (!active) return
+    active = false
+    window.clearTimeout(timer)
+    unsubscribeSession()
+    unsubscribeSettings()
+    if (pendingResearchOpenCancel === retire) pendingResearchOpenCancel = null
+    useSessionStore.setState({ isSessionLoading: false })
+  }
+  pendingResearchOpenCancel = retire
+  const fail = (error: unknown) => {
+    if (!active) return
+    retire()
+    useSessionStore.setState({ sessionLoadError: error instanceof Error ? error.message : String(error) })
+  }
+  unsubscribeSession = useSessionStore.subscribe(current => {
+    const editor = current.researchEditors[captured.researchView.ownerKey]
+    const previousEditor = captured.researchEditors[captured.researchView.ownerKey]
+    if (current.agentMode !== captured.agentMode || current.researchPageVersion !== captured.researchPageVersion ||
+      current.currentSessionId !== captured.currentSessionId || current.currentSessionPath !== captured.currentSessionPath ||
+      current.currentWorkspace !== captured.currentWorkspace || !sameModelChoice(current.currentModel, captured.currentModel) ||
+      current.researchBinding?.sessionId !== captured.researchBinding?.sessionId || current.researchBinding?.streamId !== captured.researchBinding?.streamId ||
+      !sameModelChoice(editor?.model, previousEditor?.model) || !sameModelChoice(editor?.lastOrderModel, previousEditor?.lastOrderModel) ||
+      editor?.thinkingLevel !== previousEditor?.thinkingLevel) {
+      cancelResearchSessionOpen()
+    }
+  })
+  unsubscribeSettings = useSettingsStore.subscribe(current => {
+    // Capability reads also toggle modelSwitchPending and recreate metadata objects.
+    // Only a changed model choice/reasoning level supersedes this read-only open.
+    if (!sameModelChoice(current.currentModel, settings.currentModel) || current.thinkingLevel !== settings.thinkingLevel) cancelResearchSessionOpen()
+  })
+  timer = window.setTimeout(() => fail(new Error('研究会话连接超时，请重试。')), 30000)
+  void (async () => {
+    try {
+      const host = await window.app.startResearchBridge({ cwd, sessionFile: path })
+      if (!active) return
+      if (!host.enabled || host.session?.sessionId !== sessionId ||
+        normalizeWorkspacePath(host.session.file) !== normalizeWorkspacePath(path) ||
+        normalizeWorkspacePath(host.session.cwd) !== normalizeWorkspacePath(cwd)) {
+        throw new Error('研究会话标识已变更，请重试打开原研究。')
+      }
+      retire()
+      researchOpenRetryPath = null
+      const actions = useSessionStore.getState()
+      actions.bindResearchConversation({ ...host, messages: host.messages ?? [], historyVersion: host.historyVersion ?? null,
+        lastEventSeq: host.lastEventSeq ?? 0, run: host.run ?? null }, true)
+      actions.setAgentMode('research')
+      actions.selectResearchView({ kind: 'conversation', sessionId, ownerKey: `conversation:${sessionId}` })
+      useSessionStore.setState({ sessionLoadError: null, researchConnectionError: null })
+    } catch (error) { fail(error) }
+  })()
 }
 
 function sendBridge(cmd: Record<string, any>) {
@@ -420,6 +597,16 @@ export const useSessionStore = create<SessionState>((set, get) => ({
   lastEventSeq: 0,
   permissionMode: 'default',
   agentMode: 'agent',
+  researchPageView: 'new',
+  researchPageVersion: 0,
+  researchView: { kind: 'new', ownerKey: 'new::initial', version: 0 },
+  researchNewEntryId: 'initial',
+  researchEditors: {},
+  ordinaryEditor: { text: '', revision: 0, attachments: [] },
+  researchSnapshots: {},
+  researchConversations: {},
+  researchBindings: {},
+  newResearchDraft: '',
   pendingPermissionRequest: null,
   currentModel: {
     provider: 'deepseek',
@@ -444,10 +631,12 @@ export const useSessionStore = create<SessionState>((set, get) => ({
   researchContextUsage: null,
   researchTeam: null,
   researchModelBinding: null,
+  researchModelBindings: null,
   researchTeamEventSeq: 0,
   activeResearchTaskId: null,
   activeResearchGraphRunId: null,
   researchHistoryOpen: false,
+  researchHistoryGeneration: 0,
   messages: [],
   streamingMessageId: null,
   draft: '',
@@ -468,11 +657,87 @@ export const useSessionStore = create<SessionState>((set, get) => ({
   compactDraft: null,
   isCompacting: false,
 
-  setDraft: (text: string) => set(state => ({ draft: text, draftRevision: state.draftRevision + 1 })),
+  setDraft: (text: string) => set(state => {
+    const revision = state.draftRevision + 1
+    return { draft: text, draftRevision: revision, ...(state.agentMode === 'research' ? {
+      researchEditors: { ...state.researchEditors, [state.researchView.ownerKey]: { ...(state.researchEditors[state.researchView.ownerKey] || emptyResearchEditor()), text, revision } }
+    } : {}) }
+  }),
+  setResearchEditorConfig: (config, ownerKey) => set(state => {
+    const owner = ownerKey || state.researchView.ownerKey
+    return { researchEditors: { ...state.researchEditors, [owner]: { ...(state.researchEditors[owner] || emptyResearchEditor()), ...config } } }
+  }),
+  clearResearchEditor: (ownerKey, revision, attachmentIdentities) => set(state => {
+    const editor = state.researchEditors[ownerKey]
+    if (!editor || editor.revision !== revision) return state
+    if (attachmentIdentities && (editor.attachments.length !== attachmentIdentities.length || editor.attachments.some((item,index)=>item.attachmentId !== attachmentIdentities[index].attachmentId || item.preparationId !== attachmentIdentities[index].preparationId))) return state
+    return { researchEditors: { ...state.researchEditors, [ownerKey]: { ...editor, text: '', attachments: [], revision: revision + 1 } },
+      ...(state.agentMode === 'research' && state.researchView.ownerKey === ownerKey ? { draft: '', attachments: [], draftRevision: revision + 1 } : {}) }
+  }),
+  selectResearchView: view => {
+    cancelResearchSessionOpen()
+    const state = get()
+    const snapshots = state.researchSnapshots
+    set(current => {
+      const sourceOwner = current.researchView.kind === current.researchPageView ? current.researchView.ownerKey : `conversation:${current.researchBinding?.sessionId || 'unbound'}`
+      // Only the visible research editor belongs to a research owner. Ordinary text must
+      // never be checkpointed into the remembered research selection.
+      const editors = current.agentMode === 'research'
+        ? { ...current.researchEditors, [sourceOwner]: { ...(current.researchEditors[sourceOwner] || emptyResearchEditor()), text: current.draft, revision: current.draftRevision, attachments: current.attachments as ResearchEditor['attachments'] } }
+        : { ...current.researchEditors }
+      const editor = editors[view.ownerKey] || { ...emptyResearchEditor(), model:useSettingsStore.getState().currentModel, thinkingLevel:useSettingsStore.getState().thinkingLevel }
+      const version = current.researchPageVersion + 1
+      return { researchEditors: { ...editors, [view.ownerKey]: editor }, researchView: { ...view, version }, researchPageView: view.kind, researchPageVersion: version,
+        ...(current.agentMode === 'research' ? { draft: editor.text, draftRevision: editor.revision, attachments: editor.attachments } : {}) }
+    })
+    if (view.kind === 'conversation' && snapshots[view.sessionId]) {
+      const cached = state.researchBinding?.sessionId === view.sessionId ? state.researchConversation : state.researchConversations[view.sessionId]
+      get().bindResearchConversation(snapshots[view.sessionId], true)
+      if (cached && cached.lastEventSeq >= get().researchConversation.lastEventSeq) set({researchConversation:cached})
+    }
+  },
 
   bindResearchConversation: (snapshot, force = false) => {
     if (!snapshot.session?.sessionId || !Array.isArray(snapshot.messages)) return
     set(state => {
+      const incomingOwner = snapshot.session.sessionId
+      const currentOwner = state.researchBinding?.sessionId === incomingOwner
+      const cachedBinding = currentOwner ? state.researchBinding : state.researchBindings[incomingOwner]
+      const cachedConversation = currentOwner ? state.researchConversation : state.researchConversations[incomingOwner]
+      const ownerStream = snapshot.streamId ?? cachedBinding?.streamId
+      const ownerKey = researchBindingKey({sessionId:incomingOwner,streamId:ownerStream})
+      const ownerSameStream = Boolean(cachedBinding) && ownerStream === cachedBinding?.streamId
+      // Validate the incoming owner's cache BEFORE publishing either binding or transcript.
+      // A stream retired by navigation remains a valid background owner; a different,
+      // retired stream must never replace that owner's current transport.
+      if (cachedBinding && !ownerSameStream && retiredResearchBindings.has(ownerKey)) return state
+      if (ownerSameStream && cachedConversation && snapshot.lastEventSeq < cachedConversation.lastEventSeq) {
+        const knownRunId = snapshot.run?.id
+        if (force && !currentOwner) {
+          // Explicit selection may navigate to this owner, but still uses its newer cache.
+          snapshot = {...snapshot,messages:cachedConversation.messages,lastEventSeq:cachedConversation.lastEventSeq,
+            run:state.researchSnapshots[incomingOwner]?.run ?? snapshot.run}
+        } else if (knownRunId && !cachedBinding?.runId) {
+          const learnedBinding = {...cachedBinding!,runId:knownRunId}
+          const learnedConversation = clearConfirmedSnapshotStartup(cachedConversation, snapshot)
+          const previousSnapshot = state.researchSnapshots[incomingOwner]
+          return {researchBindings:{...state.researchBindings,[incomingOwner]:learnedBinding},
+            researchConversations:{...state.researchConversations,[incomingOwner]:learnedConversation},
+            ...(previousSnapshot ? {researchSnapshots:{...state.researchSnapshots,[incomingOwner]:{...previousSnapshot,run:snapshot.run}}} : {}),
+            ...(currentOwner ? {researchBinding:learnedBinding,researchPendingCreationRequestId:null,researchConversation:learnedConversation} : {})}
+        } else return state
+      }
+      if (cachedBinding && !ownerSameStream && !currentOwner) {
+        retiredResearchBindings.add(researchBindingKey(cachedBinding))
+        retiredResearchBindings.delete(ownerKey)
+      }
+      const researchSnapshots = { ...state.researchSnapshots, [incomingOwner]: snapshot }
+      const researchBindings = {...state.researchBindings, [incomingOwner]:{sessionId:incomingOwner,sessionFile:snapshot.session.file,workspace:snapshot.session.cwd,runId:snapshot.run?.id || null,streamId:snapshot.streamId ?? cachedBinding?.streamId}}
+      const researchConversations = {...state.researchConversations, ...(state.researchBinding ? {[state.researchBinding.sessionId]:state.researchConversation} : {})}
+      const backgroundHistory = projectResearchHistory(snapshot.messages)
+      researchConversations[incomingOwner] = {...emptyResearchConversation(), currentSessionId:incomingOwner, messages:reconcileResearchPendingHistory(backgroundHistory, state.researchBinding ? researchConversations[incomingOwner]?.messages || [] : [],snapshot.submissionReceipts, Boolean(snapshot.run)),lastEventSeq:snapshot.lastEventSeq || 0}
+
+      if (!force && state.researchBinding && state.researchBinding.sessionId !== snapshot.session.sessionId) return { researchSnapshots, researchBindings, researchConversations, researchCards: hydrateResearchHistoryCards(state.researchCards, snapshot.messages) }
       const sameSession = state.researchBinding?.sessionId === snapshot.session.sessionId
       // Legacy snapshots omit streamId; that absence is not a transport change.
       const snapshotStreamId = snapshot.streamId ?? (sameSession ? state.researchBinding?.streamId : undefined)
@@ -494,6 +759,7 @@ export const useSessionStore = create<SessionState>((set, get) => ({
         const knownRunId = snapshot.run?.id
         if (knownRunId && !state.researchBinding?.runId) {
           return { researchBinding: { ...state.researchBinding!, runId: knownRunId },
+            researchConversation: clearConfirmedSnapshotStartup(state.researchConversation, snapshot),
             researchPendingCreationRequestId: null }
         }
         return state
@@ -509,7 +775,7 @@ export const useSessionStore = create<SessionState>((set, get) => ({
       const isStreaming = liveOwner ? state.researchConversation.isStreaming
         : hasNativeLifecycle ? nativeBusy
           : Boolean(sameStream && state.researchConversation.isStreaming) || isResearchRunActive(snapshot.run?.status)
-      const messages = reconcileResearchPendingHistory(liveOwner ? [...history, liveOwner] : history, sameSession ? state.researchConversation.messages : [], snapshot.submissionReceipts)
+      const messages = reconcileResearchPendingHistory(liveOwner ? [...history, liveOwner] : history, sameSession ? state.researchConversation.messages : state.researchBinding ? researchConversations[incomingOwner]?.messages || [] : [], snapshot.submissionReceipts, Boolean(snapshot.run))
       for (const message of messages) {
         if (message.requestId && message.deliveryStatus === 'created') researchDeliveryBindings.delete(message.requestId)
       }
@@ -522,12 +788,14 @@ export const useSessionStore = create<SessionState>((set, get) => ({
         const run = snapshot.run
         const question = messages.find(message => message.customType === 'research-question')?.content
           || messages.find(message => message.role === 'user')?.content || ''
-        cards[run.id] = { ...(cards[run.id] || { runId: run.id, question, workspace: snapshot.session.cwd, tasks: [], updatedAt: Date.now() }),
+        cards[run.id] = mergeResearchCard(cards[run.id], { ...(cards[run.id] || { runId: run.id, question, workspace: snapshot.session.cwd, tasks: [], updatedAt: Date.now() }),
           status: run.status, phase: run.phase,
           ...(run.status !== 'waiting_input' ? { pendingQuestions: [] } : {}),
-          ...(isResearchRunActive(run.status) ? { error: null } : {}) }
+          ...(isResearchRunActive(run.status) ? { error: null } : {}),
+          ...(snapshot.reportDelivery ? {reportDelivery:snapshot.reportDelivery} : {}) })
       }
       return {
+        researchSnapshots, researchBindings, researchConversations,
         researchBinding: { sessionId: snapshot.session.sessionId, sessionFile: snapshot.session.file, workspace: snapshot.session.cwd, runId: snapshot.run?.id ?? null,
           ...(snapshotStreamId ? { streamId: snapshotStreamId } : {}) },
         researchConversation: { ...emptyResearchConversation(), currentSessionId: snapshot.session.sessionId,
@@ -536,7 +804,8 @@ export const useSessionStore = create<SessionState>((set, get) => ({
           isStreaming,
           isAborting: Boolean(sameStream && state.researchConversation.isAborting && !runSettled) },
         researchCards: cards, researchConnectionError: null,
-        researchPendingCreationRequestId: snapshot.run || !sameSession || snapshot.submissionReceipts?.some(receipt =>
+        researchPendingCreationRequestId: snapshot.run || !sameSession || (snapshot.isIdle === true && !snapshot.run && messages.some(message =>
+          message.requestId === state.researchPendingCreationRequestId && (message.deliveryStatus === 'failed' || message.deliveryStatus === 'unconfirmed'))) || snapshot.submissionReceipts?.some(receipt =>
           receipt.requestId === state.researchPendingCreationRequestId && receipt.state === 'rejected')
           ? null : state.researchPendingCreationRequestId,
         researchHistoryVersion: snapshot.historyVersion,
@@ -544,6 +813,12 @@ export const useSessionStore = create<SessionState>((set, get) => ({
         researchTeam: snapshot.team === undefined && sameSession ? state.researchTeam : snapshot.team ?? null,
         researchModelBinding: sameSession && state.researchModelBinding && (!snapshot.modelBinding || snapshot.modelBinding.epoch < state.researchModelBinding.epoch)
           ? state.researchModelBinding : snapshot.modelBinding ?? null,
+        researchModelBindings: snapshot.modelBindings ? {
+          last_order: sameSession && state.researchModelBindings?.last_order && state.researchModelBindings.last_order.epoch > snapshot.modelBindings.last_order.epoch
+            ? state.researchModelBindings.last_order : snapshot.modelBindings.last_order,
+          sister: sameSession && state.researchModelBindings?.sister && state.researchModelBindings.sister.epoch > snapshot.modelBindings.sister.epoch
+            ? state.researchModelBindings.sister : snapshot.modelBindings.sister,
+        } : sameSession ? state.researchModelBindings : null,
         researchTeamEventSeq: Math.max(snapshot.lastEventSeq ?? 0, sameSession ? state.researchTeamEventSeq : 0),
       }
     })
@@ -553,10 +828,18 @@ export const useSessionStore = create<SessionState>((set, get) => ({
     set(state => {
       if (sessionId !== state.researchBinding?.sessionId) return state
       if (seq !== undefined && seq <= state.researchTeamEventSeq) return state
-      if (snapshot.modelBinding && state.researchModelBinding && snapshot.modelBinding.epoch < state.researchModelBinding.epoch) return state
+      const oldRoles = state.researchModelBindings
+      const nextRoles = snapshot.modelBindings && {
+        last_order: oldRoles?.last_order && oldRoles.last_order.epoch > snapshot.modelBindings.last_order.epoch
+          ? oldRoles.last_order : snapshot.modelBindings.last_order,
+        sister: oldRoles?.sister && oldRoles.sister.epoch > snapshot.modelBindings.sister.epoch
+          ? oldRoles.sister : snapshot.modelBindings.sister,
+      }
       return {
         ...(snapshot.team !== undefined ? { researchTeam: snapshot.team } : {}),
-        ...(snapshot.modelBinding !== undefined ? { researchModelBinding: snapshot.modelBinding } : {}),
+        ...(snapshot.modelBinding !== undefined && (!state.researchModelBinding || !snapshot.modelBinding || snapshot.modelBinding.epoch >= state.researchModelBinding.epoch)
+          ? { researchModelBinding: snapshot.modelBinding } : {}),
+        ...(nextRoles ? { researchModelBindings: nextRoles } : {}),
         ...(seq !== undefined ? { researchTeamEventSeq: seq } : {}),
       }
     })
@@ -568,51 +851,56 @@ export const useSessionStore = create<SessionState>((set, get) => ({
     if (state.researchConversation.isStreaming || state.researchConversation.isAborting || state.researchPendingCreationRequestId ||
       isResearchRunActive(runStatus) || runStatus === 'waiting_input' ||
       state.researchConversation.messages.some(message => message.optimistic)) return
-    set({ researchBinding: null, researchConversation: emptyResearchConversation(), researchConnectionError: null,
+    const entryId = newRequestId('research_entry')
+    const ownerKey = newResearchOwner(state.currentWorkspace, entryId)
+    get().selectResearchView({kind:'new',ownerKey})
+    set({ researchNewEntryId:entryId, researchView:{kind:'new',ownerKey,version:get().researchPageVersion}, draft:'', attachments:[], researchBinding: null, researchConversation: emptyResearchConversation(), researchConnectionError: null,
+      researchPageView: 'new', researchPageVersion: state.researchPageVersion + 1, newResearchDraft: '',
       researchPendingCreationRequestId: null,
       researchHistoryVersion: null, researchHostStats: {}, researchContextUsage: null,
-      researchTeam: null, researchModelBinding: null, researchTeamEventSeq: 0,
+      researchTeam: null, researchModelBinding: null, researchModelBindings: null, researchTeamEventSeq: 0,
       activeResearchTaskId: null, activeResearchGraphRunId: null })
   },
 
-  queueResearchMessage: (requestId, text) => {
-    if (!get().researchBinding || !text.trim()) return
-    const binding = get().researchBinding!
+  queueResearchMessage: (requestId, text, capturedBinding) => {
+    const binding = capturedBinding || get().researchBinding
+    if (!binding || !text.trim()) return
     researchDeliveryBindings.set(requestId, { sessionId: binding.sessionId, streamId: binding.streamId })
-    set(state => {
+    set(original => ownedResearchMutation(original, requestId, state => {
       if (state.researchConversation.messages.some(message => message.requestId === requestId)) return state
       const message: ChatMessage = { id: `research-user-${requestId}`, role: 'user', content: text.trim(), timestamp: Date.now(),
         requestId, optimistic: true, deliveryStatus: 'pending' }
       return { researchConnectionError: null, researchPendingCreationRequestId: state.researchBinding?.runId ? null : requestId,
         researchConversation: { ...state.researchConversation, messages: [...state.researchConversation.messages, message] } }
-    })
+    }))
   },
 
-  acceptResearchMessage: (requestId) => set(state => {
+  acceptResearchMessage: (requestId) => set(original => ownedResearchMutation(original, requestId, state => {
     if (!deliveryBelongsToBinding(requestId, state.researchBinding)) return state
     return { researchConnectionError: null, researchConversation: { ...state.researchConversation,
       messages: state.researchConversation.messages.map(message => message.requestId === requestId &&
         (message.deliveryStatus === 'pending' || message.deliveryStatus === 'unconfirmed')
-        ? { ...message, deliveryStatus: 'accepted', submissionError: undefined, deliveryReconciled: undefined } : message) } }
-  }),
+        ? { ...message, deliveryStatus: 'accepted', submissionError: undefined, deliveryReconciled: undefined,
+          errorDetails: undefined, errorCode: undefined, errorStage: undefined, researchNeedsConfiguration: undefined } : message) } }
+  })),
 
-  rememberResearchSubmission: (requestId, submission, draft) => set(state => {
+  rememberResearchSubmission: (requestId, submission, draft) => set(original => ownedResearchMutation(original, requestId, state => {
     if (!deliveryBelongsToBinding(requestId, state.researchBinding)) return state
     const original = Object.freeze({ ...submission, ...(submission.limits ? { limits: Object.freeze({ ...submission.limits }) } : {}) })
     return { researchConversation: { ...state.researchConversation, messages: state.researchConversation.messages.map(message =>
       message.requestId === requestId && !message.researchSubmission ? { ...message, researchSubmission: original,
         ...(draft ? { researchDraft: { ...draft, attachmentPaths: [...draft.attachmentPaths] } } : {}) } : message) } }
-  }),
+  })),
 
-  failResearchExecution: (requestId, error) => set(state => {
+  failResearchExecution: (requestId, error, metadata) => set(original => ownedResearchMutation(original, requestId, state => {
     if (!deliveryBelongsToBinding(requestId, state.researchBinding) && !state.researchConversation.messages.some(message => message.requestId === requestId && message.deliveryStatus === 'created')) return state
     return { researchPendingCreationRequestId: state.researchPendingCreationRequestId === requestId ? null : state.researchPendingCreationRequestId,
       researchConversation: { ...state.researchConversation, messages: state.researchConversation.messages.map(message => message.requestId === requestId
-        ? { ...message, optimistic: false, executionError: error, submissionError: undefined,
+        ? { ...message, ...failureMetadata(metadata), errorStage: metadata?.errorStage ?? (state.researchBinding?.runId ? 'execution' : 'startup'), optimistic: false, executionError: error, submissionError: undefined,
           deliveryStatus: message.deliveryStatus === 'created' ? 'created' : 'accepted' } : message) } }
-  }),
+  })),
 
-  unconfirmResearchMessage: (requestId, error, retryable, reconciled) => set(state => {
+  unconfirmResearchMessage: (requestId, error, retryable, reconciled, metadata) => set(original => ownedResearchMutation(original, requestId, state => {
     if (!deliveryBelongsToBinding(requestId, state.researchBinding)) return state
     // A retryable unconfirmed send has to give its creation fence back: while the fence is
     // held, the retry finder refuses this very row. A backend that said "not retryable" keeps
@@ -621,58 +909,87 @@ export const useSessionStore = create<SessionState>((set, get) => ({
     return { ...(releaseFence ? { researchPendingCreationRequestId: null } : {}),
       researchConversation: { ...state.researchConversation,
       messages: state.researchConversation.messages.map(message => message.requestId === requestId && message.deliveryStatus !== 'created' && message.deliveryStatus !== 'accepted'
-        ? { ...message, optimistic: true, deliveryStatus: 'unconfirmed', submissionError: error,
+        ? { ...message, ...failureMetadata(metadata), optimistic: true, deliveryStatus: 'unconfirmed', submissionError: error,
           ...(retryable !== undefined ? { deliveryRetryable: retryable } : {}),
           deliveryReconciled: reconciled ? true
             : message.deliveryStatus === 'unconfirmed' ? message.deliveryReconciled : false } : message) } }
-  }),
+  })),
 
-  failResearchMessage: (requestId, error, retryable = true) => set(state => {
-    if (!deliveryBelongsToBinding(requestId, state.researchBinding) ||
-      !state.researchConversation.messages.some(message => message.requestId === requestId && message.deliveryStatus !== 'created' && message.deliveryStatus !== 'accepted')) return state
-    return { researchConnectionError: null,
-      researchPendingCreationRequestId: state.researchPendingCreationRequestId === requestId ? null : state.researchPendingCreationRequestId,
-      researchConversation: { ...state.researchConversation,
-        messages: state.researchConversation.messages.map(message => message.requestId === requestId
-          ? { ...message, optimistic: false, deliveryStatus: 'failed', submissionError: error, deliveryRetryable: retryable } : message) } }
-  }),
+  failResearchMessage: (requestId, error, retryable = true, metadata) => {
+    set(original => ownedResearchMutation(original, requestId, state => {
+      if (!deliveryBelongsToBinding(requestId, state.researchBinding) ||
+        !state.researchConversation.messages.some(message => message.requestId === requestId && message.deliveryStatus !== 'created' && message.deliveryStatus !== 'accepted')) return state
+      return { researchConnectionError: null,
+        researchPendingCreationRequestId: state.researchPendingCreationRequestId === requestId ? null : state.researchPendingCreationRequestId,
+        researchConversation: { ...state.researchConversation,
+          messages: state.researchConversation.messages.map(message => message.requestId === requestId
+            ? { ...message, ...failureMetadata(metadata), optimistic: false, deliveryStatus: 'failed', submissionError: error, deliveryRetryable: retryable } : message) } }
+    }))
+    // Recruitment journals are already durable even when no native Run exists.
+    // Discovery is best effort and must not replace the actual startup failure.
+    if (metadata?.errorStage === 'recruitment') {
+      try { get().fetchSessions() } catch { /* Original row remains actionable. */ }
+    }
+  },
+
+  restoreResearchMessageDraft: messageId => {
+    const state = get()
+    const message = state.researchConversation.messages.find(row => row.id === messageId && row.role === 'user')
+    if (!message || state.agentMode !== 'research' || !state.researchBinding || state.researchBinding.runId ||
+      state.isSessionLoading || state.sessionLoadError || state.researchConversation.isAborting || state.researchPendingCreationRequestId) return
+    get().setDraft(message.content)
+    window.dispatchEvent(new Event('research-editor-focus'))
+  },
 
   retryResearchMessage: (messageId) => {
     const state = get()
     const binding = state.researchBinding
+    const legacy = state.researchConversation.messages.find(row => row.id === messageId &&
+      (row.researchNeedsConfiguration || (row.errorStage === 'recruitment' && !row.researchSubmission)))
+    if (legacy) { get().restoreResearchMessageDraft(messageId); return }
     const message = state.researchConversation.messages.find(row => row.id === messageId && row.role === 'user' && row.requestId &&
       row.deliveryRetryable !== false && (row.deliveryStatus === 'failed' || (row.deliveryStatus === 'unconfirmed' && row.deliveryReconciled) ||
         (Boolean(row.executionError) && Boolean(row.researchSubmission) && !binding?.runId)))
-    if (!binding || !message?.requestId || state.researchConversation.isAborting || state.isSessionLoading || state.sessionLoadError ||
+    if (!binding || !message?.requestId || state.researchConversation.isAborting ||
       (!binding.runId && state.researchPendingCreationRequestId) ||
       state.researchConversation.messages.some(row => row.requestId === message.requestId && row.deliveryStatus === 'pending')) return
     const requestId = message.requestId
     let owner = binding
-    const ownsContext = () => get().agentMode === 'research' && get().researchBinding?.sessionId === owner.sessionId && get().researchBinding?.streamId === owner.streamId
+    const navigationVersion = state.researchPageVersion
+    const ownsContext = () => get().researchPageVersion === navigationVersion && get().agentMode === 'research' && get().researchBinding?.sessionId === owner.sessionId && get().researchBinding?.streamId === owner.streamId
     researchDeliveryBindings.set(requestId, { sessionId: binding.sessionId, streamId: binding.streamId })
     set(current => ({ researchConnectionError: null,
       researchPendingCreationRequestId: binding.runId ? current.researchPendingCreationRequestId : requestId,
       researchConversation: { ...current.researchConversation,
       messages: current.researchConversation.messages.map(row => row.id === messageId
-        ? { ...row, optimistic: true, deliveryStatus: 'pending', deliveryReconciled: undefined, submissionError: undefined, executionError: undefined } : row) } }))
+        ? { ...row, optimistic: true, deliveryStatus: 'pending', deliveryReconciled: undefined, submissionError: undefined, executionError: undefined,
+          errorDetails: undefined, errorCode: undefined, errorStage: undefined, researchNeedsConfiguration: undefined } : row) } }))
     void startComposerResearch({ question: message.content, workspace: binding.workspace, binding, requestId, submission: message.researchSubmission,
       onSubmission: submission => get().rememberResearchSubmission(requestId, submission, message.researchDraft),
       onBound: host => {
-        if (!ownsContext()) return
         get().bindResearchConversation(host)
-        const rebound = get().researchBinding
+        const rebound = get().researchBindings[host.session.sessionId]
         if (rebound) {
           owner = rebound
           researchDeliveryBindings.set(requestId, { sessionId: rebound.sessionId, streamId: rebound.streamId })
         }
+        // This reconnect snapshot precedes the replay: a durable row from the
+        // previous attempt must not restore its error or release this retry's fence.
+        set(current => ownedResearchMutation(current, requestId, state => ({
+          researchPendingCreationRequestId: state.researchBinding?.runId ? state.researchPendingCreationRequestId : requestId,
+          researchConversation: { ...state.researchConversation, messages: state.researchConversation.messages.map(row => row.requestId === requestId
+            ? { ...row, optimistic: true, deliveryStatus: 'pending', deliveryReconciled: undefined, submissionError: undefined,
+              executionError: undefined, errorDetails: undefined, errorCode: undefined, errorStage: undefined, researchNeedsConfiguration: undefined } : row) },
+        })))
       },
       onAccepted: () => get().acceptResearchMessage(requestId),
-      onUnconfirmed: (error, reconciled) => get().unconfirmResearchMessage(requestId, error.message, (error as Error & { retryable?: boolean }).retryable, reconciled),
+      onUnconfirmed: (error, reconciled) => get().unconfirmResearchMessage(requestId, error.message, (error as Error & { retryable?: boolean }).retryable, reconciled, error),
     }).then(host => {
-      if (!ownsContext()) return
       get().bindResearchConversation(host)
-      const current = get()
       const draft = message.researchDraft
+      if (draft?.ownerKey && draft.revision !== undefined) get().clearResearchEditor(draft.ownerKey, draft.revision, draft.attachmentIdentities)
+      if (!ownsContext()) return
+      const current = get()
       if (draft && draft.mode === current.agentMode && draft.sessionId === current.researchBinding?.sessionId &&
         current.draft === draft.text &&
         (draft.revision === undefined || draft.revision === current.draftRevision) &&
@@ -681,17 +998,102 @@ export const useSessionStore = create<SessionState>((set, get) => ({
       }
       if (host.syncError) set({ researchConnectionError: host.syncError })
     }).catch(error => {
-      if (!ownsContext()) return
       const message = error instanceof Error ? error.message : String(error)
-      if (isResearchStartupFailure(error)) get().failResearchExecution(requestId, message)
-      else if (isResearchRequestTimeout(error) || error?.errorCode === 'RESEARCH_DELIVERY_UNCONFIRMED') get().unconfirmResearchMessage(requestId, message, error?.retryable)
-      else get().failResearchMessage(requestId, message, error?.retryable)
+      if (isResearchStartupFailure(error)) get().failResearchExecution(requestId, message, error)
+      else if (isResearchRequestTimeout(error) || error?.errorCode === 'RESEARCH_DELIVERY_UNCONFIRMED') get().unconfirmResearchMessage(requestId, message, error?.retryable, undefined, error)
+      else get().failResearchMessage(requestId, message, error?.retryable, error)
     })
   },
 
-  requestResearchStop: () => {
+  requestResearchStop: target => {
     const state = get()
+    if (target?.kind === 'startup') {
+      if (target.sessionId) cancelResearchStartup(target.sessionId)
+      else cancelResearchStartup(target.requestId)
+      return
+    }
+    if (target?.kind === 'turn') {
+      void requestResearch('abort', {sessionId:target.sessionId, ...(target.streamId ? {streamId:target.streamId} : {})}).catch(error => {
+        if (get().researchBinding?.sessionId === target.sessionId) set({researchConnectionError:error instanceof Error ? error.message : String(error)})
+      })
+      return
+    }
+    if (target?.kind === 'run') beginResearchControl(target.runId)
     const binding = state.researchBinding
+    const captured: ResearchStopTarget | null = target?.kind === 'run' ? { ...target }
+      : binding?.runId ? { kind: 'run', runId: binding.runId, workspace: binding.workspace,
+        sessionId: binding.sessionId, sessionFile: binding.sessionFile, streamId: binding.streamId } : null
+    const previousStop = captured ? researchStopEntry(captured.runId) : undefined
+    const recovering = captured && (previousStop?.phase === 'failed' || previousStop?.phase === 'unconfirmed'
+      || (!previousStop && state.researchCards[captured.runId]?.status === 'stopping'))
+    if (captured && recovering) {
+      const runId = captured.runId
+      const attemptId = beginResearchStop(runId)
+      if (!attemptId) return
+      beginResearchControl(runId)
+      // Lock before the read, not merely before the eventual control command: two clicks or
+      // a layout switch cannot create parallel preflights and dispatch two stops.
+      void (async () => {
+        const detail = await refreshResearchStopTarget(captured)
+        if (researchStopEntry(runId)?.attemptId !== attemptId) return
+        upsertActivityDetail(detail)
+        if (researchRunAtRest(detail.run.status, detail.run.driving)) {
+          clearResearchStop(runId, attemptId)
+          return
+        }
+        if (!['active', 'waiting_input', 'stopping'].includes(detail.run.status)) {
+          unconfirmResearchStop(runId, attemptId, '停止结果待确认：尚未确认后台驱动已退出，请刷新状态。')
+          return
+        }
+        await executeResearchControl('stop_research', { runId, workspace: detail.run.workspace,
+          sessionFile: detail.run.rootSession,
+          isCurrent: () => researchStopEntry(runId)?.attemptId === attemptId && researchStopEntry(runId)?.phase === 'pending',
+          onBound: host => {
+            if (host.run?.id !== runId || !sameResearchStopPath(host.session.file, detail.run.rootSession!)
+              || !sameResearchStopPath(host.session.cwd, detail.run.workspace)) {
+              throw new Error('研究控制目标已变更，请重新打开原研究。')
+            }
+            if (researchRunAtRest(host.run.status, host.run.driving)) clearResearchStop(runId, attemptId)
+            // A background recovery must not navigate away from a conversation selected in
+            // the meantime. Binding is only a refresh of the same captured current owner.
+            if (get().researchBinding?.runId === runId && get().researchBinding?.sessionId === captured.sessionId) {
+              get().bindResearchConversation(host)
+            }
+          } })
+        noteResearchStopAck(runId, attemptId)
+      })().catch(error => {
+        if (researchStopEntry(runId)?.attemptId !== attemptId) return
+        const message = error instanceof Error ? error.message : String(error)
+        if (isResearchRequestTimeout(error)) unconfirmResearchStop(runId, attemptId, message)
+        else failResearchStop(runId, attemptId, message)
+      })
+      return
+    }
+    // One shared lock per run: the workbench header, the focus bar, the timeline pill and the
+    // sidebar entry all stop the same way, and a second click while a stop is in flight sends
+    // nothing. The engine's reply only means the command landed -- the wait ends when the board
+    // reports the run at rest (researchStopObservation), never on the ACK alone.
+    const dispatchStop = (runId: string, dispatch: (attemptId: string) => Promise<void>, failed: (error: unknown) => void) => {
+      const attemptId = beginResearchStop(runId)
+      if (!attemptId) return
+      void dispatch(attemptId).then(() => {
+        noteResearchStopAck(runId, attemptId)
+      }).catch(error => {
+        if (researchStopEntry(runId)?.attemptId !== attemptId) return
+        failed(error)
+        if (isResearchRequestTimeout(error)) unconfirmResearchStop(runId, attemptId, error.message)
+        else failResearchStop(runId, attemptId, error instanceof Error ? error.message : String(error))
+      })
+    }
+    if (target?.kind === 'run' && (state.researchBinding?.runId !== target.runId || state.researchBinding?.sessionId !== target.sessionId)) {
+      const runId = target.runId
+      dispatchStop(runId, attemptId => executeResearchControl('stop_research', {runId, workspace:target.workspace, sessionFile:target.sessionFile || target.rootSession,
+        isCurrent: () => researchStopEntry(runId)?.attemptId === attemptId && researchStopEntry(runId)?.phase === 'pending',
+        onBound: host => get().bindResearchConversation(host)}).then(() => { void get().fetchResearchCardDetails(runId).catch(() => {}) }),
+        error => set(current=>({researchCards:{...current.researchCards,[runId]:{...current.researchCards[runId],runId,
+          error:isResearchRequestTimeout(error) ? '停止请求没有回应，结果待确认，请刷新研究状态核对。' : error instanceof Error ? error.message : String(error)}}})))
+      return
+    }
     if (!binding) return
     if (state.researchConversation.isAborting) return
     if (!binding.runId) {
@@ -725,13 +1127,17 @@ export const useSessionStore = create<SessionState>((set, get) => ({
         })
       return
     }
+    const runId = binding.runId
+    const attemptId = beginResearchStop(runId)
+    if (!attemptId) return
     let owner = binding
     const ownsContext = () => get().agentMode === 'research' &&
       researchBindingKey(get().researchBinding || { sessionId: '' }) === researchBindingKey(owner)
     set({ researchConnectionError: null, researchConversation: { ...state.researchConversation, isAborting: true } })
-    void executeResearchControl('stop_research', { runId: binding.runId, workspace: binding.workspace, sessionFile: binding.sessionFile,
+    void executeResearchControl('stop_research', { runId, workspace: binding.workspace, sessionFile: binding.sessionFile,
+      isCurrent: () => researchStopEntry(runId)?.attemptId === attemptId && researchStopEntry(runId)?.phase === 'pending',
       onBound: host => {
-        if (host.session.sessionId !== binding.sessionId || (host.run && host.run.id !== binding.runId)) {
+        if (host.session.sessionId !== binding.sessionId || (host.run && host.run.id !== runId)) {
           throw new Error('研究控制目标已变更，请重新打开原研究。')
         }
         if (!ownsContext()) return
@@ -739,15 +1145,28 @@ export const useSessionStore = create<SessionState>((set, get) => ({
         const rebound = get().researchBinding
         if (!rebound) return
         owner = rebound
-        const settled = host.run && host.run.status !== 'waiting_input' && !isResearchRunActive(host.run.status)
+        const settled = host.run && researchRunAtRest(host.run.status, host.run.driving)
+        // The bound host IS the run's root session: when its own board read already reports the
+        // run at rest, the stop is finished -- the shared wait ends here, with its terminal state.
+        if (settled && host.run) clearResearchStop(runId, attemptId)
         set(current => ({ researchConversation: { ...current.researchConversation, isAborting: !settled } }))
       },
+    }).then(() => {
+      // An acknowledgement only means the command was received: the conversation keeps
+      // 正在停止 until the observation chain (or a later authoritative snapshot) confirms rest.
+      noteResearchStopAck(runId, attemptId)
     })
       .catch(error => {
-        if (isResearchRequestTimeout(error)) return
+        if (researchStopEntry(runId)?.attemptId !== attemptId) return
+        if (isResearchRequestTimeout(error)) {
+          unconfirmResearchStop(runId, attemptId, '停止请求没有回应，结果待确认，请刷新研究状态核对。')
+          return
+        }
+        const message = error instanceof Error ? error.message : String(error)
+        failResearchStop(runId, attemptId, message)
         set(current => {
           if (researchBindingKey(current.researchBinding || { sessionId: '' }) !== researchBindingKey(owner)) return current
-          return { researchConnectionError: error instanceof Error ? error.message : String(error),
+          return { researchConnectionError: message,
             researchConversation: { ...current.researchConversation, isAborting: false } }
         })
       })
@@ -756,18 +1175,33 @@ export const useSessionStore = create<SessionState>((set, get) => ({
   handleResearchBridgeMessage: (msg) => {
     if ('type' in msg && msg.type === 'ack') {
       if (msg.requestId) {
-        const binding = get().researchBinding
-        if ((typeof msg.sessionId === 'string' && msg.sessionId !== binding?.sessionId) ||
-          (typeof msg.streamId === 'string' && msg.streamId !== binding?.streamId)) return
+        const owner = researchDeliveryBindings.get(msg.requestId)
+        if (owner && ((typeof msg.sessionId === 'string' && msg.sessionId !== owner.sessionId) ||
+          (typeof msg.streamId === 'string' && owner.streamId && msg.streamId !== owner.streamId))) return
         if (msg.ok) get().acceptResearchMessage(msg.requestId)
-        else if (msg.errorCode === 'RESEARCH_DELIVERY_UNCONFIRMED') get().unconfirmResearchMessage(msg.requestId, msg.error || '研究消息结果尚未确认', false)
-        else get().failResearchMessage(msg.requestId, msg.error || '研究消息提交失败', msg.retryable)
+        else if (msg.errorCode === 'RESEARCH_DELIVERY_UNCONFIRMED') get().unconfirmResearchMessage(msg.requestId, msg.error || '研究消息结果尚未确认', false, undefined, msg)
+        else get().failResearchMessage(msg.requestId, msg.error || '研究消息提交失败', msg.retryable, msg)
       }
       return
     }
     if (!('event' in msg) || !msg.event) return
     const binding = get().researchBinding
     const streamId = (msg as BridgeEventEnvelope & { streamId?: string }).streamId
+    if (msg.sessionId && msg.sessionId !== binding?.sessionId) {
+      const owner = get().researchBindings[msg.sessionId]
+      if (!owner || (owner.streamId && streamId && owner.streamId !== streamId) || typeof msg.seq !== 'number') return
+      set(current => {
+        const previous = current.researchConversations[msg.sessionId] || emptyResearchConversation()
+        if (msg.seq <= previous.lastEventSeq) return {}
+        const conversation = reduceResearchConversationEvent(previous, msg as BridgeEventEnvelope)
+        const raw = msg.event.type === 'message_end' ? msg.event.message : null
+        const runId = raw ? researchNoticeRunId(raw) : ''
+        if (raw?.customType === 'research-final') settleStopFromFinalNotice(runId || undefined, raw)
+        const card = runId && raw ? {...applyResearchNoticeToCard(current.researchCards[runId], {...raw,details:{...raw.details,seq:msg.seq}}),workspace:owner.workspace} : null
+        return {researchConversations:{...current.researchConversations,[msg.sessionId]:conversation},...(card ? {researchCards:{...current.researchCards,[runId]:card}} : {})}
+      })
+      return
+    }
     if (binding?.streamId && streamId && streamId !== binding.streamId) return
     if (msg.event.type === 'research_connection_error') {
       if (binding && (!msg.sessionId || msg.sessionId === binding.sessionId)) {
@@ -793,6 +1227,7 @@ export const useSessionStore = create<SessionState>((set, get) => ({
         if (lateRunId && !state.researchBinding.runId &&
           (!pendingRequestId || !noticeRequestId || noticeRequestId === pendingRequestId)) {
           set(current => ({ researchBinding: current.researchBinding ? { ...current.researchBinding, runId: lateRunId } : current.researchBinding,
+            researchConversation: clearResearchStartupRequest(current.researchConversation, noticeRequestId || pendingRequestId || undefined),
             researchPendingCreationRequestId: null }))
         }
       }
@@ -802,12 +1237,17 @@ export const useSessionStore = create<SessionState>((set, get) => ({
       get().applyResearchTeamSnapshot(msg.sessionId, msg.event.details ?? msg.event, msg.seq)
     }
     set(current => {
-      const conversation = reduceResearchConversationEvent(current.researchConversation, envelope)
+      let conversation = reduceResearchConversationEvent(current.researchConversation, envelope)
       const raw = msg.event.type === 'message_end' ? msg.event.message : null
       const runId = raw?.customType?.startsWith('research-') && raw.customType !== 'research-input' ? researchNoticeRunId(raw) : ''
+      if (raw?.customType === 'research-discipline' && runId && !current.researchBinding?.runId) {
+        const requestId = raw.details?.requestId || current.researchPendingCreationRequestId
+        conversation = clearResearchStartupRequest(conversation, requestId || undefined)
+      }
       let cards = current.researchCards
+      if (raw?.customType === 'research-final') settleStopFromFinalNotice(runId || undefined, raw)
       if (runId) {
-        const card = applyResearchNoticeToCard(cards[runId], raw)
+        const card = applyResearchNoticeToCard(cards[runId], {...raw,details:{...raw.details,seq:msg.seq}})
         if (!card.workspace) card.workspace = current.researchBinding?.workspace
         if (!card.question) {
           const question = [...conversation.messages].reverse().find(message => message.customType === 'research-question')
@@ -829,62 +1269,71 @@ export const useSessionStore = create<SessionState>((set, get) => ({
     })
   },
 
-  prepareAttachments: async (paths: string[]) => {
-    const current = get().attachments
+  ingestResearchBridgeMessage: (msg) => {
+    // An ack answers a promise the page is already waiting on; queueing it would delay the result
+    // of a send the reader can see happening.
+    if ('type' in msg && msg.type === 'ack') { get().handleResearchBridgeMessage(msg); return }
+    researchIngest.push(msg)
+  },
+
+  flushResearchIngest: () => { researchIngest.flushNow() },
+
+  prepareAttachments: async (paths, capturedOwner) => {
+    const start = get()
+    const owner = capturedOwner === undefined ? (start.agentMode === 'research' ? start.researchView.ownerKey : null) : capturedOwner
+    const read = (state: SessionState): PreparedAttachment[] => owner ? (state.agentMode === 'research' && state.researchView.ownerKey === owner ? state.attachments : state.researchEditors[owner]?.attachments || []) : state.agentMode === 'agent' ? state.attachments : state.ordinaryEditor.attachments
+    const update = (transform: (items: PreparedAttachment[]) => PreparedAttachment[]) => set(state => {
+      const attachments = transform(read(state))
+      if (owner) return { researchEditors: { ...state.researchEditors, [owner]: { ...(state.researchEditors[owner] || emptyResearchEditor()), attachments: attachments as ResearchEditor['attachments'] } },
+        ...(state.agentMode === 'research' && state.researchView.ownerKey === owner ? {attachments} : {}) }
+      return state.agentMode === 'agent' ? {attachments} : { ordinaryEditor: {...state.ordinaryEditor, attachments} }
+    })
+    const current = read(start)
     const seen = new Set(current.map(item => attachmentIdentity(item.path)))
     const unique = paths.filter(path => {
-      if (typeof path !== 'string' || !path.trim()) return false
-      const identity = attachmentIdentity(path)
-      if (seen.has(identity)) return false
-      seen.add(identity)
-      return true
+      if (typeof path !== 'string' || !path.trim() || seen.has(attachmentIdentity(path))) return false
+      seen.add(attachmentIdentity(path)); return true
     })
     if (!unique.length) return
-
-    const available = Math.max(0, MAX_ATTACHMENTS - current.length)
-    const selected = unique.slice(0, available)
-    const tooMany = unique.slice(available)
-    const pending: PreparedAttachment[] = [
-      ...selected.map(path => ({ path, name: attachmentName(path), size: 0, kind: 'unsupported' as const, text: '', images: [], error: null, status: 'preparing' as const })),
-      ...tooMany.map(path => ({ path, name: attachmentName(path), size: 0, kind: 'unsupported' as const, text: '', images: [], error: `最多可添加 ${MAX_ATTACHMENTS} 个附件`, status: 'error' as const })),
-    ]
-    set(state => ({ attachments: [...state.attachments, ...pending] }))
+    const selected = unique.slice(0, Math.max(0, MAX_ATTACHMENTS-current.length))
+    const pending = unique.map(path => ({ path, attachmentId: newRequestId('attachment'), preparationId: newRequestId('preparation'), name: attachmentName(path), size:0, kind:'unsupported' as const, text:'', images:[], error: selected.includes(path) ? null : `最多可添加 ${MAX_ATTACHMENTS} 个附件`, status: selected.includes(path) ? 'preparing' as const : 'error' as const }))
+    update(items => [...items, ...pending])
+    if (owner) set(state => {
+      const editor=state.researchEditors[owner]
+      if (!editor) return state
+      const revision=editor.revision+1
+      return {researchEditors:{...state.researchEditors,[owner]:{...editor,revision}},...(state.agentMode==='research' && state.researchView.ownerKey===owner ? {draftRevision:revision} : {})}
+    })
     if (!selected.length) return
-
+    const owns = (item: PreparedAttachment) => pending.some(p => p.attachmentId === (item as ResearchEditor['attachments'][number]).attachmentId && p.preparationId === (item as ResearchEditor['attachments'][number]).preparationId && selected.includes(p.path)) && item.status === 'preparing'
     try {
-      const result = await request<{ attachments?: AttachmentPreparation[] }>('prepare_attachments', { paths: selected }, 120000)
-      const prepared = result.attachments ?? []
-      const byPath = new Map(prepared.map(item => [item.path, item]))
-      set(state => {
-        let totalBytes = state.attachments.reduce((sum, item) => item.status === 'ready' && !selected.includes(item.path) ? sum + item.size : sum, 0)
-        const attachments = state.attachments.map(item => {
-          if (!selected.includes(item.path) || item.status !== 'preparing') return item
-          const value = byPath.get(item.path)
-          if (!value) return { ...item, status: 'error' as const, error: '附件处理没有返回结果' }
-          if (value.error) return { ...item, ...value, status: 'error' as const }
-          if (value.size > 10 * 1024 * 1024 || totalBytes + value.size > MAX_ATTACHMENT_BYTES) {
-            return { ...item, ...value, images: [], status: 'error' as const, error: '附件总大小超过 25 MiB' }
-          }
-          totalBytes += value.size
-          return { ...item, ...value, status: 'ready' as const }
+      const result = await request<{attachments?: AttachmentPreparation[]}>('prepare_attachments', {paths:selected},120000)
+      const byPath = new Map((result.attachments || []).map(item=>[item.path,item]))
+      update(items => {
+        let total = items.reduce((sum,item)=>sum+(item.status === 'ready' ? item.size : 0),0)
+        return items.map(item => {
+          if (!owns(item)) return item
+          const value=byPath.get(item.path)
+          if (!value) return {...item,status:'error' as const,error:'附件处理没有返回结果'}
+          if (value.error) return {...item,...value,status:'error' as const}
+          if (value.size > 10*1024*1024 || total+value.size > MAX_ATTACHMENT_BYTES) return {...item,...value,images:[],status:'error' as const,error:'附件总大小超过 25 MiB'}
+          total+=value.size; return {...item,...value,status:'ready' as const}
         })
-        return { attachments }
       })
-    } catch (error) {
-      const message = error instanceof Error ? error.message : '附件处理失败'
-      set(state => ({ attachments: state.attachments.map(item => selected.includes(item.path) && item.status === 'preparing'
-        ? { ...item, status: 'error' as const, error: message } : item) }))
-    }
+    } catch(error) { update(items=>items.map(item=>owns(item) ? {...item,status:'error' as const,error:error instanceof Error ? error.message : '附件处理失败'} : item)) }
   },
-
-  retryAttachment: async (path: string) => {
-    if (!get().attachments.some(item => item.path === path && item.status === 'error')) return
-    set(state => ({ attachments: state.attachments.filter(item => item.path !== path) }))
+  retryAttachment: async path => {
+    if (!get().attachments.some(item=>item.path===path && item.status==='error')) return
+    get().removeAttachment(path)
     await get().prepareAttachments([path])
   },
-
-  removeAttachment: (path: string) => set(state => ({ attachments: state.attachments.filter(item => item.path !== path) })),
-  clearAttachments: () => set({ attachments: [] }),
+  removeAttachment: path => set(state => {
+    const attachments=state.attachments.filter(item=>item.path!==path)
+    return {attachments,...(state.agentMode==='research' ? {researchEditors:{...state.researchEditors,[state.researchView.ownerKey]:{...(state.researchEditors[state.researchView.ownerKey] || emptyResearchEditor()),attachments:attachments as ResearchEditor['attachments'],revision:state.draftRevision+1}},draftRevision:state.draftRevision+1} : {})}
+  }),
+  clearAttachments: () => {
+    for (const item of get().attachments) get().removeAttachment(item.path)
+  },
 
   takeRetainedEditorText: () => {
     const held = get().retainedEditorText
@@ -983,11 +1432,19 @@ export const useSessionStore = create<SessionState>((set, get) => ({
   },
 
   openSession: (path: string) => {
+    const state = get()
+    const row = state.sessions.find(session => session.path === path)
+    const cached = Object.values(state.researchBindings).find(binding => binding.sessionFile === path)
+    if (row?.desktopResearch || cached) {
+      openResearchSession(path, row?.id || cached!.sessionId, row?.cwd || cached!.workspace)
+      return
+    }
     if (path === get().currentSessionPath && get().agentMode !== 'research' && !get().isSessionLoading && !get().sessionLoadError) return
     beginHydration({ type: 'load_session', requestId: newRequestId('load'), path, preview: true }, path)
   },
 
   retrySessionLoad: () => {
+    if (researchOpenRetryPath) { get().openSession(researchOpenRetryPath); return }
     if (!retryCommand) return
     const prefix = retryCommand.type === 'switch_workspace' ? 'sw' : retryCommand.type === 'new_session' ? 'new' : retryCommand.type === 'fork_session' ? 'fork' : 'load'
     const command: HydrationCommand = { ...retryCommand, requestId: newRequestId(prefix) }
@@ -995,6 +1452,10 @@ export const useSessionStore = create<SessionState>((set, get) => ({
   },
 
   createSession: (carryOverContext = false) => {
+    const entryId = newRequestId('research_entry')
+    const ownerKey = newResearchOwner(get().currentWorkspace, entryId)
+    if (get().agentMode === 'research') get().setAgentMode('agent')
+    set({researchNewEntryId: entryId, researchView: {kind:'new',ownerKey,version:get().researchPageVersion+1}, draft:'',attachments:[],ordinaryEditor:{text:'',revision:0,attachments:[]}})
     beginHydration({ type: 'new_session', requestId: newRequestId('new'), carryOverContext,
       cwd: get().currentWorkspace || undefined })
   },
@@ -1099,7 +1560,9 @@ export const useSessionStore = create<SessionState>((set, get) => ({
   },
 
   fetchResearchRuns: () => {
-    sendBridge({ type: 'list_research_runs', requestId: `req_runs_${Date.now()}` })
+    const release = retainResearchActivity()
+    const unsubscribe = researchActivity.subscribeHistory()
+    void researchActivity.refresh().finally(() => {unsubscribe();release()})
   },
 
   fetchResearchGraph: (runId?: string) => {
@@ -1107,60 +1570,56 @@ export const useSessionStore = create<SessionState>((set, get) => ({
   },
 
   upsertResearchCard: (card) => {
-    set(state => ({
-      researchCards: {
-        ...state.researchCards,
-        [card.runId]: {
-          ...(state.researchCards[card.runId] || {
-            runId: card.runId,
-            question: '',
-            status: 'active',
-            phase: 'active',
-            tasks: [],
-            findings: [],
-            pendingQuestions: [],
-            report: null,
-            error: null,
-            updatedAt: Date.now(),
-          }),
-          ...card,
-          updatedAt: Date.now(),
-        },
-      },
-    }))
+    set(state => {
+      const previous = state.researchCards[card.runId]
+      const incoming: ResearchRunCard = {...(previous ?? {runId:card.runId,question:'',status:'active',phase:'active',tasks:[],updatedAt:Date.now()}),...card}
+      return {researchCards:{...state.researchCards,[card.runId]:mergeResearchCard(previous,incoming)}}
+    })
   },
 
   setActiveResearchTask: (target) => set({ activeResearchTaskId: target }),
   setActiveResearchGraphRunId: (runId) => set({ activeResearchGraphRunId: runId }),
-  setResearchHistoryOpen: (open) => set({ researchHistoryOpen: open }),
+  setResearchHistoryOpen: (open) => set(state => ({ researchHistoryOpen: open, researchHistoryGeneration: state.researchHistoryGeneration + 1 })),
 
   fetchResearchCardDetails: async (runId: string) => {
-    try {
-      const workspace = get().researchCards[runId]?.workspace
-        || get().researchRuns.find(r => r.id === runId)?.workspace
-        || get().currentWorkspace
-      const detail = await request<ResearchRunDetail>('get_research_details', { runId, workspace })
-      if (detail?.run?.id === runId) {
-        set(state => ({
-          researchCards: {
-            ...state.researchCards,
-            [runId]: hydrateCardFromDetail(state.researchCards[runId], detail),
-          },
-        }))
-      }
-    } catch {
-      // ignore errors
-    }
+    const workspace = get().researchCards[runId]?.workspace || get().researchRuns.find(run=>run.id === runId)?.workspace || get().currentWorkspace
+    const release = subscribeResearchRun(runId, workspace)
+    try { await researchActivity.refresh() } finally {release()}
   },
 
-  setAgentMode: (mode) => {
-    if (get().isSessionLoading || get().sessionLoadError || get().sessionOperation || get().isCompacting) return
-    if (mode === 'research') get().setPermissionMode('bypassPermissions')
-    set({ agentMode: mode })
+  setResearchPageView: view => {
+    const state = get()
+    if (view === 'conversation') get().selectResearchView({ kind: 'conversation', ownerKey: `conversation:${state.researchBinding?.sessionId || 'unbound'}`, sessionId: state.researchBinding?.sessionId || 'unbound' })
+    else get().selectResearchView({ kind: 'new', ownerKey: newResearchOwner(state.currentWorkspace, state.researchNewEntryId) })
+  },
+  setNewResearchDraft: text => set({ newResearchDraft: text }),
+  setAgentMode: mode => {
+    const state = get()
+    if (state.agentMode === mode) return
+    cancelResearchSessionOpen()
+    if (mode === 'research') {
+      const view: ResearchViewSelection = state.researchPageView === 'new' ? { kind: 'new', ownerKey: newResearchOwner(state.currentWorkspace, state.researchNewEntryId) }
+        : state.researchView.kind === 'conversation' ? state.researchView
+          : { kind: 'conversation', ownerKey: `conversation:${state.researchBinding?.sessionId || 'unbound'}`, sessionId: state.researchBinding?.sessionId || 'unbound' }
+      const editor = state.researchEditors[view.ownerKey] || { ...emptyResearchEditor(), model: useSettingsStore.getState().currentModel, thinkingLevel: useSettingsStore.getState().thinkingLevel }
+      const version = state.researchPageVersion + 1
+      // Save the outgoing owner and restore the incoming owner in one publication; no
+      // subscriber can observe a cleared research draft and save it over its bucket.
+      set({ ordinaryEditor: { text: state.draft, revision: state.draftRevision, attachments: state.attachments }, permissionMode:'bypassPermissions', agentMode: mode,
+        researchEditors: { ...state.researchEditors, [view.ownerKey]: editor }, researchView: { ...view, version }, researchPageVersion: version,
+        draft: editor.text, draftRevision: editor.revision, attachments: editor.attachments })
+    } else {
+      const owner = state.researchView.kind === state.researchPageView ? state.researchView.ownerKey : `conversation:${state.researchBinding?.sessionId || 'unbound'}`
+      const version = state.researchPageVersion + 1
+      set({ researchEditors: { ...state.researchEditors, [owner]: { ...(state.researchEditors[owner] || emptyResearchEditor()), text: state.draft, revision: state.draftRevision, attachments: state.attachments as ResearchEditor['attachments'] } },
+        researchView: { ...state.researchView, version }, researchPageVersion: version,
+        agentMode: mode, draft: state.ordinaryEditor.text, draftRevision: state.ordinaryEditor.revision, attachments: state.ordinaryEditor.attachments })
+    }
   },
 
   setPermissionMode: (mode: PermissionMode) => {
     if (get().isSessionLoading || get().sessionLoadError || get().sessionOperation || get().isCompacting) return
+    if (get().agentMode === 'research') get().setAgentMode('agent')
     set({ permissionMode: mode, agentMode: 'agent' })
     sendBridge({
       type: 'set_permission_mode',

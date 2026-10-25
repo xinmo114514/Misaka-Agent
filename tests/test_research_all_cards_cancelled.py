@@ -2,6 +2,8 @@
 closed the node as a branch point, with no conclusion; a follow-up round was kept as one she had
 asked for, and her conclusion was dropped as a request for it."""
 import asyncio
+import hashlib
+from pathlib import Path
 
 from test_research_plan_change import ROSTER, change, executing, task  # noqa: F401
 
@@ -35,6 +37,18 @@ def test_a_first_round_whose_cards_were_all_cancelled_fails_the_node(executing, 
 def test_a_follow_up_round_whose_cards_were_all_cancelled_is_withdrawn(executing, monkeypatch):  # noqa: F811
     con, run, root, _tool, ctx = executing
     con.execute("UPDATE tasks SET status='done'")
+    # The original round has real accepted material; a done status alone is
+    # intentionally insufficient for the workspace's zero-output guard.
+    from misaka.core.platform import tasks
+    for original in runs.tasks(con, run["id"], kind="research"):
+        output = Path(original["output_dir"], "accepted.md")
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text("Verified source comparison.\n", encoding="utf-8")
+        relative = str(output.relative_to(run["workspace"]))
+        tasks.add_event(con, original["id"], "submitted", {"summary": "Verified comparison", "findings": [],
+            "artifacts": [relative], "artifact_digests": {relative: hashlib.sha256(output.read_bytes()).hexdigest()}},
+            generation=original["generation"])
+    workflow.settle_done_tasks(con, run_id=run["id"])
     plan = planner.validate_plan({"status": "ready", "plan_markdown": "more", "tasks": [task("x"), task("y")]},
                                  ROSTER, red_team_required=False)
     runs.record_action(con, run, root, runs.plan_key(2), plan, session_file=ctx.sessionManager.sessionFile,

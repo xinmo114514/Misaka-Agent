@@ -1,7 +1,8 @@
+import { beginResearchControl, acceptResearchResume } from './researchActivityStore'
 import { newRequestId, request } from './bridge'
 import { addResearchSink, isResearchRequestTimeout, requestResearch } from './researchBridge'
 import { isResearchRunActive } from './researchConversation'
-import type { ResearchOptionsPayload, ResearchRunDetail, ResearchRunSummary, ResearchHostSnapshot, ResearchConversationBinding } from '../types/research'
+import type { ResearchOptionsPayload, ResearchRunDetail, ResearchRunSummary, ResearchHostSnapshot, ResearchConversationBinding, ResearchFailureMetadata } from '../types/research'
 
 export interface ResearchSubmissionInput {
   text: string
@@ -17,6 +18,9 @@ interface Input {
   question: string
   workspace: string
   model?: { provider: string; modelId: string } | null
+  lastOrderModel?: { provider: string; modelId: string } | null
+  modelRole?: 'last_order' | 'sister'
+  limits?: ResearchOptionsPayload['defaults']
   thinkingLevel?: string
   binding?: ResearchConversationBinding | null
   requestId?: string
@@ -26,12 +30,12 @@ interface Input {
   onSubmission?: (input: ResearchSubmissionInput) => void
   onBound?: (host: ResearchHostSnapshot) => void
   onAccepted?: () => void
-  onUnconfirmed?: (error: Error, reconciled?: boolean) => void
+  onUnconfirmed?: (error: Error & ResearchFailureMetadata, reconciled?: boolean) => void
 }
 
 // AI-driven recruitment can require multiple real model turns before the
 // original native workflow acknowledges its first input.
-const RESEARCH_STARTUP_TIMEOUT_MS = 180_000
+const RESEARCH_STARTUP_TIMEOUT_MS = 650_000
 
 /** Startups without a run id can only be cancelled on their own research host. */
 const pendingStartups = new Map<string, () => void>()
@@ -126,7 +130,7 @@ function confirmResearchStartup(sessionId: string, streamId?: string, previousRu
     const attempts = [3_000, 6_000, 12_000, 24_000, 48_000, 96_000]
     let index = 0
     const schedule = () => {
-      const delay = attempts[index]
+      const delay = attempts[index] ?? 30_000
       if (settled || delay === undefined) return
       index += 1
       pollTimer = window.setTimeout(() => {
@@ -154,6 +158,16 @@ function confirmResearchStartup(sessionId: string, streamId?: string, previousRu
 
 type ResearchStartResult = ResearchHostSnapshot & { runId: string; syncError?: string }
 
+function requireCommittedRoleModel(acknowledgement: { modelBinding?: ResearchHostSnapshot['modelBinding']; modelBindings?: ResearchHostSnapshot['modelBindings'] },
+  role: 'last_order' | 'sister', model: { provider: string; modelId: string }): void {
+  const committed = acknowledgement.modelBindings?.[role] ?? (role === 'sister' ? acknowledgement.modelBinding : null)
+  if (committed && (committed.state !== 'ready' || committed.effective.provider !== model.provider || committed.effective.modelId !== model.modelId)) {
+    throw Object.assign(new Error(committed.error || '研究模型尚未就绪，请重试模型切换后发送。'), {
+      retryable: true, errorCode: 'RESEARCH_MODEL_NOT_READY', errorStage: 'model_binding',
+    })
+  }
+}
+
 /** The renderer can cancel a launch before it has acquired a native session ID. */
 export function startComposerResearch(input: Input): Promise<ResearchStartResult> {
   const requestId = input.requestId ?? newRequestId('research_input')
@@ -177,7 +191,7 @@ export function startComposerResearch(input: Input): Promise<ResearchStartResult
 }
 
 /** Research uses its own host; ordinary chat permissions alone do not configure it. */
-async function launchComposerResearch({ question, workspace, model, thinkingLevel, binding, requestId = newRequestId('research_input'), startNew, submission, onSubmission, onBound, onAccepted, onUnconfirmed }: Input,
+async function launchComposerResearch({ question, workspace, model, lastOrderModel, modelRole = 'sister', limits: chosenLimits, thinkingLevel, binding, requestId = newRequestId('research_input'), startNew, submission, onSubmission, onBound, onAccepted, onUnconfirmed }: Input,
   launch: { check: () => void; bound: () => void }): Promise<ResearchStartResult> {
   if (!workspace.trim()) throw new Error('请先选择项目目录')
   if (!(submission?.text ?? question).trim()) throw new Error('请先输入研究课题')
@@ -192,6 +206,9 @@ async function launchComposerResearch({ question, workspace, model, thinkingLeve
     launch.check()
     const owned = active.runs?.find(run => run.workspace.replace(/\\/g, '/').toLowerCase() === workspace.replace(/\\/g, '/').toLowerCase())
     if (owned) {
+      if (freshStart) {
+        throw new Error(`当前项目已有研究正在运行中（${owned.question || owned.id}），请先完成或停止该研究。`);
+      }
       const detail = await request<ResearchRunDetail>('get_research_details', { runId: owned.id, workspace })
       launch.check()
       if (!detail.run.rootSession) throw new Error('研究根会话尚未登记，请刷新研究状态后重试。')
@@ -211,7 +228,10 @@ async function launchComposerResearch({ question, workspace, model, thinkingLeve
   // A settled run in the host snapshot is adopted only when the caller is not
   // deliberately opening a new research conversation; otherwise its run id would
   // silently fold a fresh question into the previous (finished) run.
-  const adoptSnapshotRun = !(freshStart && snapshot.run && !isResearchRunActive(snapshot.run.status))
+  if (freshStart && snapshot.run && isResearchRunActive(snapshot.run.status)) {
+    throw new Error(`当前已有研究正在运行中（${snapshot.run.id}），请先完成或停止该研究。`)
+  }
+  const adoptSnapshotRun = freshStart ? false : Boolean(snapshot.run)
   const runId = (adoptSnapshotRun ? snapshot.run?.id : undefined) || binding?.runId || stored?.runId || undefined
   const starting = !runId
   const previousRunId = starting && !adoptSnapshotRun ? snapshot.run?.id : undefined
@@ -231,14 +251,41 @@ async function launchComposerResearch({ question, workspace, model, thinkingLeve
     // research's selected policy without changing its model or run parameters.
     await wait(requestResearch('set_permission_mode', { mode: 'bypassPermissions' }))
     if (starting && !stored) {
-      const options = await wait(request<ResearchOptionsPayload>('get_research_options'))
-      limits = { ...options.defaults, plan_approval: false }
+      if (chosenLimits) limits = { ...chosenLimits }
+      else {
+        const options = await wait(request<ResearchOptionsPayload>('get_research_options'))
+        limits = { ...options.defaults }
+      }
     }
     // The picker selection is authoritative for this send, including when
     // continuing an existing run: the research channel's team barrier drains
     // in-flight requests and commits the pair before the message is admitted.
-    if (model) await wait(requestResearch('set_model', { provider: model.provider, modelId: model.modelId }))
-    if (thinkingLevel) await wait(requestResearch('set_thinking', { level: thinkingLevel }))
+    if (starting) {
+      if (model) {
+        const acknowledgement = await wait(requestResearch<{modelBinding?: ResearchHostSnapshot['modelBinding']; modelBindings?: ResearchHostSnapshot['modelBindings']}>('desktop_set_team_model', { sessionId: host.session.sessionId,
+          provider: model.provider, modelId: model.modelId, role: 'sister', action: 'switch', requestId: newRequestId('team_model_sister') }))
+        requireCommittedRoleModel(acknowledgement, 'sister', model)
+      }
+      if (lastOrderModel) {
+        const acknowledgement = await wait(requestResearch<{modelBinding?: ResearchHostSnapshot['modelBinding']; modelBindings?: ResearchHostSnapshot['modelBindings']}>('desktop_set_team_model', { sessionId: host.session.sessionId,
+          provider: lastOrderModel.provider, modelId: lastOrderModel.modelId, role: 'last_order', action: 'switch', requestId: newRequestId('team_model_lo') }))
+        requireCommittedRoleModel(acknowledgement, 'last_order', lastOrderModel)
+      }
+      if (thinkingLevel) await wait(requestResearch('set_thinking', { level: thinkingLevel, role: 'sister' }))
+    } else if (model) {
+      const acknowledgement = await wait(requestResearch<{modelBinding?: ResearchHostSnapshot['modelBinding']; modelBindings?: ResearchHostSnapshot['modelBindings']}>('desktop_set_team_model', {
+        sessionId: host.session.sessionId,
+        provider: model.provider,
+        modelId: model.modelId,
+        role: modelRole,
+        action: 'switch',
+        requestId: newRequestId('team_model'),
+      }))
+      // Older bridges omit this optional snapshot. A present role barrier must
+      // prove its own pair committed before admitting a durable submission.
+      requireCommittedRoleModel(acknowledgement, modelRole, model)
+
+    }
     const identity: ResearchSubmissionInput = stored ?? {
       text: question.trim(), sessionId: host.session.sessionId, requestId,
       ...(freshStart ? { startNew: true } : {}),
@@ -249,13 +296,16 @@ async function launchComposerResearch({ question, workspace, model, thinkingLeve
     const input = { ...original, ...(host.streamId ? { streamId: host.streamId } : {}) }
     let acceptedSnapshot = boundSnapshot
     let receiptRunId: string | undefined
+    let resumed = false
     try {
+      if (runId) beginResearchControl(runId)
       if (!stored) onSubmission?.(Object.freeze({ ...input,
         ...(input.limits ? { limits: Object.freeze({ ...input.limits }) } : {}),
       }))
       const sent = gate ? gate.race(requestResearch('send_research_message', input, RESEARCH_STARTUP_TIMEOUT_MS))
         : requestResearch('send_research_message', input)
-      await sent
+      const acknowledgement = await sent
+      resumed = acknowledgement?.mode === 'resume'
     } catch (error) {
       const unknownDelivery = error instanceof Error &&
         (error as Error & { errorCode?: string }).errorCode === 'RESEARCH_DELIVERY_UNCONFIRMED'
@@ -280,6 +330,7 @@ async function launchComposerResearch({ question, workspace, model, thinkingLeve
           if (reconciledAcceptance) {
             acceptedSnapshot = reconciled
             receiptRunId = receipt?.runId || reconciled.run?.id || runId
+            resumed = receipt?.mode === 'resume'
           }
         }
       } catch {
@@ -292,6 +343,7 @@ async function launchComposerResearch({ question, workspace, model, thinkingLeve
         throw error
       }
     }
+    if (resumed && (receiptRunId || runId)) acceptResearchResume((receiptRunId || runId)!)
     onAccepted?.()
     let confirmedRunId = receiptRunId || runId
     if (!confirmedRunId && gate && confirmation) {

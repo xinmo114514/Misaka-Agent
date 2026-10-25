@@ -17,7 +17,7 @@ async def test_plain_message_reaches_research_ingress(monkeypatch):
     controller = object.__new__(runtime.DesktopResearchController)
     controller.lock = asyncio.Lock()
     controller.session = SimpleNamespace(sessionId='session-1')
-    controller.scope = SimpleNamespace(current_config=dict)
+    controller.scope = SimpleNamespace(current_config=dict, begin_launch_admission=lambda: None)
     controller.ingress = SimpleNamespace(send=AsyncMock(return_value={'accepted': True}))
     controller.intake_requests = set()
     monkeypatch.setattr(runtime, 'session_run', lambda *_: {'id': 'run-1'})
@@ -186,7 +186,7 @@ async def test_stop_uses_root_session_control_instead_of_board_connection(waitin
     controller = object.__new__(runtime.DesktopResearchController)
     controller.lock = asyncio.Lock()
     controller.session = case.session
-    controller.scope = SimpleNamespace(current_config=dict)
+    controller.scope = SimpleNamespace(current_config=dict, begin_launch_admission=lambda: None)
     controller.ingress = ResearchMessageIngress(case.session)
     controller.intake_requests = set()
 
@@ -207,7 +207,7 @@ async def test_stop_alias_reaches_the_same_owned_runtime_control(waiting_root, t
     controller = object.__new__(runtime.DesktopResearchController)
     controller.lock = asyncio.Lock()
     controller.session = case.session
-    controller.scope = SimpleNamespace(current_config=dict)
+    controller.scope = SimpleNamespace(current_config=dict, begin_launch_admission=lambda: None)
     controller.ingress = ResearchMessageIngress(case.session)
     controller.intake_requests = set()
     ack = await controller.send_message({'sessionId': case.session.sessionId,
@@ -394,7 +394,7 @@ async def test_text_format_is_preserved_by_the_controller(monkeypatch, text):
     controller = object.__new__(runtime.DesktopResearchController)
     controller.lock = asyncio.Lock()
     controller.session = SimpleNamespace(sessionId='session-1')
-    controller.scope = SimpleNamespace(current_config=dict)
+    controller.scope = SimpleNamespace(current_config=dict, begin_launch_admission=lambda: None)
     controller.ingress = SimpleNamespace(send=AsyncMock(return_value={'accepted': True}))
     controller.intake_requests = set()
     monkeypatch.setattr(runtime, 'session_run', lambda *_: {'id': 'run-1'})
@@ -405,6 +405,7 @@ async def test_text_format_is_preserved_by_the_controller(monkeypatch, text):
 
 async def test_recruitment_retry_continues_without_repeating_original_intent(monkeypatch, tmp_path):
     from misaka.core import session_control
+    from misaka.core.research import submissions
     session = _Session(tmp_path, tmp_path / 'root.jsonl')
     session.waitForIdle = AsyncMock()
     members = []
@@ -426,7 +427,7 @@ async def test_recruitment_retry_continues_without_repeating_original_intent(mon
     controller = object.__new__(runtime.DesktopResearchController)
     controller.lock = asyncio.Lock()
     controller.session = session
-    controller.scope = SimpleNamespace(current_config=dict)
+    controller.scope = SimpleNamespace(current_config=dict, begin_launch_admission=lambda: None)
     controller.ingress = SimpleNamespace(starting=False, send=AsyncMock(return_value={'accepted': True}))
     controller.intake_requests = set()
     controller.scene = SimpleNamespace(intake=False)
@@ -434,8 +435,10 @@ async def test_recruitment_retry_continues_without_repeating_original_intent(mon
     monkeypatch.setattr(runtime, 'session_run', lambda *_: None)
     monkeypatch.setattr(session_control, 'for_session', lambda _: _Control())
     payload = {'sessionId': session.sessionId, 'requestId': 'intake-retry', 'text': '原始研究问题'}
-    with pytest.raises(ValueError, match='provider rejected intake'):
+    with pytest.raises(submissions.ResearchInputError) as caught:
         await controller.send_message(dict(payload), None)
+    assert caught.value.errorCode == 'RESEARCH_RECRUITMENT_MODEL_ERROR'
+    assert caught.value.errorDetails['message'] == 'provider rejected intake'
     result = await controller.send_message(dict(payload), None)
     assert result['accepted'] is True
     assert calls == ['desktop-intake', 'desktop-intake-resume']

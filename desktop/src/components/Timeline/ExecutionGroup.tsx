@@ -3,7 +3,8 @@ import { AlertCircle, CheckCircle2, ChevronRight, CircleMinus, Loader2 } from 'l
 import type { ChatMessage, ToolCall } from '../../types/session'
 import { ThinkingBlock } from './ThinkingBlock'
 import { ToolCallRow } from './ToolCallCard'
-import { hasOpenDisclosure, useDisclosure, useSessionViewKey } from '../../lib/sessionViewState'
+import { hasOpenDisclosure, useDisclosure } from '../../lib/sessionViewState'
+import { useChatSurfaceKey } from './ChatSurface'
 import { formatDuration, toolDisplayName } from '../../lib/toolDisplay'
 import { useLiveClock } from '../../lib/useLiveClock'
 
@@ -37,9 +38,11 @@ function groupElapsed(calls: ToolCall[], running: boolean, now: number): number 
 }
 
 export const ExecutionGroup: React.FC<{ blocks: ExecutionBlock[]; stateKey?: string; active?: boolean }> = ({ blocks, stateKey, active }) => {
-  const [manualExpanded, setExpanded] = useDisclosure(`group:${stateKey ?? blocks[0].id}`)
+  // Folds belong to the reading surface, so the same turn in the main area and in a side viewer
+  // keeps its own state instead of the two transcripts opening each other's rows.
+  const path = useChatSurfaceKey()
+  const [manualExpanded, setExpanded] = useDisclosure(`group:${stateKey ?? blocks[0].id}`, path)
   const { calls, done, failed, running, status } = useMemo(() => summarizeExecution(blocks), [blocks])
-  const path = useSessionViewKey()
   const childKeys = useMemo(() => blocks.map(block => block.type === 'thinking'
     ? `thinking:${stateKey ? `${stateKey}:${block.contentIndex}` : block.id}`
     : `tool:${block.toolCall.id}`), [blocks, stateKey])

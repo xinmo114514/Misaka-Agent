@@ -27,6 +27,7 @@ from misaka.ai.utils.oauth.types import (
     OAuthDeviceCodeInfo,
     OAuthLoginCallbacks,
 )
+from misaka.config.proxy_settings import proxy_httpx_options
 from misaka.utils.async_lifecycle import settle
 from misaka.utils.values import signal_aborted
 
@@ -151,7 +152,7 @@ async def _http_post_form(url: str, fields: dict[str, str], signal: Any = None) 
 
     async def send() -> Any:
         options = _http_options.get()
-        async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT_MS / 1000, **(options(url) if options is not None else {})) as client:
+        async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT_MS / 1000, **(options(url) if options is not None else proxy_httpx_options(url))) as client:
             return await client.post(
                 url,
                 headers={

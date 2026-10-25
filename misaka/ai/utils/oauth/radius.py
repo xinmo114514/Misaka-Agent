@@ -73,6 +73,7 @@ from misaka.ai.utils.oauth.types import (
     OAuthSelectOption,
     OAuthSelectPrompt,
 )
+from misaka.config.proxy_settings import proxy_httpx_options
 from misaka.utils.values import signal_aborted
 
 # Loopback only, and not overridable, because these three constants are used twice over:
@@ -147,7 +148,7 @@ def _read_oauth_response_error(response: RadiusHttpResponse, message: str) -> OA
 
 async def _default_get_json(url: str, headers: dict[str, str], signal: Any) -> RadiusHttpResponse:
     async def request() -> RadiusHttpResponse:
-        async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT_MS / 1000) as client:
+        async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT_MS / 1000, **proxy_httpx_options(url)) as client:
             response = await client.get(url, headers=headers)
         return RadiusHttpResponse(status=response.status_code, body=response.text)
 
@@ -156,7 +157,7 @@ async def _default_get_json(url: str, headers: dict[str, str], signal: Any) -> R
 
 async def _default_post_form(url: str, fields: dict[str, str], signal: Any) -> RadiusHttpResponse:
     async def request() -> RadiusHttpResponse:
-        async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT_MS / 1000) as client:
+        async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT_MS / 1000, **proxy_httpx_options(url)) as client:
             response = await client.post(
                 url,
                 headers={"accept": "application/json", "content-type": "application/x-www-form-urlencoded"},

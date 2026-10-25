@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import asyncio
 import os
-import re
 import shlex
 import time
 
@@ -14,54 +13,37 @@ from misaka.core.platform import budget
 from misaka.core.platform import tasks as task_store
 from misaka.core.research import node as research_node
 from misaka.core.research import planner, runs, usage, window, workflow
+from misaka.core.research.options import (
+    QUESTION_TEXT,
+    parse_output,
+    parse_threshold,
+    wizard_questions,
+)
 from misaka.ui.tui.interactive.components.ask_user_question import (
     AskUserQuestionComponent,
 )
 from misaka.utils.values import read_field
 
 _CON = None
-_DEPTH_QUESTION = "How deep should this research run go?"
-_PARALLEL_QUESTION = "How many Last Order nodes may run at once?"
-_SISTER_PARALLEL_QUESTION = "How many Sister cards may be active per Last Order node?"
-_ROUNDS_QUESTION = "After its first cards are back, how many more times may a node send its Sisters out before it concludes?"
-_REVISIONS_QUESTION = "How many times may a node revise its conclusion after the red team's review?"
-_NODES_QUESTION = "How many nodes may the research graph hold in all?"
-_APPROVAL_QUESTION = "Should each research plan wait for your approval?"
-_THRESHOLD_QUESTION = "At what share of the context window should this run's sessions compact their context?"
-_OUTPUT_QUESTION = "How long may each reply in this run be, at most?"
+_DEPTH_QUESTION = QUESTION_TEXT["max_depth"]
+_PARALLEL_QUESTION = QUESTION_TEXT["parallel"]
+_SISTER_PARALLEL_QUESTION = QUESTION_TEXT["sister_parallel"]
+_ROUNDS_QUESTION = QUESTION_TEXT["max_followups"]
+_REVISIONS_QUESTION = QUESTION_TEXT["max_revisions"]
+_NODES_QUESTION = QUESTION_TEXT["max_nodes"]
+_APPROVAL_QUESTION = QUESTION_TEXT["plan_approval"]
+_THRESHOLD_QUESTION = QUESTION_TEXT["context_threshold"]
+_OUTPUT_QUESTION = QUESTION_TEXT["max_output_tokens"]
 _GLOBAL_THRESHOLD = "Global setting"
 _MODEL_OUTPUT = "Model default"
 
 
 def _parse_threshold(answer):
-    """``None`` for the global setting, else a fraction: ``0.6``, ``60%`` and ``60`` all mean 0.6."""
-    text = str(answer or "").strip()
-    if not text or text.startswith(_GLOBAL_THRESHOLD):
-        return None
-    try:
-        value = float(text.rstrip("%").strip())
-    except ValueError:
-        raise ValueError(f"Compaction threshold must be a fraction such as 0.6 or a percentage such as 60%, not {text!r}.") from None
-    if text.endswith("%") or value >= 1:
-        value /= 100
-    if not runs.MIN_CONTEXT_THRESHOLD <= value <= runs.MAX_CONTEXT_THRESHOLD:
-        raise ValueError(f"Compaction threshold must be between {runs.MIN_CONTEXT_THRESHOLD:g} and "
-                         f"{runs.MAX_CONTEXT_THRESHOLD:g} (10% to 95%), not {text!r}.")
-    return round(value, 4)
+    return parse_threshold(answer)
 
 
 def _parse_output(answer):
-    """``None`` for each model's own limit, else tokens: ``64k``, ``64000`` and ``64 k`` all mean 64000."""
-    text = str(answer or "").strip()
-    if not text or text.startswith(_MODEL_OUTPUT):
-        return None
-    match = re.fullmatch(r"(\d+(?:\.\d+)?)\s*([kK])?", text.replace(",", ""))
-    if match is None:
-        raise ValueError(f"Output limit must be a number of tokens such as 64000 or 64k, not {text!r}.")
-    tokens = int(float(match.group(1)) * (1000 if match.group(2) else 1))
-    if tokens < 1024:
-        raise ValueError(f"Output limit must be at least 1024 tokens, not {text!r}.")
-    return tokens
+    return parse_output(answer)
 
 
 def _session_limits_text(limits):
@@ -122,7 +104,8 @@ def _cfg():
 # The run limits /research takes as options, by flag.
 _OPTIONS = {"--depth": "max_depth", "--parallel": "parallel", "--sister-parallel": "sister_parallel",
             "--followups": "max_followups", "--revisions": "max_revisions", "--max-nodes": "max_nodes",
-            "--plan-approval": "plan_approval"}
+            "--plan-approval": "plan_approval", "--context-threshold": "context_threshold",
+            "--max-output-tokens": "max_output_tokens"}
 
 
 def _limits_text(limits):
@@ -199,7 +182,11 @@ def parse_command(raw):
                 value = words[0] if words else ""
             if not value:
                 raise ValueError(f"{option} requires an integer.\n{USAGE}")
-            if key == "plan_approval":
+            if key == "context_threshold":
+                selected[key] = parse_threshold(value)
+            elif key == "max_output_tokens":
+                selected[key] = parse_output(value)
+            elif key == "plan_approval":
                 approval = value.strip().lower()
                 if approval not in {"required", "automatic"}:
                     raise ValueError("Plan approval must be required or automatic.")
@@ -334,6 +321,11 @@ class ResearchPart:
             # A node's failure is Last Order's to answer -- retry it now, or leave it for the resume --
             # so it opens a turn; every other notice is the feed.
             failed = payload.get("stage") == "node_failed"
+            if failed and run_id:
+                from misaka.core.research.suspension import active_suspensions
+                if any(item["scope"] == "run" or item["nodeId"] == payload.get("node")
+                       for item in active_suspensions(con, run_id)):
+                    failed = False
             if failed:
                 payload[TURN] = True
             self.session.moments.send_message(
@@ -341,6 +333,30 @@ class ResearchPart:
                  "content": content, "details": payload},
                 {"deliverAs": "followUp", "triggerTurn": failed},
             )
+
+        def deliver_final_report(run_id, final=None, con=None):
+            from misaka.core.research import delivery
+            con = con if con is not None else _con()
+            run_row = runs.get(con, run_id)
+            if run_row is None:
+                return None
+            run = dict(run_row)
+            from misaka.core.research.suspension import active_suspensions
+            if any(item["scope"] == "run" for item in active_suspensions(con, run_id)):
+                return None  # A stop confirmation is not a research report delivery.
+            try:
+                prepared = delivery.prepare_final_delivery(con, run, self.session)
+            except Exception as error:  # noqa: BLE001 - artifact errors are structured delivery failures
+                delivery.record(con, run, "failed", error_code="RESEARCH_REPORT_UNAVAILABLE")
+                self.session.moments.send_message(
+                    {"customType": "research-error", "display": True,
+                     "content": f"Research report {run_id} needs attention: {error}",
+                     "details": {"run_id": run_id, "errorCode": "RESEARCH_REPORT_UNAVAILABLE"}},
+                    {"deliverAs": "followUp", "triggerTurn": False})
+                return None
+            return delivery.persist_final_delivery(con, run, prepared, self.session,
+                                                    self.session.moments.send_message)
+        self.deliver_final_report = deliver_final_report
 
         async def drive(run_id, ctx, *, resume=False, clarification=""):
             # While the run works in this window, the window's session runs with the run's own
@@ -371,23 +387,10 @@ class ResearchPart:
                          "details": {"run_id": run_id, "result": result.get("run")}},
                         {"deliverAs": "followUp", "triggerTurn": False},
                     )
-                else:
+                elif not result.get("suspension"):
                     final = result.get("final") or {}
-                    content = final.get("content") or f"Research run `{run_id}` finished: {result['reason']}."
-                    final_artifact = final.get("artifact") if result["reason"] == "done" else None
-                    if final_artifact:
-                        content = (f"# Delivered final report — `{run_id}`\n\n"
-                                   "This is the authoritative version; it supersedes this run's working drafts.\n"
-                                   f"Report: `{final['path']}`\n\n---\n\n" + content)
-                    if final.get("survey_path"):
-                        content += f"\n\n---\nSurvey by node: `{final['survey_path']}`"
-                    self.session.moments.send_message(
-                        {"customType": "research-final", "display": True,
-                         "content": content,
-                         "details": {"run_id": run_id, "result": result.get("run"), "final_artifact": final_artifact}},
-                        {"deliverAs": "followUp", "triggerTurn": False,
-                         **({"_deliveryId": f"research-final:{run_id}:{final_artifact}"} if final_artifact else {})},
-                    )
+                    from misaka.core.research.delivery import wait_for_persistence
+                    await wait_for_persistence(deliver_final_report(run_id, final=final, con=con))
             except asyncio.CancelledError:
                 raise
             except Exception as error:  # noqa: BLE001 - infrastructure failures stay visible, and the run stays resumable
@@ -416,10 +419,14 @@ class ResearchPart:
         # limits, its approval policy, its own session settings and the project folder.
         pending = {"choice": None}
         starts = set()
+        self._starts = starts
 
         async def begin(question, choice, ctx):
             from misaka.core.platform import cards as card_files
             await asyncio.to_thread(card_files.init_project, choice["workspace"], draft_brief=False, git=False)
+            task = asyncio.current_task()
+            if (task and task.cancelled()) or getattr(ctx, "aborted", False) or getattr(self.session, "_aborted", False):
+                return
             run = runs.create(
                 con, workspace=choice["workspace"], question=question,
                 limits={**choice["limits"], "plan_approval": choice["plan_approval"], **(choice["session"] or {})},
@@ -564,10 +571,25 @@ class ResearchPart:
                     run = _find_run(con, spec["run_id"], _workspace(ctx))
                     if not run:
                         raise ValueError("No research run to resume.")
-                    if run["status"] == "done":
-                        raise ValueError(f"Research run {run['id']} is done; start a new run.")
+                    # Task 4: ownership is checked BEFORE any done-run redelivery. The old
+                    # order let an unrelated window receive a run's final report.
                     saved = run["root_session"]
                     here = getattr(getattr(ctx, "sessionManager", None), "sessionFile", None)
+                    done_redelivery = run["status"] == "done" and dict(run).get("final_artifact")
+                    if (saved and (not here or os.path.realpath(saved) != os.path.realpath(here))
+                            and (done_redelivery or not spec.get("here"))):
+                        raise ValueError(
+                            f"Research run {run['id']} belongs to the Last Order conversation {saved}; open that "
+                            f"session and redeliver there. `/research resume {run['id']} --here` adopts this window "
+                            "instead, and its Last Order will not remember the run's earlier turns.")
+                    if run["status"] == "done":
+                        if dict(run).get("final_artifact"):
+                            from misaka.core.research.delivery import (
+                                wait_for_persistence,
+                            )
+                            await wait_for_persistence(deliver_final_report(run["id"], con=con))
+                            return
+                        raise ValueError(f"Research run {run['id']} is done; start a new run.")
                     if saved and here and not spec.get("here") and os.path.realpath(saved) != os.path.realpath(here):
                         # The run's Last Order is a conversation. Driving it from another window
                         # silently rebound root_session to a Last Order that remembered none of
@@ -610,7 +632,7 @@ class ResearchPart:
                             else planner.plan_waits_for_user(_cfg()))
                 choice = {"limits": {key: value for key, value in spec["limits"].items()
                                       if key != "plan_approval"}, "plan_approval": approval,
-                          "session": {}, "workspace": _workspace(ctx)}
+                          "session": session_overrides.clean(spec["limits"]), "workspace": _workspace(ctx)}
                 if spec.get("question"):
                     # `/research [--depth N] QUESTION`: no picker, no waiting for the next message.
                     pending["choice"] = None
@@ -625,86 +647,7 @@ class ResearchPart:
                         approval_options.reverse()
                     result = await ctx.ui.custom(
                         lambda tui, _theme, keybindings, done: AskUserQuestionComponent(
-                            [{
-                                "header": "Research depth",
-                                "question": _DEPTH_QUESTION,
-                                "multiSelect": False,
-                                "options": [
-                                    {"label": "2", "description": "Quick pass: branches go at most 2 levels deep."},
-                                    {"label": "5", "description": "Standard deep research: branches go at most 5 levels deep."},
-                                    {"label": "10", "description": "Exhaustive: branches go at most 10 levels deep. Slow and costly."},
-                                ],
-                            }, {
-                                "header": "LO parallelism",
-                                "question": _PARALLEL_QUESTION,
-                                "multiSelect": False,
-                                "options": [
-                                    {"label": "4", "description": "Default: up to 4 LO nodes at once; independent of Sister cards per LO."},
-                                    {"label": "1", "description": "One LO node at a time; lowest concurrent resource use."},
-                                    {"label": "8", "description": "Up to 8 LO nodes at once; more simultaneous sessions and requests."},
-                                ],
-                            }, {
-                                "header": "Sister cards per LO",
-                                "question": _SISTER_PARALLEL_QUESTION,
-                                "multiSelect": False,
-                                "options": [
-                                    {"label": "4", "description": "Default: up to 4 active Sister cards per LO; global admission limits still apply."},
-                                    {"label": "1", "description": "One active Sister card per LO at a time."},
-                                    {"label": "8", "description": "Up to 8 active Sister cards per LO, including multiple sessions of the same Sister."},
-                                ],
-                            }, {
-                                "header": "Follow-ups",
-                                "question": _ROUNDS_QUESTION,
-                                "multiSelect": False,
-                                "options": [
-                                    {"label": "2", "description": "Default: up to two more rounds of cards after the first, per node."},
-                                    {"label": "0", "description": "None: every node concludes from its first cards."},
-                                    {"label": "4", "description": "Up to four more rounds per node; thorough and slow, with more plans to review if approval is required."},
-                                ],
-                            }, {
-                                "header": "Revisions",
-                                "question": _REVISIONS_QUESTION,
-                                "multiSelect": False,
-                                "options": [
-                                    {"label": "2", "description": "Default: a node may rework its conclusion twice; each version is reviewed again."},
-                                    {"label": "0", "description": "None: every issue is answered by rebuttal, concession, another node, or left open."},
-                                    {"label": "4", "description": "Up to four reworks per node; thorough and slow."},
-                                ],
-                            }, {
-                                "header": "Nodes",
-                                "question": _NODES_QUESTION,
-                                "multiSelect": False,
-                                "options": [
-                                    {"label": "30", "description": "Default: up to 30 nodes in the research graph, the root included."},
-                                    {"label": "12", "description": "A small graph: a few alternatives explored in depth."},
-                                    {"label": "80", "description": "A large graph for questions with many genuine alternatives; slow and costly."},
-                                ],
-                            }, {
-                                "header": "Plan approval",
-                                "question": _APPROVAL_QUESTION,
-                                "multiSelect": False,
-                                "options": approval_options,
-                            }, {
-                                "header": "Compaction",
-                                "question": _THRESHOLD_QUESTION,
-                                "multiSelect": False,
-                                "options": [
-                                    {"label": _GLOBAL_THRESHOLD,
-                                     "description": "Default: the global setting every other session uses."},
-                                    {"label": "0.5", "description": "Compact at half the window: smaller requests, earlier summaries."},
-                                    {"label": "0.85", "description": "Compact late: more of the conversation stays verbatim; larger, costlier requests."},
-                                ],
-                            }, {
-                                "header": "Output limit",
-                                "question": _OUTPUT_QUESTION,
-                                "multiSelect": False,
-                                "options": [
-                                    {"label": _MODEL_OUTPUT,
-                                     "description": "Default: each model's own maximum (models.json or the built-in catalog)."},
-                                    {"label": "64k", "description": "At most 64,000 tokens per reply, or the model's own maximum if lower."},
-                                    {"label": "32k", "description": "At most 32,000 tokens per reply, or the model's own maximum if lower."},
-                                ],
-                            }],
+                            wizard_questions(_cfg()),
                             done,
                             tui=tui,
                             keybindings=keybindings,
@@ -736,7 +679,7 @@ class ResearchPart:
                     picked.update(context_threshold=_parse_threshold(answers.get(_THRESHOLD_QUESTION)),
                                   max_output_tokens=_parse_output(answers.get(_OUTPUT_QUESTION)))
                     limits = runs.normalize_limits({k: v for k, v in picked.items() if v is not None})
-                    choice.update(limits={key: limits[key] for key in _OPTIONS.values() if key != "plan_approval"},
+                    choice.update(limits={key: limits[key] for key in _OPTIONS.values() if key != "plan_approval" and key in limits},
                                   session=session_overrides.clean(limits))
                 pending["choice"] = choice
                 ctx.ui.notify(
@@ -776,6 +719,39 @@ class ResearchPart:
 
     def attach(self, session):
         self.session = session
+
+    async def recover_final_report(self, con=None):
+        """Opening/reconnecting the saved root recovers delivery, never reruns research."""
+        from misaka.core.research.delivery import snapshot, wait_for_persistence
+        from misaka.core.research.ingress import session_run
+        con = con if con is not None else _con()
+        run = session_run(self.session, con)
+        if run is None or run['status'] not in {'done', 'stopped', 'failed'} or not run['final_artifact']:
+            return None
+        key = (str(run['root_session']), run['id'], run['final_artifact'])
+        receipts = getattr(self.session, '_report_recovery_jobs', None)
+        if receipts is None:
+            receipts = self.session._report_recovery_jobs = {}
+        existing = receipts.get(key)
+        if existing is not None and existing.done():
+            receipts.pop(key, None)
+            existing = None
+        if existing is None:
+            async def recover():
+                status = await wait_for_persistence(self.deliver_final_report(run['id'], con=con))
+                receipt = snapshot(con, run['id'])
+                return status or (receipt.get('state') if receipt else None)
+            existing = asyncio.create_task(recover())
+            receipts[key] = existing
+        try:
+            return await asyncio.shield(existing)
+        finally:
+            if existing.done() and receipts.get(key) is existing:
+                receipts.pop(key, None)  # cache only in-flight work; failed/reconnected hosts may retry
+
+
+    async def session_start(self, _event, _ctx):
+        await self.recover_final_report()
 
     async def input(self, event, ctx):
         return await self._capture_question(event, ctx)

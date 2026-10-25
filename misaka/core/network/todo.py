@@ -436,6 +436,13 @@ class TodoPart:
     def attach(self, session):
         self.session = session
 
+    async def session_start(self, _event, _ctx):
+        row = self._owned_row()
+        if row is not None:
+            manager = self.session.sessionManager
+            self._bdb.set_runtime(self.con(), self.task_id, manager.sessionId, manager.sessionFile,
+                                  generation=row["generation"], claim_lock=row["claim_lock"])
+
     def con(self):
         if self._con is None:
             path = (os.environ.get("MISAKA_SISTER_OWNER_DB")

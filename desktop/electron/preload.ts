@@ -24,6 +24,12 @@ contextBridge.exposeInMainWorld('researchBridge', {
   },
 })
 
+contextBridge.exposeInMainWorld('diagnostics', {
+  report: (records: unknown) => {
+    if (Array.isArray(records)) ipcRenderer.send('diag:renderer', records)
+  },
+})
+
 contextBridge.exposeInMainWorld('theme', {
   onChange: (handler: (themeData: any) => void) => {
     const listener = (_e: Electron.IpcRendererEvent, data: any) => {
@@ -47,12 +53,15 @@ contextBridge.exposeInMainWorld('app', {
   openExternal: (url: string) => ipcRenderer.invoke('app:open-external', url),
   showItemInFolder: (targetPath: string) => ipcRenderer.invoke('app:show-item-in-folder', targetPath),
   startResearchBridge: (input: { cwd: string; sessionFile?: string | null }) =>
-    ipcRenderer.invoke('app:start-research-bridge', input),  setResearchActive: (state: boolean | { active: boolean; pendingCount: number }) =>
+    ipcRenderer.invoke('app:start-research-bridge', input),  setResearchActive: (state: boolean | { active?: boolean; pendingCount?: number; pendingStart?: boolean }) =>
     ipcRenderer.send('app:research-state', state),
-  onRequestClose: (handler: () => void) => {
-    const listener = () => handler()
+  /** The main process numbers every close request; a late or foreign answer must be ignorable. */
+  onRequestClose: (handler: (request: { closeRequestId: number }) => void) => {
+    const listener = (_e: Electron.IpcRendererEvent, request: { closeRequestId: number }) => handler(request)
     ipcRenderer.on('app:request-close', listener)
     return () => ipcRenderer.removeListener('app:request-close', listener)
   },
+  reportClosePresented: (closeRequestId: number) => ipcRenderer.send('app:close-presented', closeRequestId),
+  reportCloseCancelled: (closeRequestId: number) => ipcRenderer.send('app:close-cancelled', closeRequestId),
   confirmClose: (action: 'tray' | 'quit') => ipcRenderer.invoke('app:confirm-close', action),
 })

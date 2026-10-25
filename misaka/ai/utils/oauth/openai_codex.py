@@ -28,6 +28,7 @@ from misaka.ai.utils.oauth.types import (
     OAuthSelectPrompt,
 )
 from misaka.ai.utils.provider_env import get_provider_env_value
+from misaka.config.proxy_settings import proxy_httpx_options
 from misaka.core.provider_attribution import CLIENT_NAME
 from misaka.utils.values import signal_aborted
 
@@ -121,7 +122,7 @@ def _decode_jwt(token: str) -> dict[str, Any] | None:
 
 
 async def _exchange_authorization_code(code: str, verifier: str, redirect_uri: str = REDIRECT_URI) -> dict[str, Any]:
-    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT_MS / 1000) as client:
+    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT_MS / 1000, **proxy_httpx_options(TOKEN_URL)) as client:
         response = await client.post(
             TOKEN_URL,
             data={
@@ -154,7 +155,7 @@ async def _exchange_authorization_code(code: str, verifier: str, redirect_uri: s
 
 async def _refresh_access_token(refresh_token: str) -> dict[str, Any]:
     try:
-        async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT_MS / 1000) as client:
+        async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT_MS / 1000, **proxy_httpx_options(TOKEN_URL)) as client:
             response = await client.post(
                 TOKEN_URL,
                 data={
@@ -187,7 +188,7 @@ async def _refresh_access_token(refresh_token: str) -> dict[str, Any]:
 async def _start_device_auth(signal: Any = None) -> dict[str, Any]:
     """Ask OpenAI for a user code the person types on another device."""
     try:
-        async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT_MS / 1000) as client:
+        async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT_MS / 1000, **proxy_httpx_options(DEVICE_USER_CODE_URL)) as client:
             response = await client.post(DEVICE_USER_CODE_URL, json={"client_id": CLIENT_ID})
     except Exception as error:
         if signal_aborted(signal):
@@ -245,7 +246,7 @@ async def _poll_device_auth(device: dict[str, Any], signal: Any = None) -> dict[
 
     async def poll() -> dict[str, Any]:
         try:
-            async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT_MS / 1000) as client:
+            async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT_MS / 1000, **proxy_httpx_options(DEVICE_TOKEN_URL)) as client:
                 response = await client.post(
                     DEVICE_TOKEN_URL,
                     json={"device_auth_id": device["deviceAuthId"], "user_code": device["userCode"]},

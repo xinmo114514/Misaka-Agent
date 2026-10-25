@@ -11,7 +11,7 @@ import re
 import time
 import uuid
 from collections.abc import AsyncIterable, AsyncIterator, Callable, Mapping
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from email.utils import parsedate_to_datetime
 from typing import Any, Literal, TypedDict
 from urllib.parse import urlparse
@@ -55,6 +55,12 @@ from misaka.ai.utils.diagnostics import (
 )
 from misaka.ai.utils.event_stream import AssistantMessageEventStream, spawn_stream_task
 from misaka.ai.utils.headers import headers_to_record
+from misaka.ai.utils.network_route import (
+    httpx_client_options,
+    resolve_network_route,
+    sanitize_network_error,
+    snapshot_network_env,
+)
 from misaka.ai.utils.text import get_system_message_text
 from misaka.ai.utils.transcript import (
     get_declared_tools,
@@ -149,6 +155,7 @@ class _CachedWebSocketConnection:
     busy: bool
     idle_handle: asyncio.TimerHandle | None = None
     continuation: _CachedWebSocketContinuationState | None = None
+    route_key: tuple[Any, ...] | None = field(default=None, repr=False)
 
 
 async def _sleep(ms: int, signal: Any = None) -> None:
@@ -783,7 +790,8 @@ def _schedule_session_websocket_expiry(session_id: str, entry: _CachedWebSocketC
         if entry.busy:
             return
         _run_socket_close_nowait(entry.socket, 1000, "idle_timeout")
-        _websocket_session_cache.pop(session_id, None)
+        if _websocket_session_cache.get(session_id) is entry:
+            _websocket_session_cache.pop(session_id, None)
 
     entry.idle_handle = loop.call_later(SESSION_WEBSOCKET_CACHE_TTL_MS / 1000, expire)
 
@@ -793,6 +801,7 @@ async def _connect_websocket(
     headers: Mapping[str, str],
     signal: Any = None,
     timeout_ms: int | None = None,
+    env: Mapping[str, str] | None = None,
 ) -> Any:
     connector = await _get_websocket_connector()
     if connector is None:
@@ -804,11 +813,28 @@ async def _connect_websocket(
     websocket_headers.pop("OpenAI-Beta", None)
     websocket_headers.pop("openai-beta", None)
 
+    network_options = httpx_client_options(url, env)
+    selected_proxy = resolve_network_route(url, env).proxy_url
+    if selected_proxy:
+        proxy_uri = urlparse(selected_proxy)
+        if proxy_uri.scheme in {"socks5", "socks5h"} and proxy_uri.port is None:
+            # websockets defaults every non-HTTPS proxy to 80, including SOCKS.
+            # Make the SOCKS protocol default explicit without changing DNS mode.
+            selected_proxy = proxy_uri._replace(netloc=f"{proxy_uri.netloc}:1080").geturl()
+    tls_options = {}
+    if urlparse(url).scheme == "wss" or (selected_proxy or "").startswith("https:"):
+        ssl_context = httpx.create_ssl_context(verify=network_options["verify"], trust_env=False)
+        if urlparse(url).scheme == "wss":
+            tls_options["ssl"] = ssl_context
+        if (selected_proxy or "").startswith("https:"):
+            tls_options["proxy_ssl"] = ssl_context
     connectable = connector(
         url,
         additional_headers=websocket_headers,
         max_size=None,
         open_timeout=(timeout_ms / 1000) if timeout_ms is not None else None,
+        proxy=selected_proxy,
+        **tls_options,
     )
     connect_task = asyncio.create_task(maybe_await(connectable))
     abort_task = _create_abort_wait_task(signal)
@@ -837,9 +863,15 @@ async def _acquire_websocket(
     session_id: str | None,
     signal: Any = None,
     timeout_ms: int | None = None,
+    env: Mapping[str, str] | None = None,
 ) -> tuple[Any, _CachedWebSocketConnection | None, bool, Callable[[bool], None]]:
+    network_env = snapshot_network_env(env)
+    route = resolve_network_route(url, network_env)
+    route_key = (url, route.proxy_url, network_env["ssl_cert_file"], network_env["ssl_cert_dir"])
+    # Preserve four-argument connector test seams for callers without scoped env.
+    connect_options = {"env": network_env} if env is not None else {}
     if not session_id:
-        socket = await _connect_websocket(url, headers, signal, timeout_ms)
+        socket = await _connect_websocket(url, headers, signal, timeout_ms, **connect_options)
 
         def release(keep: bool = True) -> None:
             if not keep:
@@ -850,6 +882,13 @@ async def _acquire_websocket(
         return socket, None, False, release
 
     cached = _websocket_session_cache.get(session_id)
+    if cached is not None and cached.route_key != route_key:
+        if cached.idle_handle is not None:
+            cached.idle_handle.cancel()
+        _websocket_session_cache.pop(session_id, None)
+        if not cached.busy:
+            _run_socket_close_nowait(cached.socket)
+        cached = None
     if cached is not None:
         if cached.idle_handle is not None:
             cached.idle_handle.cancel()
@@ -859,9 +898,10 @@ async def _acquire_websocket(
             cached.busy = True
 
             def release(keep: bool = True) -> None:
-                if not keep or not _is_websocket_reusable(cached.socket):
+                if not keep or not _is_websocket_reusable(cached.socket) or _websocket_session_cache.get(session_id) is not cached:
                     _run_socket_close_nowait(cached.socket)
-                    _websocket_session_cache.pop(session_id, None)
+                    if _websocket_session_cache.get(session_id) is cached:
+                        _websocket_session_cache.pop(session_id, None)
                     return
                 cached.busy = False
                 _schedule_session_websocket_expiry(session_id, cached)
@@ -869,7 +909,7 @@ async def _acquire_websocket(
             return cached.socket, cached, True, release
 
         if cached.busy:
-            socket = await _connect_websocket(url, headers, signal, timeout_ms)
+            socket = await _connect_websocket(url, headers, signal, timeout_ms, **connect_options)
 
             def release(keep: bool = True) -> None:
                 _run_socket_close_nowait(socket)
@@ -880,12 +920,12 @@ async def _acquire_websocket(
             _run_socket_close_nowait(cached.socket)
             _websocket_session_cache.pop(session_id, None)
 
-    socket = await _connect_websocket(url, headers, signal, timeout_ms)
-    entry = _CachedWebSocketConnection(socket=socket, busy=True)
+    socket = await _connect_websocket(url, headers, signal, timeout_ms, **connect_options)
+    entry = _CachedWebSocketConnection(socket=socket, busy=True, route_key=route_key)
     _websocket_session_cache[session_id] = entry
 
     def release(keep: bool = True) -> None:
-        if not keep or not _is_websocket_reusable(entry.socket):
+        if not keep or not _is_websocket_reusable(entry.socket) or _websocket_session_cache.get(session_id) is not entry:
             _run_socket_close_nowait(entry.socket)
             if entry.idle_handle is not None:
                 entry.idle_handle.cancel()
@@ -1070,6 +1110,7 @@ async def process_websocket_stream(
         session_id,
         _option(options, "signal"),
         _option(options, "timeoutMs"),
+        env=_option(options, "env"),
     )
     keep_connection = True
     use_cached_context = _option(options, "transport") in {"websocket-cached", "auto"}
@@ -1149,6 +1190,7 @@ def stream_openai_codex_responses(
     options: StreamOptions | dict[str, Any] | None = None,
 ) -> AssistantMessageEventStream:
     stream = AssistantMessageEventStream()
+    options = {**(dict(options) if options is not None else {}), "env": snapshot_network_env(_option(options, "env"))}
     normalized_context = resolve_transcript(
         context, getattr(getattr(model, "compat", None), "supportsMidConvoSystemMessages", None)
     )
@@ -1172,7 +1214,11 @@ def stream_openai_codex_responses(
         )
 
         response: httpx.Response | None = None
+        route = None
+        api_key = ""
         try:
+            url = resolve_codex_url(model.baseUrl)
+            route = resolve_network_route(url, _option(options, "env"))
             api_key = _option(options, "apiKey") or get_env_api_key(model.provider) or ""
             if not api_key:
                 raise RuntimeError(f"No API key for provider: {model.provider}")
@@ -1250,7 +1296,7 @@ def stream_openai_codex_responses(
                         output,
                         create_assistant_message_diagnostic(
                             "provider_transport_failure",
-                            error,
+                            RuntimeError(sanitize_network_error(error, route, secrets=(api_key,))),
                             {
                                 "configuredTransport": transport,
                                 **({} if websocket_state["started"] else {"fallbackTransport": "sse"}),
@@ -1259,19 +1305,20 @@ def stream_openai_codex_responses(
                                 if websocket_state["started"]
                                 else "before_message_stream_start",
                                 "requestBytes": len(body_json.encode("utf-8")),
+                                "route": route.public_details(),
                             },
                         ),
                     )
                     if session_id:
                         _websocket_fallback_sessions.add(session_id)
-                        _record_websocket_failure(session_id, error)
+                        _record_websocket_failure(session_id, sanitize_network_error(error, route, secrets=(api_key,)))
                         _record_websocket_sse_fallback(session_id)
                     break
 
             url = resolve_codex_url(model.baseUrl)
             signal = _option(options, "signal")
 
-            async with httpx.AsyncClient(follow_redirects=True, timeout=_resolve_codex_timeout(options)) as client:
+            async with httpx.AsyncClient(follow_redirects=True, timeout=_resolve_codex_timeout(options), **httpx_client_options(url, _option(options, "env"))) as client:
                 retries = _option(options, "maxRetries")
                 retries = MAX_RETRIES if retries is None else max(0, int(retries))
                 for attempt in range(retries + 1):
@@ -1342,7 +1389,11 @@ def stream_openai_codex_responses(
                 except AttributeError:
                     continue
             output.stopReason = "aborted" if signal_aborted(_option(options, "signal")) else "error"
-            output.errorMessage = str(error)
+            output.errorMessage = sanitize_network_error(error, route, secrets=(api_key,))
+            append_assistant_message_diagnostic(output, create_assistant_message_diagnostic(
+                "provider_network_failure", RuntimeError(output.errorMessage),
+                {"route": route.public_details() if route is not None else None, "errorType": type(error).__name__},
+            ))
             stream.push(ErrorEvent(reason=output.stopReason, error=output), cause=error)
             stream.end()
         finally:

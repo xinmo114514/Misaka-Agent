@@ -70,6 +70,15 @@ def _script(lab, *, reviews, alternatives, dispositions, decide, cards_failed=No
             if row["id"] not in scope or row["status"] == "done":
                 continue
             payload = {"summary": "done", "artifacts": [], "artifact_digests": {}, "findings": []}
+            if row["research_kind"] == "research":
+                from misaka.core.network import worker
+                output = Path(row["output_dir"], worker.contract_deliverable(row) or "findings.md")
+                output.parent.mkdir(parents=True, exist_ok=True)
+                if not output.exists():
+                    output.write_text("Fixture source checked; interpretation remains bounded.\n", encoding="utf-8")
+                relative = str(output.relative_to(row["workspace"]))
+                payload["artifacts"] = [relative]
+                payload["artifact_digests"] = {relative: hashlib.sha256(output.read_bytes()).hexdigest()}
             if row["research_kind"] == "red_team":
                 payload["issues"] = reviews[row["generation"]]      # one card: each review is an attempt
                 critique = Path(row["output_dir"], runs.versioned("critique.md", row["generation"]))
@@ -441,12 +450,13 @@ async def test_a_card_that_failed_for_good_goes_back_to_its_sister_when_last_ord
     """2026-09-29: a card refused by the provider after its Sister's own attempts failed its whole
     node, which then waited for the root to retry it. The node's Last Order decides first."""
     con, run, root = lab.con, lab.run, lab.root
+    _two_cards(lab)  # A partial failure may still be adjudicated; all-stopped requires explicit resume.
     _script(lab, reviews={1: []}, alternatives=[], dispositions=None,
             decide=lambda con_: {"decisions": [], "declined": []},
             cards_failed=lambda con_, key: {"decision": "retry", "reason": "the provider refused; it passes"})
     _fail_once(lab, "fiscal")
     assert await _expand(lab, _Runner(con)) == "closed"
-    [card] = runs.tasks(con, run["id"], kind="research", node_id=root["id"])
+    [card] = [row for row in runs.tasks(con, run["id"], kind="research", node_id=root["id"]) if row["local_id"] == "fiscal"]
     assert (card["status"], card["generation"]) == ("done", 2)
     [key] = [k for k in lab.prompts if k.startswith("cards_failed:")]
     assert key == runs.cards_failed_key([{"id": card["id"], "generation": 1}]) and "502" in lab.prompts[key]

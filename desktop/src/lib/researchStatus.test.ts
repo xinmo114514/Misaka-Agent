@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { researchPhaseLabel, researchNodeLabel, researchOverview } from './researchStatus'
+import { researchRunLabel, researchPhaseLabel, researchNodeLabel, researchOverview } from './researchStatus'
 
 describe('research phase labels', () => {
   it.each([
@@ -43,3 +43,20 @@ describe('concurrent node overview', () => {
     ])
   })
 })
+
+describe('researchRunLabel terminal priority', () => {
+  it('keeps a failed run failed even when its phase still says active', () => {
+    expect(researchRunLabel({ status: 'failed', phase: 'active' })).toBe('失败')
+  })
+
+  it('shows the phase for an active run', () => {
+    expect(researchRunLabel({ status: 'active', phase: 'executing' })).toBe('执行中')
+  })
+
+  it('treats stopped and done as terminal too', () => {
+    expect(researchRunLabel({ status: 'stopped', phase: 'active' })).toBe('已停止')
+    expect(researchRunLabel({ status: 'done', phase: 'finalizing' })).toBe('已完成')
+  })
+})
+it.each([['stopping','正在停止'],['waiting_input','待用户输入']])('run status %s takes priority over old active phase', (status,label) => {expect(researchRunLabel({status,phase:'active'})).toBe(label)})
+it.each([['partial','已暂停'],['cancelled','已停止'],['closed','已完成']])('terminal %s has a localized label', (status,label)=>{expect(researchRunLabel({status,phase:'active'})).toBe(label)})

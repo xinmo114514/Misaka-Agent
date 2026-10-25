@@ -1,6 +1,7 @@
 import React, { useEffect, useRef, useState } from 'react'
 import { Loader2, X } from 'lucide-react'
 import type { CompactStatus } from '../../store/useSessionStore'
+import { consumeEscape, ESCAPE_PRIORITY, useEscapeLayer } from '../../lib/useEscapeLayer'
 
 export interface CompactDialogProps {
   open: boolean
@@ -24,6 +25,11 @@ export const CompactDialog: React.FC<CompactDialogProps> = ({
   const [instructions, setInstructions] = useState('')
   const textareaRef = useRef<HTMLTextAreaElement>(null)
   const restoreFocusRef = useRef<HTMLElement | null>(null)
+  useEscapeLayer(open, event => {
+    consumeEscape(event)
+    if (busy) onCancelOperation()
+    else onClose()
+  }, ESCAPE_PRIORITY.dialog)
 
   useEffect(() => {
     if (!open) return
@@ -37,20 +43,6 @@ export const CompactDialog: React.FC<CompactDialogProps> = ({
     if (open) return
     restoreFocusRef.current?.focus?.()
   }, [open])
-
-  useEffect(() => {
-    if (!open) return
-    const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key !== 'Escape') return
-      event.preventDefault()
-      // A running compaction is the only thing that can be cancelled; the dialog stays put
-      // so the terminal state is still on screen.
-      if (busy) onCancelOperation()
-      else onClose()
-    }
-    document.addEventListener('keydown', onKeyDown)
-    return () => document.removeEventListener('keydown', onKeyDown)
-  }, [open, busy, onCancelOperation, onClose])
 
   if (!open) return null
 

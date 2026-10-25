@@ -59,6 +59,7 @@ from misaka.ai.utils.oauth.types import (
     OAuthPrompt,
 )
 from misaka.ai.utils.provider_env import get_provider_env_value
+from misaka.config.proxy_settings import proxy_httpx_options
 from misaka.utils.values import signal_aborted
 
 AUTHORIZE_URL = "https://openrouter.ai/auth"
@@ -162,7 +163,7 @@ async def _post_json(url: str, body: str, headers: dict[str, str], *, transport:
     pinned 0.28.1 `httpx._content.encode_json` serialises with `separators=(",", ":")` too,
     so a `json=` dict would come out compact as well.
     """
-    async with httpx.AsyncClient(timeout=TOKEN_EXCHANGE_TIMEOUT_MS / 1000, transport=transport) as client:
+    async with httpx.AsyncClient(timeout=TOKEN_EXCHANGE_TIMEOUT_MS / 1000, transport=transport, **proxy_httpx_options(url)) as client:
         response = await client.post(url, content=body, headers=headers)
     return response.status_code, response.text
 

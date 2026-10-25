@@ -50,7 +50,8 @@ async def test_recruitment_that_never_settles_fails_with_a_retryable_error(promp
     # The coordinator never calls desktop_recruit_agent and never finishes its turn.
     stalled = asyncio.Event()
 
-    def stream(actual_model, context, options=None):
+    async def stream(actual_model, context, options=None):
+        await stalled.wait()
         out = AssistantMessageEventStream()
         reply = AssistantMessage(content=[{'type': 'text', 'text': 'thinking'}], api=model.api,
                                  provider=model.provider, model=model.id, stopReason='stop', timestamp=1,
@@ -62,13 +63,10 @@ async def test_recruitment_that_never_settles_fails_with_a_retryable_error(promp
 
     session.agent.streamFn = stream
     controller = DesktopResearchController(session, lambda payload: None).attach()
+    await controller.set_team_model(model.provider, model.id, role='last_order')
     await session.bindExtensions({'mode': 'json'})
     con = controller.scope.native.module('misaka.core.research.wiring.research')._con()
 
-    async def never_idle():
-        await stalled.wait()
-
-    monkeypatch.setattr(session, 'waitForIdle', never_idle)
     try:
         with pytest.raises(submissions.ResearchInputError) as caught:
             await asyncio.wait_for(controller.send_message(
@@ -101,3 +99,64 @@ async def test_recruitment_timeout_is_reported_as_a_structured_bridge_ack(prompt
     assert ack['errorCode'] == 'RESEARCH_RECRUITMENT_TIMEOUT'
     assert ack['errorStage'] == 'recruitment'
     assert ack['retryable'] is True
+
+
+async def test_recruitment_stream_call_that_never_completes_times_out(prompt_home, monkeypatch):  # noqa: F811
+    """When the provider stream stalls during sendCustomMessage, recruitment timeout must fire."""
+    from misaka.ai.models import get_models
+    from misaka.ai.utils.event_stream import AssistantMessageEventStream
+    from misaka.core import wiring
+    from misaka.core.auth_storage import AuthStorage
+    from misaka.core.research import submissions
+    from misaka.core.resource_loader import DefaultResourceLoader
+    from misaka.core.sdk import create_agent_session
+    from misaka.core.session_manager import SessionManager
+    from misaka.core.settings_manager import SettingsManager
+    from misaka.desktop_research import runtime
+    from misaka.desktop_research.runtime import DesktopResearchController
+
+    monkeypatch.setattr(runtime, "RECRUITMENT_TURN_TIMEOUT_SECONDS", 0.5)
+
+    workspace = prompt_home / "workspace_recruit_stream_timeout"
+    workspace.mkdir()
+    _, assembly, _ = wiring.role_session_setup(str(prompt_home / "profiles/last_order"), str(workspace),
+                                               research_context=True, research_host=True)
+    loader = DefaultResourceLoader({"cwd": str(workspace), "agentDir": str(prompt_home / "agent"),
+                                    "noExtensions": True, "noPromptTemplates": True, "noThemes": True})
+    await loader.reload()
+    model = next(iter(get_models("openai")))
+    auth = AuthStorage.inMemory()
+    auth.setRuntimeApiKey(model.provider, "deterministic-fixture")
+    result = await create_agent_session({
+        "cwd": str(workspace), "agentDir": str(prompt_home / "agent"), "model": model, "authStorage": auth,
+        "resourceLoader": loader,
+        "settingsManager": SettingsManager.inMemory({"compaction": {"enabled": False}, "retry": {"enabled": False}}),
+        "sessionManager": SessionManager.create(str(workspace), str(prompt_home / "sessions")),
+        "parts": assembly.parts, "customTools": assembly.custom_tools})
+    session = result["session"]
+    session.research_host = True
+
+    # The stream never emits or ends: simulates an infinite provider hang during sendCustomMessage
+    def hanging_stream(actual_model, context, options=None):
+        return AssistantMessageEventStream()
+
+    session.agent.streamFn = hanging_stream
+    controller = DesktopResearchController(session, lambda payload: None).attach()
+    await controller.set_team_model(model.provider, model.id, role='last_order')
+    await session.bindExtensions({"mode": "json"})
+    con = controller.scope.native.module("misaka.core.research.wiring.research")._con()
+
+    try:
+        with pytest.raises(submissions.ResearchInputError) as caught:
+            await asyncio.wait_for(controller.send_message(
+                {"sessionId": session.sessionId, "requestId": "stream-hang-input",
+                 "text": "A question whose recruitment model call hangs",
+                 "limits": {"max_depth": 0, "max_nodes": 1}}, con), timeout=10)
+        error = caught.value
+        assert error.errorCode == "RESEARCH_RECRUITMENT_TIMEOUT"
+        assert error.errorStage == "recruitment"
+        assert error.retryable is True
+    finally:
+        await controller.close()
+        await session.moments.session_shutdown({"type": "session_shutdown", "reason": "test"})
+        session.dispose()

@@ -1,4 +1,5 @@
 import { expect, test } from '@playwright/test'
+import { expandFocusRoles, toggleFocusProcess } from './focusUi'
 test.setTimeout(60000)
 
 test.beforeEach(async ({ page }) => {
@@ -16,11 +17,18 @@ test.beforeEach(async ({ page }) => {
   const input = page.getByRole('textbox', { name: '给 Misaka 发送任务' })
   await input.fill('对照公开文献证据')
   await input.press('Enter')
-  await expect(page.getByTestId('research-run-pill')).toBeVisible()
+  // A new run is configured before it starts; these cases read the run itself.
+  const wizard = page.getByRole('dialog', { name: '研究参数确认' })
+  await expect(wizard).toBeVisible()
+  await wizard.getByRole('checkbox', { name: '计划审批' }).uncheck()
+  await wizard.getByRole('button', { name: '确认并开始研究' }).click()
+  await expect(page.locator('[data-research-focus-view]')).toBeVisible()
 })
 
 test('uses the effective team model, retains only selected roles, and surfaces conflicts', async ({ page }) => {
-  await page.getByRole('button', { name: '展开研究过程' }).click()
+  // The team and its retention step live in the run's 研究过程 panel, not in the transcript.
+  await toggleFocusProcess(page)
+  await expandFocusRoles(page)
   const team = page.getByTestId('desktop-research-team')
   await expect(team.getByText('证据核验员', { exact: true })).toBeVisible()
   await expect(team.getByText('misaka-fixture/full', { exact: true })).toHaveCount(2)

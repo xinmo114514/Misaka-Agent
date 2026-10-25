@@ -26,7 +26,7 @@ dependencies = [
     # engine/ai (formerly harn_ai)
     "pydantic>=2.10",
     "jsonschema>=4.23",
-    "httpx>=0.28",
+    "httpx[socks]>=0.28",
     # CCB MCP transport parity: use the official SDK for HTTP/SSE/WebSocket.
     "mcp[ws]>=1.30,<2",
     # engine/agent (formerly harn_agent)
@@ -61,13 +61,15 @@ dependencies = [
     "openpyxl>=3.1",
     "python-pptx>=1.0",
     "tiktoken>=0.14.0",
+    "python-socks[asyncio]>=2.7",
 ]
 
 [project.optional-dependencies]
 # Provider SDKs are extras: a user install picks the ones it talks to.
 anthropic = ["anthropic>=0.45"]
 openai = ["openai>=1.60"]
-google = ["google-genai>=1.0"]
+# Explicit HTTPX transports (including SOCKS and force-direct) use these verified SDK seams.
+google = ["google-genai>=2.19.0"]
 bedrock = ["boto3>=1.35"]
 mistral = ["mistralai>=1.5"]
 providers = ["misaka[anthropic,openai,google,bedrock,mistral]"]

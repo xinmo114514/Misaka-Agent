@@ -41,6 +41,7 @@ from misaka.ai.utils.oauth.types import (
     OAuthLoginCallbacks,
 )
 from misaka.ai.utils.provider_env import get_provider_env_value
+from misaka.config.proxy_settings import proxy_httpx_options
 from misaka.utils.values import signal_aborted
 
 CLIENT_ID = "17e5f671-d194-4dfb-9706-5516cb48c098"
@@ -85,19 +86,19 @@ PostForm = Callable[[str, dict[str, str], Any], Awaitable[KimiHttpResponse]]
 SleepMs = Callable[[float, Any], Awaitable[None]]
 
 
-def _new_http_client() -> httpx.AsyncClient:
+def _new_http_client(endpoint: str) -> httpx.AsyncClient:
     """The client the production path uses; a seam so the path itself can be tested.
 
     Upstream's 30s ``AbortSignal.timeout`` is this client's timeout (see the module
     docstring). Kept as its own function so a test can replace it without touching the
     ``httpx`` module itself.
     """
-    return httpx.AsyncClient(timeout=REQUEST_TIMEOUT_MS / 1000)
+    return httpx.AsyncClient(timeout=REQUEST_TIMEOUT_MS / 1000, **proxy_httpx_options(endpoint))
 
 
 async def _default_post_form(url: str, fields: dict[str, str], signal: Any) -> KimiHttpResponse:
     async def request() -> KimiHttpResponse:
-        async with _new_http_client() as client:
+        async with _new_http_client(url) as client:
             response = await client.post(url, headers=FORM_HEADERS, content=urlencode(fields).encode())
         return KimiHttpResponse(status=response.status_code, body=response.text)
 

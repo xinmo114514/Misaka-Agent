@@ -82,7 +82,7 @@ async def test_real_root_receives_first_question_resume_and_done_followup(prompt
     control = session_control.for_session(session)
     try:
         first = await ingress.send({"text": "Compare the evidence", "sessionId": session.sessionId,
-                                    "requestId": "first"}, con)
+                                    "requestId": "first", "limits": {"plan_approval": False}}, con)
         assert first["mode"] == "start" and first["runId"] is None
         await until(lambda: workflow_calls and runs.listing(con)[0]["status"] == "waiting_input")
         run = runs.listing(con)[0]

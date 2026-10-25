@@ -27,12 +27,16 @@ class Controller:
         return {"team": {"teamId": "team-1", "scene": "desktop_research", "members": []},
                 "modelBinding": {"effective": {"provider": "fixture", "modelId": "a"},
                                  "target": None, "epoch": 1, "state": "ready"}}
-    async def set_team_model(self, provider, model_id, action="switch"):
+    async def set_team_model(self, provider, model_id, action="switch", role="all"):
         self.calls.append(action)
+        self.calls.append(("model-role", role))
         if action == "switch":
             await self.gate.wait()
         else:
             self.gate.set()
+        return self.snapshot()
+    async def set_team_thinking(self, level, role="last_order"):
+        self.calls.append(("thinking-role", role, level))
         return self.snapshot()
     async def retain_roles(self, selections, request_id, con):
         self.calls.append(("retain", selections, request_id))
@@ -80,7 +84,22 @@ async def test_cancel_model_switch_can_reach_pending_switch_on_same_transport(mo
     replies = {item.get("requestId"): item for item in result if item.get("type") == "ack"}
     assert replies["switch"]["ok"] is True
     assert replies["cancel"]["ok"] is True
-    assert Controller.calls[:2] == ["switch", "cancel"]
+    assert [call for call in Controller.calls if isinstance(call, str)][:2] == ["switch", "cancel"]
+    assert ("model-role", "all") in Controller.calls
+
+
+@pytest.mark.parametrize("role", ["last_order", "sister"])
+async def test_role_model_and_thinking_are_forwarded_without_changing_scope(monkeypatch, role):
+    result = await bridge(monkeypatch, [
+        {"type": "desktop_set_team_model", "sessionId": "test-session-123", "role": role,
+         "action": "cancel", "requestId": "role-model"},
+        {"type": "set_thinking", "sessionId": "test-session-123", "role": role,
+         "level": "medium", "requestId": "role-thinking"},
+    ])
+    acks = {row.get("requestId"): row for row in result if row.get("type") == "ack"}
+    assert acks["role-model"]["ok"] and acks["role-thinking"]["ok"]
+    assert ("model-role", role) in Controller.calls
+    assert ("thinking-role", role, "medium") in Controller.calls
 
 @pytest.mark.asyncio
 async def test_team_commands_reject_mismatched_session_and_preserve_ordinary_roots(monkeypatch):
@@ -161,13 +180,16 @@ async def test_desktop_research_prompt_question_also_uses_team_intake(monkeypatc
 
 @pytest.mark.parametrize("research", [True, False])
 def test_bridge_prepares_only_research_assembly_before_opening(monkeypatch, tmp_path, research):
+    import os
+
     from misaka.core import wiring
     from misaka.core.platform import session as platform_session
     from misaka.desktop_research import runtime
 
     assembly = SimpleNamespace(prepared=False)
     calls = []
-    monkeypatch.setattr(desktop_bridge, "_clean_broken_local_proxies", lambda: None)
+    proxy = "http://configured-proxy.test:43129"
+    monkeypatch.setenv("HTTP_PROXY", proxy)
     monkeypatch.setattr(wiring, "role_session_setup", lambda *_args, **_kwargs: ([], assembly, {}))
     def prepare(value):
         assert value is assembly
@@ -187,4 +209,4 @@ def test_bridge_prepares_only_research_assembly_before_opening(monkeypatch, tmp_
     args = SimpleNamespace(cwd=str(tmp_path), research_context=research)
     assert desktop_bridge.main(args) == 0
     assert calls == (["prepare", "open"] if research else ["open"])
-
+    assert os.environ["HTTP_PROXY"] == proxy

@@ -14,7 +14,7 @@ export const ResearchFinalReport: React.FC<ResearchFinalReportProps> = ({ messag
   const runId = message.details?.run_id || message.details?.runId || ''
   const content = message.content || ''
   const status = message.details?.result?.status || message.details?.status
-  const final = !status || status === 'done'
+  const final = message.details?.incomplete !== true && (!status || status === 'done')
   const workspace = useSessionStore(s => s.researchCards[runId]?.workspace || s.researchBinding?.workspace)
 
   // Extract report path from message details or content
@@ -66,6 +66,7 @@ export const ResearchFinalReport: React.FC<ResearchFinalReportProps> = ({ messag
             <div className="font-semibold text-text-main text-xs flex items-center gap-1.5">
               <span>{final ? '研究最终报告' : '研究阶段性报告'}</span>
               {runId && <span className="font-mono text-[10.5px] text-dim">({runId})</span>}
+              {!final && <span className="text-[10px] text-warning">不完整报告</span>}
             </div>
             {reportPath && <div className="text-[10px] text-muted font-mono">{reportPath}</div>}
           </div>

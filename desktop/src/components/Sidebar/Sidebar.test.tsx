@@ -3,14 +3,35 @@ import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/re
 import { Sidebar } from './Sidebar'
 import { SessionDeleteDialog } from '../SessionDeleteDialog'
 import { useSessionStore } from '../../store/useSessionStore'
+import { useResearchRunStore } from '../../store/useResearchRunStore'
 
 afterEach(() => { cleanup(); vi.restoreAllMocks() })
 
 beforeEach(() => {
+  useResearchRunStore.setState({ runs: {} })
   useSessionStore.setState({
     sessions: [], projects: [], currentWorkspace: 'C:/Misaka-Agent', recentWorkspaces: ['C:/New-project'],
     currentSessionPath: 'C:/Misaka-Agent/active.jsonl', sessionFilterScope: 'all',
   })
+})
+it('shows every executor in a workspace group, including cards beyond the four visible tiles', () => {
+  useResearchRunStore.setState({ runs: { r: { runId: 'r', run: { id: 'r', question: 'Question', workspace: 'C:/Misaka-Agent', status: 'active', phase: 'cards', nodes: 1, tasks: 6 },
+    graph: { run: 'r', question: 'Question', status: 'active', phase: 'cards', nodes: [{ id: 'n1', question: 'Node', depth: 0,
+      status: 'active', kind: 'root', parents: [], children: [] }] },
+    sessions: [{ executorId: 'root-executor', sessionId: 'root', sessionFile: 'root.jsonl', nodeId: 'n1', taskId: null,
+      role: 'last_order' as const, label: 'Last Order root', workspace: 'C:/Misaka-Agent', status: 'running', generation: 1,
+      attempt: 1, startedAt: Date.now() - 120000, endedAt: null, error: null },
+    ...Array.from({ length: 6 }, (_, index) => ({ executorId: `executor-${index}`, sessionId: null, sessionFile: null,
+      nodeId: 'n1', taskId: `task-${index}`, role: 'sister' as const, label: `Agent ${index}`, workspace: 'C:/Misaka-Agent',
+      status: index ? 'ready' : 'running', generation: 1, attempt: 1, startedAt: index ? null : Date.now() - 120000, endedAt: null, error: null }))],
+    suspension: null, suspensions: [] } } })
+  render(<Sidebar />)
+  expect(screen.getByText('Sessions · Agents')).toBeInTheDocument()
+  for (let index = 0; index < 6; index++) expect(screen.getByText(`Agent ${index}`)).toBeInTheDocument()
+  expect(screen.getAllByText('Sister').length).toBe(6)
+  expect(screen.getByText('Last Order · 1')).toBeInTheDocument()
+  expect(screen.getByText('Sisters / Agents · 6')).toBeInTheDocument()
+  expect(screen.getAllByText(/2m/).length).toBeGreaterThan(0)
 })
 
 it('renders projects and recent conversations as separate compact sections', () => {

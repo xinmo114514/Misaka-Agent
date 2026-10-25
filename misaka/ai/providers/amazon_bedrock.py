@@ -82,7 +82,7 @@ from misaka.ai.utils.estimate import clamp_max_tokens_to_context
 from misaka.ai.utils.event_stream import AssistantMessageEventStream, spawn_stream_task
 from misaka.ai.utils.headers import headers_to_record
 from misaka.ai.utils.json_parse import StreamingArgs
-from misaka.ai.utils.node_http_proxy import create_http_proxy_agents_for_target
+from misaka.ai.utils.network_route import resolve_network_route, snapshot_network_env
 from misaka.ai.utils.provider_env import get_provider_env_value
 from misaka.ai.utils.sanitize_unicode import sanitize_surrogates
 from misaka.ai.utils.text import get_system_message_text
@@ -186,8 +186,28 @@ def create_client(model: Model, options: StreamOptions | dict[str, Any] | None =
         client_kwargs["aws_secret_access_key"] = settings.credentials.secretAccessKey
         if settings.credentials.sessionToken:
             client_kwargs["aws_session_token"] = settings.credentials.sessionToken
-    if settings.config_kwargs:
-        client_kwargs["config"] = Config(**settings.config_kwargs)
+    config_kwargs = dict(settings.config_kwargs)
+    network_env = snapshot_network_env(_option(options, "env"))
+    if network_env["ssl_cert_dir"] and not network_env["ssl_cert_file"]:
+        raise ValueError("Bedrock SDK transport does not support SSL_CERT_DIR; use SSL_CERT_FILE")
+    if network_env["ssl_cert_file"]:
+        client_kwargs["verify"] = network_env["ssl_cert_file"]
+        config_kwargs["proxies_config"] = {"proxy_ca_bundle": network_env["ssl_cert_file"]}
+    if settings.endpoint_url is None:
+        # Let the public SDK resolve endpoint env/profile overrides, FIPS and
+        # partition rules before interpreting NO_PROXY. Construction sends no
+        # model request. The temporary client's route is explicitly disabled.
+        discovery_kwargs = {**client_kwargs, "config": Config(**{**config_kwargs, "proxies": {}})}
+        discovery_client = session.client("bedrock-runtime", **discovery_kwargs)
+        try:
+            endpoint_url = discovery_client.meta.endpoint_url
+            config_kwargs.update(_proxy_config(endpoint_url, _option(options, "env")))
+        finally:
+            discovery_client.close()
+        # Pin the resolved endpoint so changes between construction phases do
+        # not change the endpoint after its frozen route has been selected.
+        client_kwargs["endpoint_url"] = endpoint_url
+    client_kwargs["config"] = Config(**config_kwargs)
 
     client = session.client("bedrock-runtime", **client_kwargs)
     _register_request_overrides(client, settings.default_headers, settings.bearer_token)
@@ -234,12 +254,6 @@ def build_client_settings(model: Model, options: StreamOptions | dict[str, Any] 
     timeout_ms = _option(options, "timeoutMs")
     if timeout_ms is not None:
         config_kwargs["read_timeout"] = timeout_ms / 1000
-    proxy_agents = create_http_proxy_agents_for_target(model.baseUrl, _option(options, "env"))
-    if proxy_agents is not None:
-        config_kwargs["proxies"] = {
-            "http": proxy_agents.httpAgent,
-            "https": proxy_agents.httpsAgent,
-        }
     # AWS_BEDROCK_FORCE_HTTP1 has no counterpart here and needs none: upstream sets it to
     # swap the SDK's default HTTP/2 handler for an HTTP/1.1 one, and botocore only ever
     # speaks HTTP/1.1. The endpoints that switch it on already get what they asked for.
@@ -288,6 +302,13 @@ def build_client_settings(model: Model, options: StreamOptions | dict[str, Any] 
     if region_name is None and not has_configured_profile:
         region_name = "us-east-1"
 
+    if use_explicit_endpoint:
+        config_kwargs.update(_proxy_config(model.baseUrl, env))
+    else:
+        # The SDK owns endpoint resolution. create_client finalizes this route
+        # only after endpoint overrides and profile/region rules are resolved.
+        config_kwargs["proxies"] = {}
+
     return BedrockClientSettings(
         profile_name=profile_name,
         region_name=region_name,
@@ -297,6 +318,15 @@ def build_client_settings(model: Model, options: StreamOptions | dict[str, Any] 
         bearer_token=bearer_token,
         credentials=credentials,
     )
+
+
+def _proxy_config(endpoint: str, env: Any) -> dict[str, Any]:
+    route = resolve_network_route(endpoint, env)
+    if route.proxy_url and urlparse(route.proxy_url).scheme in {"socks5", "socks5h"}:
+        # Botocore uses urllib3.proxy_from_url, not SOCKSProxyManager. Installing
+        # PySocks alone does not add SOCKS capability to that transport.
+        raise ValueError("Bedrock SDK transport does not support SOCKS proxies; select HTTP or HTTPS")
+    return {"proxies": {"http": route.proxy_url, "https": route.proxy_url} if route.proxy_url else {}}
 
 
 def is_reserved_bedrock_header(key: str) -> bool:
@@ -361,6 +391,7 @@ def stream_bedrock(
         )
         signal = _option(options, "signal")
         response_stream: Any = None
+        client: Any = None
         # Declared out here so a failure anywhere below can still sweep what arrived.
         partial_json: dict[int, StreamingArgs] = {}
         redacted_chunks: dict[int, list[bytes]] = {}
@@ -519,6 +550,8 @@ def stream_bedrock(
             stream.push(ErrorEvent(reason=output.stopReason, error=output), cause=error)
         finally:
             await _close_stream(response_stream)
+            if _option(options, "client") is None and client is not None:
+                await asyncio.to_thread(client.close)
             stream.end()
 
     spawn_stream_task(run(), stream=stream)

@@ -264,6 +264,12 @@ class ResearchMessageIngress:
             if durable is not None:
                 self.accepted[request_id] = (text, requested_run_id, durable)
                 return dict(durable)
+            if run is not None and control_spec is None:
+                from misaka.core.research.suspension import active_suspensions
+                if any(item["scope"] == "run" for item in active_suspensions(con, run["id"])):
+                    raise submissions.ResearchInputError(
+                        f"研究已挂起；请使用 /research resume {run['id']} 或恢复研究按钮继续。",
+                        "RESEARCH_EXPLICIT_RESUME_REQUIRED", retryable=False)
             # Replay an already admitted start before considering the current
             # run: its own creation must not turn an identical retry into a new start.
             if obj.get('startNew') and requested_run_id is None:
@@ -286,7 +292,7 @@ class ResearchMessageIngress:
                 limits = obj.get("limits")
                 if limits is not None and not isinstance(limits, dict):
                     raise ValueError("Research limits must be an object.")
-                delivered = research_start_prompt(text, {**(limits or {}), "plan_approval": False})
+                delivered = research_start_prompt(text, limits)
                 cfg = self.config if self.config is not None else current_config()
                 await asyncio.to_thread(ensure_research_sisters, cfg.get("profiles_root"))
                 mode = "start"

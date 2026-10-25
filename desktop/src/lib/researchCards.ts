@@ -15,6 +15,24 @@ export interface ResearchNotice {
   timestamp?: number
 }
 
+const TERMINAL = new Set(['done', 'failed', 'error', 'stopped', 'partial', 'cancelled'])
+
+/** All discovery, detail and live event paths share this monotonic metadata boundary. */
+export function mergeResearchCard(existing: ResearchRunCard | undefined, incoming: ResearchRunCard): ResearchRunCard {
+  if (!existing) return incoming
+  const oldEpoch = existing.controlEpoch ?? 0
+  const nextEpoch = incoming.controlEpoch ?? oldEpoch
+  if (nextEpoch < oldEpoch) return existing
+  if (nextEpoch === oldEpoch && existing.eventSeq !== undefined && incoming.eventSeq !== undefined && incoming.eventSeq < existing.eventSeq) return existing
+  const merged = { ...existing, ...incoming, controlEpoch: nextEpoch }
+  if (nextEpoch === oldEpoch && TERMINAL.has(existing.status) && !TERMINAL.has(incoming.status)) {
+    return { ...merged, status: existing.status, phase: existing.phase, stage: existing.stage,
+      error: existing.error, pendingQuestions: existing.pendingQuestions }
+  }
+  if (nextEpoch === oldEpoch && existing.status === 'done') merged.status = 'done'
+  return merged
+}
+
 function parseQuestionsFromContent(content?: string): string[] {
   if (!content) return []
   const lines = content.split('\n')
@@ -51,6 +69,9 @@ export function applyResearchNoticeToCard(
         error: null,
         updatedAt: now,
       }
+
+  card.lastActivityAt = now
+  if (typeof details.seq === 'number') card.eventSeq = details.seq
 
   if (details.workspace && !card.workspace) {
     card.workspace = String(details.workspace)
@@ -119,12 +140,17 @@ export function applyResearchNoticeToCard(
       if (parsed.length > 0) card.pendingQuestions = parsed
     }
   } else if (customType === 'research-final') {
-    card.status = String(details.result?.status || details.status || 'done')
+    const incomplete = details.incomplete === true
+    const finalStatus = details.result?.status || details.status
+    card.status = incomplete
+      ? String(finalStatus && finalStatus !== 'done' ? finalStatus : existingCard && TERMINAL.has(existingCard.status) && existingCard.status !== 'done' ? existingCard.status : 'partial')
+      : String(finalStatus || 'done')
     card.phase = String(details.result?.phase || details.phase || card.status)
     card.pendingQuestions = []
-    card.error = details.result?.last_error || null
+    card.error = details.result?.last_error || (incomplete ? existingCard?.error : null) || null
     card.report = {
-      artifactId: details.final_artifact || details.result?.final_artifact || undefined,
+      artifactId: details.artifactId || details.artifact_id || details.final_artifact || details.result?.final_artifact || undefined,
+      incomplete,
       content: notice.content,
       path: details.result?.final?.path,
     }
@@ -133,7 +159,14 @@ export function applyResearchNoticeToCard(
     card.error = notice.content || '研究发生异常'
   }
 
-  return card
+  const merged = mergeResearchCard(existingCard, card)
+  const meaningful = ['research-discipline','research-question','research-progress','research-clarification','research-final','research-error'].includes(customType)
+  // Live event envelopes carry seq; persisted history replay and token streaming do not
+  // manufacture a new notice revision that could indefinitely suppress polling.
+  if (meaningful && typeof details.seq === 'number' && details.seq !== existingCard?.eventSeq && merged !== existingCard) {
+    return {...merged,noticeRevision:(existingCard?.noticeRevision ?? 0)+1}
+  }
+  return merged
 }
 
 export function hydrateCardFromDetail(
@@ -162,6 +195,9 @@ export function hydrateCardFromDetail(
     pendingQuestions: [],
     error: run.last_error || null,
     updatedAt: Date.now(),
+    startedAt: run.createdAt ?? existingCard?.startedAt,
+    lastActivityAt: run.lastActivityAt ?? (run.updatedAt ? run.updatedAt * 1000 : existingCard?.lastActivityAt),
+    reportDelivery: run.reportDelivery ?? existingCard?.reportDelivery,
   }
 
   // Extract tasks from all graph nodes
@@ -190,7 +226,7 @@ export function hydrateCardFromDetail(
   card.tasks = tasks
   card.findings = findings
 
-  if (Array.isArray(detail.pending_questions) && detail.pending_questions.length > 0) {
+  if (!TERMINAL.has(run.status) && Array.isArray(detail.pending_questions) && detail.pending_questions.length > 0) {
     card.pendingQuestions = detail.pending_questions.map(q => q.question)
     card.status = 'waiting_input'
   }
@@ -205,7 +241,7 @@ export function hydrateCardFromDetail(
     }
   }
 
-  return card
+  return mergeResearchCard(existingCard, card)
 }
 
 export function hydrateCardsFromRuns(
@@ -215,7 +251,8 @@ export function hydrateCardsFromRuns(
   const result = { ...existing }
   for (const run of runs) {
     const prev = result[run.id]
-    result[run.id] = {
+    result[run.id] = mergeResearchCard(prev, {
+      ...prev,
       runId: run.id,
       question: run.question || prev?.question || '',
       workspace: run.workspace || prev?.workspace,
@@ -233,7 +270,10 @@ export function hydrateCardsFromRuns(
         : prev?.report || null,
       error: run.last_error || null,
       updatedAt: run.updatedAt || prev?.updatedAt || Date.now(),
-    }
+      startedAt: run.createdAt ?? prev?.startedAt,
+      lastActivityAt: run.lastActivityAt ?? (run.updatedAt ? run.updatedAt * 1000 : prev?.lastActivityAt),
+      reportDelivery: run.reportDelivery ?? prev?.reportDelivery,
+    })
   }
   return result
 }

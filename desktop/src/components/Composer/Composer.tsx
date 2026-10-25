@@ -1,3 +1,6 @@
+import { useResearchActivityStore } from '../../lib/researchActivityStore'
+import { useResearchEditorModel } from '../../lib/useResearchEditorModel'
+import { consumeEscape, useEscapeLayer } from '../../lib/useEscapeLayer'
 import React, { useState, useRef, useEffect, useLayoutEffect, useMemo, useCallback } from 'react'
 import {
   Plus,
@@ -14,22 +17,27 @@ import {
   RotateCw,
   X,
   Network,
+  Cpu,
 } from 'lucide-react'
 import { useSessionStore } from '../../store/useSessionStore'
 import { useSettingsStore } from '../../store/useSettingsStore'
 import { ModelPickerPopover } from './ModelPickerPopover'
 import { MisakaLogo } from '../MisakaLogo'
 import type { PermissionMode } from '../../types/session'
-import { cancelResearchStartup, startComposerResearch } from '../../lib/startComposerResearch'
+import { cancelResearchStartup, startComposerResearch, openResearchConversation } from '../../lib/startComposerResearch'
 import { isResearchStartupFailure } from '../../lib/researchConversation'
 import { newRequestId } from '../../lib/bridge'
+import { request } from '../../lib/bridge'
 import { recordResearchSubmissionDiagnostic } from '../../lib/researchDiagnostics'
+import type { ResearchOptionsPayload, ResearchRunLimits } from '../../types/research'
+import { ResearchRunWizard } from '../ResearchWorkspace/ResearchRunWizard'
 
 interface ComposerProps {
   onOpenModelSettings?: () => void
   welcome?: boolean
   workspaceControl?: React.ReactNode
   onResearchStarted?: () => void
+  presentation?: 'default' | 'multi'
 }
 
 const PERMISSION_MODE_OPTIONS: {
@@ -76,9 +84,12 @@ const PERMISSION_MODE_OPTIONS: {
   },
 ]
 
-export const Composer: React.FC<ComposerProps> = ({ onOpenModelSettings, welcome = false, workspaceControl, onResearchStarted }) => {
+export const Composer: React.FC<ComposerProps> = ({ onOpenModelSettings, welcome = false, workspaceControl, onResearchStarted, presentation = 'default' }) => {
   const text = useSessionStore(s => s.draft)
   const setText = useSessionStore(s => s.setDraft)
+  const researchPageView = useSessionStore(s => s.researchPageView)
+  const setResearchPageView = useSessionStore(s => s.setResearchPageView)
+  const isResearchNew = useSessionStore(s => s.agentMode === 'research' && s.researchPageView === 'new')
   const attachments = useSessionStore(s => s.attachments)
   const prepareAttachments = useSessionStore(s => s.prepareAttachments)
   const retryAttachment = useSessionStore(s => s.retryAttachment)
@@ -92,12 +103,23 @@ export const Composer: React.FC<ComposerProps> = ({ onOpenModelSettings, welcome
   const [researchStarting, setResearchStarting] = useState(false)
   const [researchCancelling, setResearchCancelling] = useState(false)
   const [researchError, setResearchError] = useState<string | null>(null)
+  const [wizardOptions, setWizardOptions] = useState<ResearchOptionsPayload | null>(null)
+  const [wizardLoading, setWizardLoading] = useState(false)
+  const attachmentPickerGeneration = useRef(0)
+  const researchPageVersion = useSessionStore(s=>s.researchPageVersion)
+  useEffect(()=>{attachmentPickerGeneration.current += 1; setIsPickingFiles(false)},[researchPageVersion])
   const researchStartingRef = useRef(false)
   const researchStartingRequestRef = useRef<string | null>(null)
   const sendMenuRef = useRef<HTMLDivElement>(null)
   const sendMenuTriggerRef = useRef<HTMLButtonElement>(null)
   const textareaRef = useRef<HTMLTextAreaElement>(null)
+  useEffect(() => {
+    const focusEditor = () => { if (useSessionStore.getState().agentMode === 'research') textareaRef.current?.focus() }
+    window.addEventListener('research-editor-focus', focusEditor)
+    return () => window.removeEventListener('research-editor-focus', focusEditor)
+  }, [])
   const formRef = useRef<HTMLFormElement>(null)
+  const wasMultiPresentation = useRef(false)
   const composing = useRef(false)
   const pickerRef = useRef<HTMLDivElement>(null)
   // The pill owns focus when the popover closes on the keyboard: the popover is an
@@ -106,8 +128,8 @@ export const Composer: React.FC<ComposerProps> = ({ onOpenModelSettings, welcome
   const modePickerRef = useRef<HTMLDivElement>(null)
 
   const isStreaming = useSessionStore(s => s.agentMode === 'research' && s.researchBinding ? s.researchConversation.isStreaming : s.isStreaming)
-  const isSessionLoading = useSessionStore(s => s.isSessionLoading)
-  const sessionLoadError = useSessionStore(s => s.sessionLoadError)
+  const isSessionLoading = useSessionStore(s => s.agentMode === 'research' ? false : s.isSessionLoading)
+  const sessionLoadError = useSessionStore(s => s.agentMode === 'research' ? null : s.sessionLoadError)
   const isAborting = useSessionStore(s => s.agentMode === 'research' && s.researchBinding ? s.researchConversation.isAborting : s.isAborting)
   const sessionOperation = useSessionStore(s => s.sessionOperation)
   const isCompacting = useSessionStore(s => s.isCompacting)
@@ -117,13 +139,19 @@ export const Composer: React.FC<ComposerProps> = ({ onOpenModelSettings, welcome
   const sendMessage = useSessionStore((s) => s.sendMessage)
   const ordinaryAbort = useSessionStore(s => s.abortGeneration)
   const requestResearchStop = useSessionStore(s => s.requestResearchStop)
-  const abortGeneration = useCallback(() => {
+  const abortGeneration = useCallback((background = false) => {
     const state = useSessionStore.getState()
-    if (state.agentMode === 'research' && state.researchBinding) {
+    const liveRun = Object.values(state.researchCards).find(card => ['active', 'waiting_input', 'stopping'].includes(card.status))
+    if (state.agentMode === 'research' && background && liveRun) {
+      const binding = Object.values(state.researchBindings).find(owner => owner.runId === liveRun.runId)
+      const detail = useResearchActivityStore.getState().details[liveRun.runId]
+      requestResearchStop({kind:'run',runId:liveRun.runId,workspace:liveRun.workspace || binding?.workspace || detail?.run.workspace || '',rootSession:detail?.run.rootSession || binding?.sessionFile || '',sessionId:binding?.sessionId,sessionFile:binding?.sessionFile,streamId:binding?.streamId})
+    } else if (state.agentMode === 'research' && state.researchBinding) {
       setResearchError(null)
       // A start with no run id is owned by the research host, never this window's ordinary session.
       if (!state.researchBinding.runId) setResearchCancelling(true)
-      requestResearchStop()
+      const binding = state.researchBinding
+      requestResearchStop(binding.runId ? {kind:'run',runId:binding.runId,workspace:binding.workspace,rootSession:binding.sessionFile || '',sessionFile:binding.sessionFile,sessionId:binding.sessionId,streamId:binding.streamId} : state.researchPendingCreationRequestId ? {kind:'startup',requestId:state.researchPendingCreationRequestId,workspace:binding.workspace,sessionId:binding.sessionId,streamId:binding.streamId} : {kind:'turn',workspace:binding.workspace,sessionId:binding.sessionId,streamId:binding.streamId})
     } else if (state.agentMode === 'research' && researchStartingRef.current && researchStartingRequestRef.current) {
       setResearchError(null)
       setResearchCancelling(true)
@@ -149,11 +177,12 @@ export const Composer: React.FC<ComposerProps> = ({ onOpenModelSettings, welcome
     return ''
   })
   const researchCard = useSessionStore(s => s.researchBinding?.runId ? s.researchCards[s.researchBinding.runId] : undefined)
+  const backgroundCard = useSessionStore(s => Object.values(s.researchCards).find(card => ['active','stopping','waiting_input'].includes(card.status)))
+  const hasActiveBackgroundResearch = isResearch && Boolean(backgroundCard)
   const researchTeam = useSessionStore(s => s.researchTeam)
 
-  const currentModel = useSettingsStore((s) => s.currentModel)
+  const { currentModel, thinkingLevel } = useResearchEditorModel()
   const models = useSettingsStore(s => s.models)
-  const thinkingLevel = useSettingsStore((s) => s.thinkingLevel)
 
   const modelDisplayName = currentModel ? (currentModel.name || currentModel.modelId) : '选择模型'
 
@@ -161,15 +190,18 @@ export const Composer: React.FC<ComposerProps> = ({ onOpenModelSettings, welcome
 
   const handleAddAttachments = async () => {
     if (isPickingFiles) return
+    const operation = ++attachmentPickerGeneration.current
+    const pickerState = useSessionStore.getState()
+    const pickerOwner = pickerState.agentMode === 'research' ? pickerState.researchView.ownerKey : null
     setIsPickingFiles(true)
     setAttachmentNotice(null)
     try {
       const paths = await window.app?.pickFiles()
-      if (paths?.length) await prepareAttachments(paths)
+      if (paths?.length) await prepareAttachments(paths, pickerOwner)
     } catch (error) {
-      setAttachmentNotice(error instanceof Error ? error.message : '打开附件选择窗口失败')
+      if (attachmentPickerGeneration.current === operation) setAttachmentNotice(error instanceof Error ? error.message : '打开附件选择窗口失败')
     } finally {
-      setIsPickingFiles(false)
+      if (attachmentPickerGeneration.current === operation) setIsPickingFiles(false)
     }
   }
 
@@ -226,23 +258,59 @@ export const Composer: React.FC<ComposerProps> = ({ onOpenModelSettings, welcome
     return () => observer?.disconnect()
   }, [])
 
+  // The same textarea survives presentation changes. Re-measure its current controlled
+  // draft after the card has its new width; a former multi cap must not linger in chat.
+  const resizeEditor = useCallback((limit: number) => {
+    const editor = textareaRef.current
+    if (!editor) return
+    editor.style.height = 'auto'
+    editor.style.height = `${Math.min(editor.scrollHeight, limit)}px`
+  }, [])
+  useLayoutEffect(() => {
+    if (presentation === 'multi' || wasMultiPresentation.current) resizeEditor(presentation === 'multi' ? 88 : 180)
+    wasMultiPresentation.current = presentation === 'multi'
+  }, [presentation, text, resizeEditor])
+  useLayoutEffect(() => {
+    if (presentation !== 'multi' || !formRef.current || typeof ResizeObserver === 'undefined') return
+    const card = formRef.current
+    let width = card.getBoundingClientRect().width
+    const observer = new ResizeObserver(() => {
+      const nextWidth = card.getBoundingClientRect().width
+      if (nextWidth === width) return // Height changes must not drive their own resize loop.
+      width = nextWidth
+      resizeEditor(88)
+    })
+    observer.observe(card)
+    return () => observer.disconnect()
+  }, [presentation, resizeEditor])
+
+  const closeComposerMenu = useCallback(() => {
+    if (showSendMenu) {
+      setShowSendMenu(false)
+      sendMenuTriggerRef.current?.focus()
+    } else if (showModePicker) {
+      setShowModePicker(false)
+      modePickerRef.current?.querySelector<HTMLButtonElement>('button')?.focus()
+    }
+  }, [showSendMenu, showModePicker])
+
+  useEscapeLayer(showSendMenu || showModePicker, event => {
+    consumeEscape(event)
+    closeComposerMenu()
+  })
+
   useEffect(() => {
     if (!showSendMenu && !showModePicker && (!isStreaming || isSessionLoading || isAborting)) return
     const stopOnEscape = (event: KeyboardEvent) => {
       if (event.key !== 'Escape' || event.defaultPrevented || event.isComposing || composing.current) return
-      if (showSendMenu) {
+      if (showSendMenu || showModePicker) {
         event.preventDefault()
-        setShowSendMenu(false)
-        sendMenuTriggerRef.current?.focus()
-      } else if (showModePicker) {
-        event.preventDefault()
-        setShowModePicker(false)
-        modePickerRef.current?.querySelector<HTMLButtonElement>('button')?.focus()
+        closeComposerMenu()
       } else if (!isSessionLoading && !isAborting) abortGeneration()
     }
     document.addEventListener('keydown', stopOnEscape)
     return () => document.removeEventListener('keydown', stopOnEscape)
-  }, [isStreaming, isSessionLoading, isAborting, abortGeneration, showSendMenu, showModePicker])
+  }, [isStreaming, isSessionLoading, isAborting, abortGeneration, showSendMenu, showModePicker, closeComposerMenu])
 
   useEffect(() => {
     if (!showSendMenu) return
@@ -258,7 +326,7 @@ export const Composer: React.FC<ComposerProps> = ({ onOpenModelSettings, welcome
     return () => document.removeEventListener('mousedown', outside)
   }, [showSendMenu, isStreaming, isSessionLoading, sessionLoadError, isAborting])
 
-  const submitText = (mode: 'steer' | 'followUp' = 'steer') => {
+  const submitText = (mode: 'steer' | 'followUp' = 'steer', confirmedLimits?: ResearchRunLimits) => {
     const submissionState = useSessionStore.getState()
     if (composing.current) return
     const commandText = text.trim()
@@ -323,36 +391,64 @@ export const Composer: React.FC<ComposerProps> = ({ onOpenModelSettings, welcome
       const requestId = newRequestId('research_input')
       recordResearchSubmissionDiagnostic({ requestId, text: messageText, sessionId: researchBinding?.sessionId })
       let owner = researchBinding
+      const editorOwner = submissionState.researchView.ownerKey
+      let navigationVersion = submissionState.researchPageVersion
       const ownsContext = () => {
         const current = useSessionStore.getState()
-        return current.agentMode === 'research' && current.currentWorkspace === currentWorkspace &&
+        return current.researchPageVersion === navigationVersion && current.agentMode === 'research' && current.currentWorkspace === currentWorkspace &&
           (owner ? current.researchBinding?.sessionId === owner.sessionId && current.researchBinding?.streamId === owner.streamId : !current.researchBinding)
+      }
+      // The synchronous gates run BEFORE any busy flag: the old order set researchStarting
+      // and then returned, so the finally that clears it never ran and every later send was
+      // blocked (2026-10-11 audit; see researchPageView tests).
+      if (isResearchNew && hasActiveBackgroundResearch) {
+        setResearchError(`当前已有研究正在运行中（${backgroundCard?.question || backgroundCard?.runId}），请先返回或停止当前研究。`)
+        return
+      }
+      const bindingToUse = isResearchNew ? null : researchBinding
+      const isStartingNew = isResearchNew || !bindingToUse?.runId
+      if (isStartingNew && !confirmedLimits) {
+        if (wizardLoading || wizardOptions) return
+        setWizardLoading(true)
+        void request<ResearchOptionsPayload>('get_research_options').then(options => setWizardOptions(options))
+          .catch(error => setResearchError(error instanceof Error ? error.message : String(error)))
+          .finally(() => setWizardLoading(false))
+        return
       }
       researchStartingRef.current = true
       researchStartingRequestRef.current = requestId
       setResearchStarting(true)
       setResearchError(null)
-      void startComposerResearch({ question: messageText, workspace: researchBinding?.workspace || currentWorkspace,
-        model: currentModel, thinkingLevel, binding: researchBinding, requestId, startNew: !researchBinding?.runId,
+      void startComposerResearch({ question: messageText, workspace: bindingToUse?.workspace || currentWorkspace,
+        model: currentModel, thinkingLevel, binding: bindingToUse, requestId, startNew: isStartingNew,
+        ...(confirmedLimits ? { limits: confirmedLimits } : {}),
+        lastOrderModel: isStartingNew ? submissionState.researchEditors[editorOwner]?.lastOrderModel : null,
         onBound: host => {
-          if (!ownsContext()) return
+          const mayNavigate = ownsContext()
           useSessionStore.getState().bindResearchConversation(host)
+          const capturedBinding = {sessionId:host.session.sessionId, sessionFile:host.session.file, workspace:host.session.cwd, runId:host.run?.id || null, streamId:host.streamId}
+          useSessionStore.getState().queueResearchMessage(requestId, messageText, capturedBinding)
+          owner = capturedBinding
+          if (!mayNavigate) return
+          useSessionStore.getState().selectResearchView({kind:'conversation', sessionId:host.session.sessionId, ownerKey:`conversation:${host.session.sessionId}`})
+          navigationVersion = useSessionStore.getState().researchPageVersion
           owner = useSessionStore.getState().researchBinding
           useSessionStore.getState().queueResearchMessage(requestId, messageText)
         },
         onSubmission: submission => {
-          if (!ownsContext() || !owner) return
+          if (!owner) return
           useSessionStore.getState().rememberResearchSubmission(requestId, submission, {
-            text, attachmentPaths: attachments.map(item => item.path), sessionId: owner.sessionId, streamId: owner.streamId, mode: 'research', revision: submissionState.draftRevision,
+            text, ownerKey:editorOwner, attachmentIdentities: attachments.map(item => ({attachmentId:'attachmentId' in item ? String(item.attachmentId) : item.path,preparationId:'preparationId' in item ? String(item.preparationId) : ''})), attachmentPaths: attachments.map(item => item.path), sessionId: owner.sessionId, streamId: owner.streamId, mode: 'research', revision: submissionState.draftRevision,
           })
         },
         onAccepted: () => useSessionStore.getState().acceptResearchMessage(requestId),
-        onUnconfirmed: (error, reconciled) => useSessionStore.getState().unconfirmResearchMessage(requestId, error.message, (error as Error & { retryable?: boolean }).retryable, reconciled),
+        onUnconfirmed: (error, reconciled) => useSessionStore.getState().unconfirmResearchMessage(requestId, error.message, (error as Error & { retryable?: boolean }).retryable, reconciled, error),
       }).then(host => {
-        if (!ownsContext()) return
         useSessionStore.getState().bindResearchConversation(host)
+        useSessionStore.getState().clearResearchEditor(editorOwner, submissionState.draftRevision, attachments.map(item => ({attachmentId:'attachmentId' in item ? String(item.attachmentId) : item.path,preparationId:'preparationId' in item ? String(item.preparationId) : ''})))
+        if (!ownsContext()) return
         const state = useSessionStore.getState()
-        if (state.draft === text && state.draftRevision === submissionState.draftRevision && state.attachments.length === attachments.length && state.attachments.every((item, index) => item === attachments[index])) {
+        if (state.researchView.ownerKey === editorOwner && state.draft === text && state.draftRevision === submissionState.draftRevision && state.attachments.length === attachments.length && state.attachments.every((item, index) => item === attachments[index])) {
           setText('')
           for (const attachment of attachments) removeAttachment(attachment.path)
         }
@@ -364,11 +460,10 @@ export const Composer: React.FC<ComposerProps> = ({ onOpenModelSettings, welcome
       }).catch(error => {
         const message = error instanceof Error ? error.message : String(error)
         const state = useSessionStore.getState()
-        if (!ownsContext()) return
-        if (isResearchStartupFailure(error)) state.failResearchExecution(requestId, message)
-        else if ((error instanceof Error && error.name === 'ResearchRequestTimeoutError') || error?.errorCode === 'RESEARCH_DELIVERY_UNCONFIRMED') state.unconfirmResearchMessage(requestId, message, error?.retryable)
-        else state.failResearchMessage(requestId, message, error?.retryable)
-        setResearchError(message)
+        if (isResearchStartupFailure(error)) state.failResearchExecution(requestId, message, error)
+        else if ((error instanceof Error && error.name === 'ResearchRequestTimeoutError') || error?.errorCode === 'RESEARCH_DELIVERY_UNCONFIRMED') state.unconfirmResearchMessage(requestId, message, error?.retryable, undefined, error)
+        else state.failResearchMessage(requestId, message, error?.retryable, error)
+        if (ownsContext()) setResearchError(message)
       }).finally(() => {
         if (researchStartingRequestRef.current !== requestId) return
         researchStartingRef.current = false
@@ -401,7 +496,7 @@ export const Composer: React.FC<ComposerProps> = ({ onOpenModelSettings, welcome
   const handleInput = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
     setText(e.target.value)
     e.target.style.height = 'auto'
-    e.target.style.height = Math.min(e.target.scrollHeight, 180) + 'px'
+    e.target.style.height = Math.min(e.target.scrollHeight, presentation === 'multi' ? 88 : 180) + 'px'
   }
 
   const handleSubmit = (e: React.FormEvent) => {
@@ -416,7 +511,7 @@ export const Composer: React.FC<ComposerProps> = ({ onOpenModelSettings, welcome
   const hasUnsupportedImageModel = attachments.some(item => item.images.length > 0) && !supportsImageInput
   const pendingLabel = researchStarting ? '研究启动中' : sessionLoadError ? '会话尚未就绪' : isSessionLoading ? '会话加载中' : isAborting ? '停止中' : sessionOperation ? '会话操作中' : isCompacting ? '压缩中' : ''
   const sendDisabled = Boolean(pendingLabel) || !hasContent || hasPendingAttachment || hasAttachmentError || hasUnsupportedImageModel
-  const sendLabel = isStreaming ? '干预当前运行 (Enter)' : isResearch ? (researchBinding?.runId ? '发送研究消息 (Enter)' : '开始研究 (Enter)') : '发送指令 (Enter)'
+  const sendLabel = isStreaming ? '干预当前运行 (Enter)' : isResearch ? (researchBinding?.runId ? '发送给根协调 Last Order (Enter)' : '开始研究 (Enter)') : '发送指令 (Enter)'
   // A start without a run id is cancelled on the research host, so its button is never the ordinary abort.
   const cancellingStartup = isResearch && researchStarting && !researchBinding?.runId
   // Say which step the startup is on, so a slow deep-research initialization does not read as
@@ -425,8 +520,9 @@ export const Composer: React.FC<ComposerProps> = ({ onOpenModelSettings, welcome
   const researchStartupLabel = recruitedCount
     ? `研究团队已就绪（${recruitedCount} 名成员），正在启动研究规划…`
     : '正在准备研究团队…（招募可能需要数分钟，可随时取消）'
-  const stopLabel = cancellingStartup ? (researchCancelling ? '取消中' : '取消研究启动') : isAborting ? '停止中' : '中止生成 (Esc)'
+  const stopLabel = isResearchNew && hasActiveBackgroundResearch ? '停止后台研究' : cancellingStartup ? (researchCancelling ? '取消中' : '取消研究启动') : isAborting ? '停止中' : '中止生成 (Esc)'
   const stopDisabled = cancellingStartup ? researchCancelling : Boolean(pendingLabel)
+  const hasStopButton = isStreaming || hasActiveBackgroundResearch || (isResearch && (isAborting || researchStarting))
 
   return (
     <div className={'conversation-composer-dock pointer-events-none z-10' + (welcome ? ' conversation-composer-dock--welcome' : '')}>
@@ -443,6 +539,9 @@ export const Composer: React.FC<ComposerProps> = ({ onOpenModelSettings, welcome
         <form
           ref={formRef}
           onSubmit={handleSubmit}
+          data-composer-presentation={presentation === 'multi' ? 'multi' : undefined}
+          data-composer-expanded-stop={presentation === 'multi' && hasStopButton && (isAborting || researchCancelling) ? 'true' : undefined}
+          data-composer-dense-operations={presentation === 'multi' && (isStreaming || Boolean(pendingLabel)) ? 'true' : undefined}
           className="conversation-composer misaka-glass-panel pointer-events-auto flex flex-col gap-2.5 relative"
         >
           {retainedEditorText && <div className="flex items-center justify-between gap-3 rounded-lg border border-border-subtle bg-surface-2/60 px-3 py-2 text-xs text-muted" role="status">
@@ -480,13 +579,49 @@ export const Composer: React.FC<ComposerProps> = ({ onOpenModelSettings, welcome
           {(attachmentNotice || hasUnsupportedImageModel) && <div role="status" className="text-[11px] text-warning">
             {attachmentNotice || '当前模型不支持图片输入，请切换到支持图片的模型。附件仍保留在草稿中。'}
           </div>}
+          {isResearchNew && hasActiveBackgroundResearch && (
+            <div className="flex items-center justify-between px-3 py-2 rounded-xl border border-warning-border bg-warning-surface text-warning text-xs">
+              <div className="flex items-center gap-2 truncate min-w-0">
+                <span className="font-medium shrink-0">已有研究正在后台进行中：</span>
+                <span className="truncate opacity-90">{backgroundCard?.question || backgroundCard?.runId}</span>
+              </div>
+              <div className="flex items-center gap-2 shrink-0 ml-2">
+                <button
+                  type="button"
+                  onClick={() => {
+                    if (!backgroundCard) return
+                    const version=useSessionStore.getState().researchPageVersion
+                    void openResearchConversation(backgroundCard.runId,backgroundCard.workspace).then(snapshot=>{
+                      const state=useSessionStore.getState(); state.bindResearchConversation(snapshot)
+                      if (state.researchPageVersion === version) state.selectResearchView({kind:'conversation',ownerKey:`conversation:${snapshot.session.sessionId}`,sessionId:snapshot.session.sessionId})
+                    }).catch(error=>setResearchError(error instanceof Error ? error.message : String(error)))
+                  }}
+                  className="px-2.5 py-1 rounded-md bg-surface-2 hover:bg-surface-3 text-text-main text-[11px] font-medium transition-colors cursor-pointer"
+                >
+                  返回当前研究
+                </button>
+                <button
+                  type="button"
+                  disabled={researchCancelling || isAborting}
+                  onClick={() => {
+                    if (window.confirm('确定要停止当前正在进行的研究吗？已完成的卡片和证据将被保存。')) {
+                      abortGeneration(true)
+                    }
+                  }}
+                  className="px-2.5 py-1 rounded-md bg-danger/20 hover:bg-danger/30 text-danger text-[11px] font-medium transition-colors cursor-pointer disabled:opacity-50"
+                >
+                  停止当前研究
+                </button>
+              </div>
+            </div>
+          )}
           {isResearch && (researchError || researchConnectionError) && <div role="alert" className="text-[11px] text-danger">{researchError || researchConnectionError}</div>}
           {researchStarting && !researchBinding?.runId && <div role="status" className="text-[11px] text-dim">{researchStartupLabel}</div>}
 
           {/* Bottom Toolbar */}
           <div className="conversation-composer-toolbar flex items-center justify-between pt-1 border-t border-border-subtle/50 text-xs select-none">
             {/* Left Controls: Plus + Mode Picker */}
-            <div className="flex items-center gap-2">
+            <div className="conversation-composer-context-controls flex items-center gap-2">
               <button
                 type="button"
                 onClick={() => void handleAddAttachments()}
@@ -554,10 +689,22 @@ export const Composer: React.FC<ComposerProps> = ({ onOpenModelSettings, welcome
               </div>
             </div>
 
-            {isResearch && researchBinding && <button type="button" disabled={researchStarting || isStreaming || !researchCard || ['active', 'stopping', 'waiting_input'].includes(researchCard.status)} onClick={() => { useSessionStore.getState().clearResearchConversation(); setResearchError(null) }} className="text-[11px] text-muted hover:text-accent disabled:opacity-40" title="保留当前报告并开启新的研究对话">新研究</button>}
+            {isResearch && (
+              <button
+                type="button"
+                onClick={() => {
+                  setResearchPageView(researchPageView === 'new' ? 'conversation' : 'new')
+                  setResearchError(null)
+                }}
+                className="conversation-new-research-trigger text-[11px] text-muted hover:text-accent font-medium transition-colors cursor-pointer"
+                title={researchPageView === 'new' ? '返回正在进行的研究对话' : '开启新研究入口（后台研究继续运行）'}
+              >
+                {researchPageView === 'new' ? (researchBinding ? '返回当前研究' : '新研究') : '新研究'}
+              </button>
+            )}
 
             {/* Right Controls: Model Pill + Submit Button */}
-            <div className="flex items-center gap-2.5">
+            <div className="conversation-composer-operation-controls flex items-center gap-2.5">
               {/* Interactive Model & Thinking Level Selector Pill */}
               <div className="relative" ref={pickerRef}>
                 <button
@@ -575,7 +722,8 @@ export const Composer: React.FC<ComposerProps> = ({ onOpenModelSettings, welcome
                   }
                   title="模型与思考深度"
                 >
-                  <span className="truncate max-w-[140px]">{modelDisplayName}</span>
+                  <span className="truncate max-w-[140px]" title={presentation === 'multi' ? modelDisplayName : undefined}>{modelDisplayName}</span>
+                  <span className="conversation-model-compact-icon hidden" title={presentation === 'multi' ? modelDisplayName : undefined} aria-hidden="true"><Cpu className="w-4 h-4" /></span>
                   <ChevronDown
                     className={'w-3 h-3 text-dim transition-transform ' + (showPicker ? 'rotate-180' : '')}
                   />
@@ -635,7 +783,7 @@ export const Composer: React.FC<ComposerProps> = ({ onOpenModelSettings, welcome
                 </div>}
               </>}
               </div>
-              {(isStreaming || (isResearch && (isAborting || researchStarting))) && <button type="button" onClick={abortGeneration} disabled={stopDisabled}
+              {hasStopButton && <button type="button" onClick={() => abortGeneration(isResearchNew && hasActiveBackgroundResearch)} disabled={stopDisabled}
                 aria-label={stopLabel} title={stopLabel}
                 className="conversation-stop-button h-8 min-w-8 px-2 rounded-full flex items-center justify-center gap-1 bg-danger text-on-danger hover:opacity-90 disabled:opacity-50 disabled:cursor-wait">
                 {(isAborting || researchCancelling) ? <><Loader2 className="w-4 h-4 animate-spin" /><span className="text-[11px]">{stopLabel}</span></> : <Square className="w-3.5 h-3.5 fill-current" />}
@@ -644,6 +792,10 @@ export const Composer: React.FC<ComposerProps> = ({ onOpenModelSettings, welcome
           </div>
         </form>
       </div>
+      {wizardOptions && <ResearchRunWizard options={wizardOptions} onCancel={() => setWizardOptions(null)} onConfirm={limits => {
+        setWizardOptions(null)
+        submitText('steer', limits)
+      }} />}
     </div>
   )
 }

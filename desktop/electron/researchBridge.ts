@@ -3,6 +3,11 @@ export interface ResearchBridgeLaunch {
   sessionFile?: string | null
 }
 
+/** User-selected routing belongs to the request; launching a bridge must not rewrite it. */
+export function bridgeEnvironment(parent: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+  return { ...parent, PYTHONUNBUFFERED: '1', PYTHONIOENCODING: 'utf-8' }
+}
+
 export function researchBridgeArgs(input: ResearchBridgeLaunch): string[] {
   const args = ['run', 'misaka', 'desktop-bridge', '--cwd', input.cwd, '--research-context']
   if (input.sessionFile) args.push('--session', input.sessionFile)
@@ -17,13 +22,4 @@ export function resolvedResearchBridgeLaunch(input: ResearchBridgeLaunch, sessio
 export function sameResearchBridge(active: ResearchBridgeLaunch | null, requested: ResearchBridgeLaunch): boolean {
   return Boolean(active && active.cwd === requested.cwd &&
     (active.sessionFile || null) === (requested.sessionFile || null))
-}
-
-export type ResearchCloseChoice = 'background' | 'stop' | 'cancel'
-export type ResearchCloseOutcome = 'hide' | 'stop-and-quit' | 'stay-open'
-
-export function researchCloseOutcome(choice: ResearchCloseChoice): ResearchCloseOutcome {
-  if (choice === 'background') return 'hide'
-  if (choice === 'stop') return 'stop-and-quit'
-  return 'stay-open'
 }

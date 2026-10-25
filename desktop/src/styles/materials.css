@@ -1,9 +1,9 @@
 /* Explicitly opted-in shells only. Reading surfaces and graph nodes remain solid.
    Material parameters are independent of theme IDs; all inks come from theme roles. */
 :root {
-  --glass-chrome-opacity: 84%;
+  --glass-chrome-opacity: 80%;
   --glass-panel-opacity: 82%;
-  --glass-popover-opacity: 90%;
+  --glass-popover-opacity: 88%;
 }
 
 html[data-theme-mode="light"] {
@@ -16,7 +16,7 @@ html[data-theme-mode="light"] {
   --glass-base: var(--surface-0);
   --glass-opacity: var(--glass-chrome-opacity);
   --glass-blur: 16px;
-  --glass-reflection: radial-gradient(ellipse 70vw 180px at 18vw -10px, color-mix(in srgb, var(--accent) 6%, transparent), transparent 80%);
+  --glass-reflection: radial-gradient(ellipse 70vw 180px at 18vw -10px, color-mix(in srgb, var(--accent) 8%, transparent), transparent 80%);
   --glass-edge: transparent;
   --glass-glint: transparent;
   --glass-shadow: 0 0 0 transparent;
@@ -95,13 +95,21 @@ html[data-theme-mode="light"] {
 
 /* Permanent chrome shares one viewport-anchored light source. No repeated bright
    top/bottom strips or floating-card shadows at each header/rail boundary. */
-.misaka-glass-chrome {
+.misaka-glass-chrome,
+.misaka-chrome-sticky {
   background-attachment: fixed;
   background-size: 100vw 220px;
   background-position: left top;
   background-repeat: no-repeat;
   border-color: color-mix(in srgb, var(--border-subtle) 32%, transparent);
   box-shadow: none;
+}
+
+/* Cover rows scrolling behind the sidebar search without stacking a second blur.
+   Its reflection inherits the same chrome source and stays anchored to the viewport. */
+.misaka-chrome-sticky {
+  background-color: var(--glass-base);
+  background-image: var(--glass-reflection);
 }
 
 .misaka-glass-chrome::before {
@@ -117,15 +125,18 @@ html[data-theme-mode="light"] {
   border-color: color-mix(in srgb, var(--border-subtle) 88%, var(--accent) 12%);
 }
 
-/* Diffuse light on the input follows the reading canvas instead of a diagonal beam. */
+/* The input catches a neutral reflection, not a separate accent-colored light. */
 .conversation-composer.misaka-glass-panel {
   --glass-base: color-mix(in srgb, var(--surface-0) 24%, var(--surface-1));
+  --glass-opacity: 78%;
+  --glass-reflection: radial-gradient(ellipse 110% 190% at 32% -115%, color-mix(in srgb, var(--glass-highlight) 32%, transparent), transparent 80%);
   border-color: color-mix(in srgb, var(--border-subtle) 48%, transparent);
 }
 
 /* White-mode canvas and panel already match; retain its exact opaque fallback. */
 html[data-theme-mode="light"] .conversation-composer.misaka-glass-panel {
   --glass-base: var(--surface-1);
+  --glass-opacity: 88%;
 }
 
 .conversation-composer-dock:not(.conversation-composer-dock--welcome) {

@@ -1,10 +1,12 @@
+import { researchActivity, subscribeResearchHistory, subscribeResearchRun, useResearchActivityStore, beginResearchControl, acceptResearchResume } from '../../lib/researchActivityStore'
+import { ResearchProgressArea } from '../Timeline/ResearchProgressArea'
 import React, { useCallback, useEffect, useMemo, useState } from 'react'
 import { AlertCircle, Check, Download, FileText, GitBranch, Loader2, RefreshCw, RotateCcw, ShieldAlert, Square, X } from 'lucide-react'
 import { newRequestId, request } from '../../lib/bridge'
 import { addResearchSink, requestResearch } from '../../lib/researchBridge'
 import { useSessionStore, type CompactStatus } from '../../store/useSessionStore'
-import type { ResearchGraphNode, ResearchNodeDetail, ResearchOptionsPayload, ResearchRunDetail, ResearchRunSummary } from '../../types/research'
-import { researchNodeLabel, researchOverview, researchPhaseLabel } from '../../lib/researchStatus'
+import type { ResearchGraphNode, ResearchNodeDetail, ResearchOptionsPayload, ResearchRunDetail } from '../../types/research'
+import { researchNodeLabel, researchOverview, researchPhaseLabel, researchRunLabel } from '../../lib/researchStatus'
 import { MarkdownContent } from '../Timeline/MarkdownContent'
 import { ResearchGraphCanvas } from './ResearchGraphCanvas'
 import { ResearchStartForm } from './ResearchStartForm'
@@ -24,7 +26,6 @@ export const ResearchWorkbench: React.FC = () => {
   const researchGraph = useSessionStore(state => state.researchGraph)
   const researchRunId = useSessionStore(state => state.researchRunId)
   const fetchResearchRuns = useSessionStore(state => state.fetchResearchRuns)
-  const fetchResearchGraph = useSessionStore(state => state.fetchResearchGraph)
   const [options, setOptions] = useState<ResearchOptionsPayload | null>(null)
   const [researchHostReady, setResearchHostReady] = useState(false)
   const [contextUsage, setContextUsage] = useState<Record<string, any> | null>(null)
@@ -33,9 +34,9 @@ export const ResearchWorkbench: React.FC = () => {
   const [compactBusy, setCompactBusy] = useState(false)
   const [compactOperationId, setCompactOperationId] = useState<string | null>(null)
   const [compactStatus, setCompactStatus] = useState<CompactStatus>({ state: 'idle' })
-  const [activeRuns, setActiveRuns] = useState<Array<ResearchRunSummary & { workspace: string }>>([])
-  const [runDetail, setRunDetail] = useState<ResearchRunDetail | null>(null)
   const [selectedRunId, setSelectedRunId] = useState<string | null>(researchRunId)
+  const runDetail = useResearchActivityStore(s => selectedRunId ? s.details[selectedRunId] ?? null : null)
+  const syncError = useResearchActivityStore(s => (selectedRunId && s.errors[`run:${selectedRunId}`]) || s.errors.history || s.errors.active)
   const [selectedNode, setSelectedNode] = useState<ResearchGraphNode | null>(null)
   const [nodeDetail, setNodeDetail] = useState<ResearchNodeDetail | null>(null)
   const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null)
@@ -47,7 +48,7 @@ export const ResearchWorkbench: React.FC = () => {
   const [answers, setAnswers] = useState<Record<string, string>>({})
   const [error, setError] = useState('')
 
-  const activeRun = useMemo(() => activeRuns[0] ?? researchRuns.find(run => ACTIVE.has(run.status)), [activeRuns, researchRuns])
+  const activeRun = useMemo(() => researchRuns.find(run => ACTIVE.has(run.status)), [researchRuns])
   const activeRunVisible = activeRun ? researchRuns.some(run => run.id === activeRun.id) : true
   const selectedRun = useMemo(() => researchRuns.find(run => run.id === selectedRunId) ?? null,
     [researchRuns, selectedRunId])
@@ -56,25 +57,11 @@ export const ResearchWorkbench: React.FC = () => {
   const nodeOverview = useMemo(() => researchOverview(runNodes), [runNodes])
 
   useEffect(() => {
-    fetchResearchRuns()
+    const release = subscribeResearchHistory()
     void request<ResearchOptionsPayload>('get_research_options').then(setOptions).catch(failure => {
       setError(failure instanceof Error ? failure.message : String(failure))
     })
-    const timer = window.setInterval(fetchResearchRuns, 4000)
-    return () => window.clearInterval(timer)
-  }, [fetchResearchRuns])
-
-  useEffect(() => {
-    let live = true
-    const refreshActiveRuns = async () => {
-      try {
-        const result = await request<{ runs?: Array<ResearchRunSummary & { workspace: string }> }>('get_active_research_runs')
-        if (live) setActiveRuns(result.runs || [])
-      } catch { /* App shell maintains the native close prompt during bridge reconnects */ }
-    }
-    void refreshActiveRuns()
-    const timer = window.setInterval(() => void refreshActiveRuns(), 4000)
-    return () => { live = false; window.clearInterval(timer) }
+    return release
   }, [])
 
   useEffect(() => {
@@ -121,7 +108,6 @@ export const ResearchWorkbench: React.FC = () => {
   useEffect(() => {
     if (!researchRuns.length) {
       setSelectedRunId(null)
-      setRunDetail(null)
       return
     }
     if (!selectedRunId || !researchRuns.some(run => run.id === selectedRunId)) {
@@ -129,29 +115,17 @@ export const ResearchWorkbench: React.FC = () => {
     }
   }, [researchRuns, selectedRunId, activeRun])
 
-  const refresh = useCallback(async (runId: string) => {
-    fetchResearchGraph(runId)
-    try {
-      const workspace = useSessionStore.getState().researchRuns.find(run => run.id === runId)?.workspace
-      const detail = await request<ResearchRunDetail>('get_research_details', { runId, workspace })
-      if (detail.run?.id === runId) {
-        setRunDetail(detail)
-        if (detail.root_context?.contextUsage) setContextUsage(detail.root_context.contextUsage)
-        if (detail.root_context?.stats) {
-          setContextMessageCount(Number(detail.root_context.stats.totalMessages ?? detail.root_context.stats.messageCount ?? 0))
-        }
-      }
-    } catch (failure) {
-      setError(failure instanceof Error ? failure.message : String(failure))
-    }
-  }, [fetchResearchGraph])
+  const refresh = useCallback(async (_runId: string) => { await researchActivity.refresh() }, [])
 
   useEffect(() => {
     if (!selectedRunId) return
-    void refresh(selectedRunId)
-    const timer = window.setInterval(() => void refresh(selectedRunId), 4000)
-    return () => window.clearInterval(timer)
-  }, [selectedRunId, refresh])
+    return subscribeResearchRun(selectedRunId, selectedRun?.workspace)
+  }, [selectedRunId, selectedRun?.workspace])
+
+  useEffect(() => {
+    if (runDetail?.root_context?.contextUsage) setContextUsage(runDetail.root_context.contextUsage)
+    if (runDetail?.root_context?.stats) setContextMessageCount(Number(runDetail.root_context.stats.totalMessages ?? 0))
+  }, [runDetail])
 
   useEffect(() => {
     setNodeDetail(null)
@@ -185,7 +159,9 @@ export const ResearchWorkbench: React.FC = () => {
     setResearchHostReady(true)
     setContextUsage(host.contextUsage ?? null)
     setContextMessageCount(Number(host.stats?.totalMessages ?? 0))
+    beginResearchControl(run.id)
     await requestResearch(type, { runId: run.id, clarification })
+    if (type === 'resume_research') acceptResearchResume(run.id)
     await refresh(run.id)
   }
 
@@ -309,7 +285,7 @@ export const ResearchWorkbench: React.FC = () => {
         {researchRuns.length > 0 && <select aria-label="选择研究运行" value={selectedRunId || ''}
           onChange={event => { setSelectedRunId(event.target.value); setSelectedNode(null) }}
           className="max-w-[280px] rounded-md border border-border-subtle bg-surface-1 px-2 py-1.5 text-[11px] text-text-main">
-          {researchRuns.map(run => <option key={run.id} value={run.id}>{researchPhaseLabel(run.phase || run.status)} · {run.question}</option>)}
+          {researchRuns.map(run => <option key={run.id} value={run.id}>{researchRunLabel(run)} · {run.question}</option>)}
         </select>}
         <button type="button" aria-label="刷新研究状态" onClick={() => { fetchResearchRuns(); if (selectedRunId) void refresh(selectedRunId) }}
           className="inline-flex h-8 w-8 items-center justify-center rounded-md text-muted hover:bg-surface-2 focus-visible:outline focus-visible:outline-2 focus-visible:outline-accent"><RefreshCw className="h-3.5 w-3.5" /></button>
@@ -329,11 +305,13 @@ export const ResearchWorkbench: React.FC = () => {
           className="inline-flex h-8 items-center gap-1.5 rounded-md border border-border-subtle px-2.5 text-[11px] text-text-main hover:bg-surface-2"><FileText className="h-3.5 w-3.5" /> 压缩研究会话</button>}
       </div>
 
+      {selectedRunId && <ResearchProgressArea runId={selectedRunId} />}
+      {syncError && !selectedRunId && <p role="alert" className="px-4 py-2 text-warning">同步错误：{syncError}</p>}
       <div className="min-h-0 flex-1 overflow-auto p-3">
         {!activeRunVisible && activeRun && <div role="status" className="mb-2 flex items-center gap-2 rounded-lg border border-warning-border bg-warning-surface/40 px-3 py-2 text-[10.5px] text-text-main">
           <AlertCircle className="h-3.5 w-3.5 text-warning" /> 另一项目仍有研究运行：{activeRun.question} · {activeRun.workspace}。切换到对应项目查看；新运行会在其完成后开放。
         </div>}
-        <ResearchStartForm workspace={currentWorkspace} options={options} active={Boolean(activeRuns.length || activeRun && ACTIVE.has(activeRun.status))} onStarted={(host) => {
+        <ResearchStartForm workspace={currentWorkspace} options={options} active={Boolean(activeRun && ACTIVE.has(activeRun.status))} onStarted={(host) => {
           setResearchHostReady(true)
           setContextUsage(host.contextUsage ?? null)
           setContextMessageCount(Number(host.stats?.totalMessages ?? 0))
@@ -364,7 +342,7 @@ export const ResearchWorkbench: React.FC = () => {
               <div className="h-7 w-px bg-border-subtle" />
               <div className="max-w-48 truncate text-[10px] text-dim" title={runDetail.run.workspace}>{runDetail.run.workspace}</div>
             </div>
-            <ResearchGraphCanvas showRunPicker={false} showNodeDrawer={false} onSelectNode={setSelectedNode} />
+            <ResearchGraphCanvas runId={selectedRunId} showRunPicker={false} showNodeDrawer={false} onSelectNode={setSelectedNode} />
           </section>
 
           <section className="min-h-[440px] overflow-y-auto rounded-xl border border-border-subtle bg-card">

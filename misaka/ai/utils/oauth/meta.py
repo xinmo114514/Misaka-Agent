@@ -34,6 +34,7 @@ from misaka.ai.utils.oauth.types import (
     OAuthDeviceCodeInfo,
     OAuthLoginCallbacks,
 )
+from misaka.config.proxy_settings import proxy_httpx_options
 from misaka.utils.values import signal_aborted
 
 # Muse Code CLI client id.
@@ -61,14 +62,14 @@ class MetaHttpResponse:
 Post = Callable[[str, dict[str, str], str, Any], Awaitable[MetaHttpResponse]]
 
 
-def _new_http_client() -> httpx.AsyncClient:
+def _new_http_client(endpoint: str) -> httpx.AsyncClient:
     # Upstream's 30s `AbortSignal.timeout` is this client's timeout.
-    return httpx.AsyncClient(timeout=REQUEST_TIMEOUT_MS / 1000)
+    return httpx.AsyncClient(timeout=REQUEST_TIMEOUT_MS / 1000, **proxy_httpx_options(endpoint))
 
 
 async def _default_post(url: str, headers: dict[str, str], body: str, signal: Any) -> MetaHttpResponse:
     async def request() -> MetaHttpResponse:
-        async with _new_http_client() as client:
+        async with _new_http_client(url) as client:
             response = await client.post(url, headers=headers, content=body.encode())
         return MetaHttpResponse(status=response.status_code, body=response.text)
 

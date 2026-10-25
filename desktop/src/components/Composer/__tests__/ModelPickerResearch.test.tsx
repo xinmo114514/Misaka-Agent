@@ -12,7 +12,7 @@ beforeEach(() => {
   window.bridge = { send: command => ordinary.push(command), on: () => () => {} }
   window.researchBridge = { send: command => sent.push(command), on: callback => { deliver = callback; return () => {} } }
   release = installResearchBridge()
-  useSessionStore.setState({ agentMode: 'research', currentSessionId: 'failed-ordinary', activeSessionId: 'ordinary', sessionLoadError: 'ordinary failed', researchModelBinding: null, researchTeam: null, researchBinding: { sessionId: 'root', sessionFile: '/root', workspace: '/work', runId: 'run' } })
+  useSessionStore.setState({ researchPageView: 'conversation', agentMode: 'research', currentSessionId: 'failed-ordinary', activeSessionId: 'ordinary', sessionLoadError: 'ordinary failed', researchModelBinding: null, researchTeam: null, researchBinding: { sessionId: 'root', sessionFile: '/root', workspace: '/work', runId: 'run' } })
   useSettingsStore.setState({ models: ['A', 'B'].map(id => ({ provider: 'fixture', id, name: id, reasoning: true, thinkingLevels: ['high'], input: [], maxTokens: 100, contextWindow: 1000, configured: true })), researchModelBinding: null, researchModelSessionId: null, researchModelTarget: null })
   useSettingsStore.getState().applyResearchModelBinding('root', { effective: { provider: 'fixture', modelId: 'A' }, target: null, state: 'ready', epoch: 1 })
 })
@@ -55,4 +55,34 @@ it('keeps bound research depth read-only while its model choice remains switchab
   useSettingsStore.getState().setThinkingLevel('low')
   expect(ordinary).toEqual([])
   expect(screen.getByRole('button', { name: 'A' })).toBeEnabled()
+})
+
+it('changes a new entry model and depth locally with zero host or ordinary IPC', () => {
+ useSessionStore.getState().setResearchPageView('new')
+ useSettingsStore.getState().setSessionModel('fixture', 'B')
+ useSettingsStore.getState().setThinkingLevel('high')
+ expect(sent).toEqual([])
+ expect(ordinary).toEqual([])
+ const state = useSessionStore.getState()
+ expect(state.researchEditors[state.researchView.ownerKey].model?.modelId).toBe('B')
+ expect(state.researchEditors[state.researchView.ownerKey].thinkingLevel).toBe('high')
+})
+it('keeps LO and Sister new-entry choices separate and switches only selected role in a bound run', () => {
+  useSessionStore.getState().setResearchPageView('new')
+  useSessionStore.getState().setResearchEditorConfig({ model: null })
+  const first = render(<ModelPickerPopover onClose={() => {}} />)
+  fireEvent.click(screen.getByRole('button', { name: 'Last Order 模型' }))
+  fireEvent.click(screen.getByRole('button', { name: 'A' }))
+  fireEvent.click(screen.getByRole('button', { name: /B.*1 档/ }))
+  const owner = useSessionStore.getState().researchView.ownerKey
+  expect(useSessionStore.getState().researchEditors[owner].lastOrderModel?.modelId).toBe('B')
+  expect(useSessionStore.getState().researchEditors[owner].model).toBeNull()
+  expect(sent).toEqual([])
+  first.unmount()
+  useSessionStore.getState().setResearchPageView('conversation')
+  render(<ModelPickerPopover onClose={() => {}} />)
+  fireEvent.click(screen.getByRole('button', { name: 'Last Order 模型' }))
+  fireEvent.click(screen.getByRole('button', { name: 'A' }))
+  fireEvent.click(screen.getByRole('button', { name: /B.*1 档/ }))
+  expect(sent[0]).toMatchObject({ type: 'desktop_set_team_model', role: 'last_order', provider: 'fixture', modelId: 'B' })
 })

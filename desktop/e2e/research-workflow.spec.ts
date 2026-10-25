@@ -1,5 +1,6 @@
 import { expect, test } from '@playwright/test'
 import { readFile } from 'node:fs/promises'
+import { openFocusGraph, toggleFocusProcess } from './focusUi'
 
 test.setTimeout(90000)
 
@@ -15,22 +16,27 @@ test('completes a mocked desktop research cycle from plan review to exported rep
   const input = page.getByRole('textbox', { name: '给 Misaka 发送任务' })
   await input.fill('RAG 与长上下文方法在文献问答中的优势与局限')
   await input.press('Enter')
+  // A new run is configured first; this case walks the plan-review path, so it lifts that review.
+  const wizard = page.getByRole('dialog', { name: '研究参数确认' })
+  await expect(wizard).toBeVisible()
+  await wizard.getByRole('checkbox', { name: '计划审批' }).uncheck()
+  await wizard.getByRole('button', { name: '确认并开始研究' }).click()
 
-  const pill = page.getByTestId('research-run-pill')
-  await expect(pill).toBeVisible()
-  await expect(page.getByText(/正在进行研究/)).toBeVisible()
+  // The run opens as an ordinary conversation; its process sits behind the header entry.
+  await expect(page.locator('[data-research-focus-view]')).toBeVisible()
+  await expect(page.getByRole('button', { name: /研究团队/ })).toBeVisible()
 
   const simulatedRun = await page.evaluate(() => (window as any).conversationFixture.research.state())
   expect(simulatedRun.question).toBe('RAG 与长上下文方法在文献问答中的优势与局限')
   expect(simulatedRun.start).toMatchObject({ workspace: 'C:/research', limits: { plan_approval: false } })
 
-  // Expand research pill to view multi-agent tasks
-  await page.getByRole('button', { name: /展开研究过程/ }).click()
-  await expect(page.getByText('协同任务与专家分工')).toBeVisible()
-  await expect(page.getByText('文献基准比较结果')).toBeVisible()
+  // Open the run's own working parts: tasks, the experts who took them, and retention.
+  await toggleFocusProcess(page)
+  const process = page.getByRole('region', { name: '研究运行过程' })
+  await expect(process).toContainText('文献基准比较结果')
 
   // Click task to open right-side drawer
-  await page.getByRole('button', { name: /查看任务 文献基准比较结果/ }).click()
+  await process.getByRole('button', { name: /查看任务 文献基准比较结果/ }).click()
   const drawer = page.getByTestId('research-task-drawer')
   await expect(drawer).toBeVisible()
   await expect(drawer.getByText(/比较检索召回、长上下文跨段整合和引用可核验性/)).toBeVisible()
@@ -43,8 +49,8 @@ test('completes a mocked desktop research cycle from plan review to exported rep
   await page.getByRole('button', { name: '关闭任务抽屉' }).click()
   await expect(drawer).toHaveCount(0)
 
-  // Open DAG modal
-  await page.getByRole('button', { name: '查看研究拓扑图' }).click()
+  // Structural controls are in contextual More, not a second permanent toolbar.
+  await openFocusGraph(page)
   const modal = page.getByRole('dialog', { name: '研究拓扑图' })
   await expect(modal).toBeVisible()
   await expect(modal.locator('.react-flow__node[data-id="b_root"]')).toBeVisible()

@@ -2,6 +2,7 @@ import React, { useId } from 'react'
 import { ChevronRight, Sparkles } from 'lucide-react'
 import { useSettingsStore } from '../../store/useSettingsStore'
 import { useDisclosure } from '../../lib/sessionViewState'
+import { useChatSurfaceKey } from './ChatSurface'
 
 interface ThinkingBlockProps {
   thinking: string
@@ -11,8 +12,9 @@ interface ThinkingBlockProps {
 
 export const ThinkingBlock: React.FC<ThinkingBlockProps> = ({ thinking, isStreaming = false, stateKey }) => {
   const hideThinkingBlock = useSettingsStore(s => s.hideThinkingBlock)
+  const surfaceKey = useChatSurfaceKey()
   // null follows the segment lifecycle; a click is a lasting user decision.
-  const [manualExpanded, setManualExpanded] = useDisclosure(`thinking:${stateKey ?? 'standalone'}`)
+  const [manualExpanded, setManualExpanded] = useDisclosure(`thinking:${stateKey ?? 'standalone'}`, surfaceKey)
   const expanded = manualExpanded ?? (isStreaming && !hideThinkingBlock)
   const contentId = useId()
   if (!thinking) return null

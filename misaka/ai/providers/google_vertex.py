@@ -10,6 +10,8 @@ from collections.abc import Mapping
 from typing import Any, Literal, TypedDict
 from urllib.parse import urlparse
 
+import httpx
+
 try:
     from google.genai import Client as GoogleGenAI
 except ImportError:  # optional extra: misaka[google]
@@ -73,7 +75,10 @@ from misaka.ai.types import (
 )
 from misaka.ai.utils.abort import race_with_abort_signal
 from misaka.ai.utils.event_stream import AssistantMessageEventStream, spawn_stream_task
+from misaka.ai.utils.google_endpoint import resolve_google_endpoint
 from misaka.ai.utils.headers import provider_headers_to_record
+from misaka.ai.utils.httpx_lifecycle import close_after_setup_failure
+from misaka.ai.utils.network_route import httpx_client_options
 from misaka.ai.utils.sanitize_unicode import sanitize_surrogates
 from misaka.ai.utils.text import get_system_message_text
 from misaka.ai.utils.transcript import (
@@ -142,6 +147,7 @@ def stream_google_vertex(
                         api_key,
                         _option(options, "headers"),
                         _option(options, "timeoutMs"),
+                        env=_option(options, "env"),
                     )
                 else:
                     client = create_client(
@@ -150,6 +156,7 @@ def stream_google_vertex(
                         resolve_location(options),
                         _option(options, "headers"),
                         _option(options, "timeoutMs"),
+                        env=_option(options, "env"),
                     )
 
             params = build_params(model, normalized_context, options)
@@ -314,11 +321,15 @@ def stream_google_vertex(
         finally:
             aio_client = getattr(client, "aio", None)
             close = getattr(aio_client, "aclose", None) if aio_client is not None else None
-            if callable(close):
+            if _option(options, "client") is None and callable(close):
                 try:
                     await maybe_await(close())
                 except Exception:  # noqa: BLE001, S110 - closing the SDK client is best-effort after the stream ended
                     pass
+            if _option(options, "client") is None and client is not None:
+                close_sync = getattr(client, "close", None)
+                if callable(close_sync):
+                    close_sync()
             stream.end()
 
     spawn_stream_task(run(), stream=stream)
@@ -385,15 +396,20 @@ def create_client(
     location: str,
     options_headers: Mapping[str, str] | None = None,
     timeout_ms: int | None = None,
+    env: Mapping[str, str] | None = None,
 ) -> GoogleGenAI:
-    http_options = build_http_options(model, options_headers, timeout_ms) or {}
+    http_options = build_http_options(model, options_headers, timeout_ms, env=env, location=location) or {}
     http_options.setdefault("apiVersion", API_VERSION)
-    return require(GoogleGenAI, "google-genai")(
-        vertexai=True,
-        project=project,
-        location=location,
-        http_options=http_options,
-    )
+    try:
+        return require(GoogleGenAI, "google-genai")(
+            vertexai=True,
+            project=project,
+            location=location,
+            http_options=http_options,
+        )
+    except BaseException:
+        close_after_setup_failure(http_options["asyncClientArgs"]["transport"])
+        raise
 
 
 def create_client_with_api_key(
@@ -401,20 +417,27 @@ def create_client_with_api_key(
     api_key: str,
     options_headers: Mapping[str, str] | None = None,
     timeout_ms: int | None = None,
+    env: Mapping[str, str] | None = None,
 ) -> GoogleGenAI:
-    http_options = build_http_options(model, options_headers, timeout_ms) or {}
+    http_options = build_http_options(model, options_headers, timeout_ms, env=env) or {}
     http_options.setdefault("apiVersion", API_VERSION)
-    return require(GoogleGenAI, "google-genai")(
-        vertexai=True,
-        api_key=api_key,
-        http_options=http_options,
-    )
+    try:
+        return require(GoogleGenAI, "google-genai")(
+            vertexai=True,
+            api_key=api_key,
+            http_options=http_options,
+        )
+    except BaseException:
+        close_after_setup_failure(http_options["asyncClientArgs"]["transport"])
+        raise
 
 
 def build_http_options(
     model: Model,
     options_headers: Mapping[str, str] | None = None,
     timeout_ms: int | None = None,
+    env: Mapping[str, str] | None = None,
+    location: str = "global",
 ) -> dict[str, Any] | None:
     # The outer retry_google_request owns retries; disable the SDK's five-attempt default.
     http_options: dict[str, Any] = {"retryOptions": {"attempts": 1}}
@@ -437,6 +460,16 @@ def build_http_options(
     if timeout_ms is not None:
         http_options["timeout"] = timeout_ms
 
+    endpoint = resolve_google_endpoint(model.baseUrl, vertexai=True, location=location)
+    # Pin the same concrete address used for proxy selection; otherwise the SDK
+    # can apply its global overrides after this transport has already been built.
+    http_options["baseUrl"] = endpoint
+    route_options = httpx_client_options(endpoint, env)
+    http_options["clientArgs"] = route_options
+    http_options["asyncClientArgs"] = {
+        **{key: value for key, value in route_options.items() if key != "proxy"},
+        "transport": httpx.AsyncHTTPTransport(**route_options),
+    }
     return http_options or None
 
 

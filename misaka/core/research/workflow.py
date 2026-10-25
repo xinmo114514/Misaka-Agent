@@ -377,9 +377,14 @@ async def _submit_tasks(con, run, node, specs, *, kind, progress=None, round=1, 
         # short-circuits inside `link_tasks` before any status check, so a plain replay is quiet.)
         if child is None or child["status"] in _EDGES_ARE_HISTORY:
             continue
-        with runs.owned_txn(con, run, node):
+        parent_ids = [local_to_task[dep] for dep in dependencies]
+        existing = task_store.parent_ids(con, child['id'], strict=True)
+        needs = list(dict.fromkeys([*existing, *parent_ids]))
+        with runs.owned_txn(con, run, node, card_ids=[child['id']],
+                            field_updates={child['id']: {'needs': needs}},
+                            targets={child['id']: [(child['status'], 0), ('ready', 0), ('todo', 0)]}):
             task_store.link_dependencies(
-                con, [local_to_task[dep] for dep in dependencies], child["id"])
+                con, parent_ids, child["id"])
     return local_to_task
 
 
@@ -392,7 +397,8 @@ def _release_dependencies(con, run_id, *, owner=None):
         if row["status"] != "todo":
             continue
         state, parents = task_store.dependency_state(con, row["id"])
-        with task_store.write_txn(con):
+        with task_store.write_txn(con, card_ids=[row['id']],
+                                 targets={row['id']: [('stopped', 0), ('ready', 0)]}):
             if owner is not None:
                 runs.check_owner(con, *owner)
             current = task_store.get(con, row["id"])
@@ -414,7 +420,8 @@ def _stop_pending(con, linked, *, owner=None):
     """
     for row in linked:
         if row["status"] in {"ready", "todo"}:
-            with task_store.write_txn(con):
+            with task_store.write_txn(con, card_ids=[row['id']],
+                                     targets={row['id']: [('stopped', 0)]}):
                 if owner is not None:
                     runs.check_owner(con, *owner, allow_stop=True)
                 current = task_store.get(con, row["id"])
@@ -1334,6 +1341,13 @@ async def _expand_owned(con, cfg, runner, worker, run, node, *, context, tool_ca
                     if row["id"] in scope and (row["status"] in ("failed", "stopped") or runs.parked(con, row))]
             if outcome != "failed" or not lost:
                 return outcome
+            await asyncio.to_thread(settle_done_tasks, con, run_id=run["id"])
+            from misaka.core.research.suspension import record_node_stop
+            halt = record_node_stop(con, run, node, kind=kind, scope_ids=scope)
+            if halt is not None:
+                await _progress(progress, "all_cards_stopped", halt["message"], run, node=nid,
+                                suspension=halt, task_ids=[item["taskId"] for item in halt["confirmations"]])
+                return "failed"
             await _progress(progress, "cards_failed", f"{_label(node)}: {len(lost)} card(s) failed; its Last Order "
                             "decides whether to retry them, go on without them, or fail.", run, node=nid)
             try:
@@ -1466,6 +1480,11 @@ async def _expand_owned(con, cfg, runner, worker, run, node, *, context, tool_ca
                 continue
             if not _done(con, run, node, "research"):
                 return _close(con, run, node, "failed")
+            from misaka.core.research.suspension import record_node_stop
+            halt = record_node_stop(con, run, node, kind="research")
+            if halt is not None:
+                await _progress(progress, "all_cards_stopped", halt["message"], run, node=nid, suspension=halt)
+                return _close(con, run, node, "failed")
             set_node(status="synthesizing")
 
         elif status == "synthesizing":
@@ -1478,6 +1497,12 @@ async def _expand_owned(con, cfg, runner, worker, run, node, *, context, tool_ca
                 set_node(status="executing")
                 continue
             done = _done(con, run, node, "research")
+            if done:
+                from misaka.core.research.suspension import record_node_stop
+                halt = record_node_stop(con, run, node, kind="research")
+                if halt is not None:
+                    await _progress(progress, "all_cards_stopped", halt["message"], run, node=nid, suspension=halt)
+                    return _close(con, run, node, "failed")
             # The round whose cards she is reading is the latest one that has cards, not the
             # latest plan: a follow-up plan recorded just before a crash has no cards yet. A
             # round whose cards all failed, and that she chose to conclude without, has been
@@ -2015,6 +2040,10 @@ def _partial_result(con, run, reason, *, status="stopped", driver_lock=None):
     already on disk. Each node's conclusion as that node wrote it, the ledger's count of what the
     run recorded, and the issues it never settled.
     """
+    current = runs.get(con, run["id"])
+    if current is not None and current["status"] == "done":
+        return {"reason": "done", "final": {"artifact": current["final_artifact"]},
+                "run": runs.summary(con, run["id"])}
     findings = len(ledger.findings(con, run["id"]))
     lines = ['# Incomplete research run', "", f"- Run: `{run['id']}`",
              f"- Project: `{runs.project_name(run)}` (`{run['workspace']}`)",
@@ -2033,6 +2062,10 @@ def _partial_result(con, run, reason, *, status="stopped", driver_lock=None):
     lines += [""]
     expected = {**dict(run), "driver_lock": driver_lock} if driver_lock is not None else run
     with runs.owned_txn(con, expected, allow_stop=True):
+        current = runs.get(con, run["id"])
+        if current["status"] == "done":
+            return {"reason": "done", "final": {"artifact": current["final_artifact"]},
+                    "run": runs.summary(con, run["id"])}
         aid, path = runs.write_text(con, run["id"], "partial", 'Incomplete research run', runs.run_path(run, "partial.md"), "\n".join(lines))
         # A failure says why where the run is looked up, not only in the partial report (B126).
         runs.set_state(con, run["id"], status=status, final_artifact=aid, driver_lock=driver_lock,
@@ -2600,6 +2633,11 @@ async def run(con, cfg, spawner, *, run_id, poll_seconds=POLL_SECONDS, progress=
             runs.set_state(con, run_id, phase="active", driver_lock=driver_lock)
         while True:                                   # breadth-first: one level at a time, its nodes in parallel
             check_active()
+            from misaka.core.research.suspension import active_suspensions, suspend_run
+            if active_suspensions(con, run_id) and not runs.next_level(con, run_id):
+                halt = suspend_run(con, runs.get(con, run_id))
+                await _progress(progress, "all_cards_stopped", halt["message"], runs.get(con, run_id), suspension=halt)
+                return {"reason": "stopped", "final": None, "suspension": halt, "run": runs.summary(con, run_id)}
             result = await _reconcile(con, cfg, runs.get(con, run_id), window, poll_seconds=poll_seconds,
                                       progress=progress, check_active=check_active)
             if result is not None:
@@ -2677,13 +2715,22 @@ async def run(con, cfg, spawner, *, run_id, poll_seconds=POLL_SECONDS, progress=
         check_active()
         runs.set_state(con, run_id, phase="done", status="done", final_artifact=result["artifact"],
                        driver_lock=driver_lock)
-        _try_refresh_workspace_index(con, runs.get(con, run_id))
-        _bundle(con, run)
-        await _views(con, run, final=True)
+        try:
+            _try_refresh_workspace_index(con, runs.get(con, run_id))
+        except Exception:  # noqa: BLE001 - completed run must survive optional index refresh
+            _LOG.exception("Research %s: refreshing the workspace index after completion failed", run_id)
+        try:
+            _bundle(con, run)
+        except Exception:  # noqa: BLE001 - completed run must survive optional bundle update
+            _LOG.exception("Research %s: updating the completion bundle failed", run_id)
+        try:
+            await _views(con, run, final=True)
+        except Exception:  # noqa: BLE001 - completed run must survive optional view publication
+            _LOG.exception("Research %s: publishing the final desktop view failed", run_id)
         return {"reason": "done", "final": result, "run": runs.summary(con, run_id)}
     except asyncio.CancelledError:
         current = runs.get(con, run_id)
-        if current["driver_lock"] == driver_lock:
+        if current["status"] != "done" and current["driver_lock"] == driver_lock:
             runs.request_stop(con, run_id)
             await _settle_stopped_tasks(con, cfg, run_id)
             partial(halts["stopped"])

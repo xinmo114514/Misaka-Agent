@@ -558,10 +558,27 @@ async def test_stdout_contains_only_valid_json_lines(monkeypatch: pytest.MonkeyP
         assert "type" in parsed or "seq" in parsed
 
 
-def test_cli_pipe_integration() -> None:
+def test_cli_pipe_integration(tmp_path) -> None:
     """End-to-end subprocess probe test with uv run misaka desktop-bridge."""
+    # A startup/stdio probe must not open the person's real auth/settings store.
+    fixture_home = tmp_path / 'cli-home'
+    fixture_home.mkdir()
+    settings = {'defaultProvider': 'fixture', 'defaultModel': 'fixture-model', 'retry': {'enabled': False}}
+    (fixture_home / 'settings.json').write_text(json.dumps(settings), encoding='utf-8')
+    profile = fixture_home / 'profiles' / 'last_order'
+    profile.mkdir(parents=True)
+    (profile / 'settings.json').write_text(json.dumps(settings), encoding='utf-8')
+    (fixture_home / 'models.json').write_text(json.dumps({'providers': {'fixture': {
+        'baseUrl': 'http://127.0.0.1:9/v1', 'api': 'openai-completions', 'apiKey': 'fixture-not-a-real-key',
+        'models': [{'id': 'fixture-model', 'name': 'Fixture', 'reasoning': False, 'input': ['text'],
+                    'contextWindow': 8192, 'maxTokens': 1024,
+                    'cost': {'input': 0, 'output': 0, 'cacheRead': 0, 'cacheWrite': 0}}],
+    }}}), encoding='utf-8')
     cmd = ["uv", "run", "misaka", "desktop-bridge", "--no-session"]
-    payload = json.dumps({"type": "get_stats", "requestId": "sub-1"}) + "\n"
+    payload = json.dumps({"type": "get_stats", "requestId": "sub-1"}) + "\n" + json.dumps({'type': 'shutdown'}) + '\n'
+    child_env = {key: value for key, value in os.environ.items()
+                 if not key.startswith(('MISAKA_', 'HERMES_', 'LCM_', 'PI_'))
+                 and not key.endswith(('_API_KEY', '_TOKEN'))}
     proc = subprocess.Popen(
         cmd,
         stdin=subprocess.PIPE,
@@ -569,8 +586,20 @@ def test_cli_pipe_integration() -> None:
         stderr=subprocess.PIPE,
         text=True,
         encoding="utf-8",
+        env={**child_env, 'MISAKA_HOME': str(fixture_home), 'MISAKA_OFFLINE': '1'},
     )
-    stdout, _stderr = proc.communicate(payload, timeout=20)
+    try:
+        stdout, _stderr = proc.communicate(payload, timeout=60)
+    except subprocess.TimeoutExpired as error:
+        (tmp_path / 'probe-stdout.txt').write_bytes(error.stdout or b'')
+        (tmp_path / 'probe-stderr.txt').write_bytes(error.stderr or b'')
+        if os.name == 'nt':
+            subprocess.run(['taskkill.exe', '/PID', str(proc.pid), '/T', '/F'],
+                           capture_output=True, timeout=15, check=False, creationflags=subprocess.CREATE_NO_WINDOW)
+        else:
+            proc.kill()
+        proc.communicate(timeout=10)
+        raise
     assert proc.returncode == 0
 
     lines = [json.loads(line) for line in stdout.strip().splitlines() if line]

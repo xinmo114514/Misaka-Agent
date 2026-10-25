@@ -28,7 +28,7 @@ for (const theme of themes) {
     const composer = page.locator('.conversation-composer')
     await expect(composer).toHaveCSS('backdrop-filter', 'blur(20px)')
     expect(await composer.evaluate(el => getComputedStyle(el).getPropertyValue('--glass-opacity').trim()))
-      .toBe(theme.mode === 'light' ? '88%' : '82%')
+      .toBe(theme.mode === 'light' ? '88%' : '78%')
     expect(await composer.evaluate(el => getComputedStyle(el, '::before').pointerEvents)).toBe('none')
     await input.fill('玻璃材质与主题柔光验收')
     await page.getByTitle('模型与思考深度').click()

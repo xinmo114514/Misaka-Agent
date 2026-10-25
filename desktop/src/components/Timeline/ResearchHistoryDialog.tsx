@@ -1,4 +1,5 @@
-import React, { useEffect, useState } from 'react'
+import { subscribeResearchHistory, useResearchActivityStore } from '../../lib/researchActivityStore'
+import React, { useEffect, useRef, useState } from 'react'
 import {
   CheckCircle2,
   History,
@@ -8,25 +9,31 @@ import {
   X,
 } from 'lucide-react'
 import { useSessionStore } from '../../store/useSessionStore'
-import { researchPhaseLabel } from '../../lib/researchStatus'
+import { researchRunLabel } from '../../lib/researchStatus'
 import type { ResearchRunSummary } from '../../types/research'
 import { openResearchConversation } from '../../lib/startComposerResearch'
+import { consumeEscape, ESCAPE_PRIORITY, useEscapeLayer } from '../../lib/useEscapeLayer'
 
 export const ResearchHistoryDialog: React.FC = () => {
   const open = useSessionStore(s => s.researchHistoryOpen)
   const setOpen = useSessionStore(s => s.setResearchHistoryOpen)
+  useEscapeLayer(open, event => { consumeEscape(event); setOpen(false) }, ESCAPE_PRIORITY.dialog)
   const researchRuns = useSessionStore(s => s.researchRuns)
-  const fetchRuns = useSessionStore(s => s.fetchResearchRuns)
+  const syncError = useResearchActivityStore(s => s.errors.history || s.errors.active)
+  const lastSuccess = useResearchActivityStore(s => s.lastSuccess.history)
   const fetchCardDetails = useSessionStore(s => s.fetchResearchCardDetails)
+  const mounted = useRef(true)
+  useEffect(() => { mounted.current = true; return () => { mounted.current = false } }, [])
+  const generation = useSessionStore(s => s.researchHistoryGeneration)
+  useEffect(() => { setLoadingRun(null); setError(null) }, [generation])
   const [filter, setFilter] = useState('')
   const [loadingRun, setLoadingRun] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
 
   useEffect(() => {
-    if (open) {
-      fetchRuns()
-    }
-  }, [open, fetchRuns])
+    if (!open) return
+    return subscribeResearchHistory()
+  }, [open])
 
   if (!open) return null
 
@@ -37,17 +44,23 @@ export const ResearchHistoryDialog: React.FC = () => {
 
   const handleSelectRun = async (run: ResearchRunSummary) => {
     if (loadingRun) return
+    const initial = useSessionStore.getState()
+    const generation = initial.researchHistoryGeneration
+    const version = initial.researchPageVersion
+    const ownsDialog = () => mounted.current && useSessionStore.getState().researchHistoryOpen && useSessionStore.getState().researchHistoryGeneration === generation
     setLoadingRun(run.id)
     setError(null)
     try {
       const snapshot = await openResearchConversation(run.id, run.workspace)
-      useSessionStore.getState().bindResearchConversation(snapshot, true)
+      useSessionStore.getState().bindResearchConversation(snapshot)
+      if (!ownsDialog() || useSessionStore.getState().researchPageVersion !== version) return
       useSessionStore.getState().setAgentMode('research')
+      useSessionStore.getState().selectResearchView({ kind: 'conversation', sessionId: snapshot.session.sessionId, ownerKey: `conversation:${snapshot.session.sessionId}` })
       useSessionStore.setState({ researchRunId: run.id })
       await fetchCardDetails(run.id)
-      setOpen(false)
-    } catch (failure) { setError(failure instanceof Error ? failure.message : String(failure)) }
-    finally { setLoadingRun(null) }
+      if (ownsDialog()) setOpen(false)
+    } catch (failure) { if (ownsDialog()) setError(failure instanceof Error ? failure.message : String(failure)) }
+    finally { if (ownsDialog()) setLoadingRun(null) }
   }
 
   return (
@@ -90,6 +103,7 @@ export const ResearchHistoryDialog: React.FC = () => {
 
         {/* List */}
         <div className="flex-1 overflow-y-auto p-3 space-y-2">
+          {syncError && <p role="alert" className="text-warning">同步错误：{syncError} · {lastSuccess ? `最后成功同步 ${new Date(lastSuccess).toLocaleTimeString()}` : '尚无成功同步记录'}</p>}
           {error && <p role="alert" className="text-danger">{error}</p>}
           {filteredRuns.length === 0 ? (
             <div className="py-12 text-center text-dim text-xs">
@@ -125,7 +139,7 @@ export const ResearchHistoryDialog: React.FC = () => {
                       <div className="flex items-center gap-2 mt-1 text-[10.5px] text-muted font-mono">
                         <span>{run.id}</span>
                         <span>·</span>
-                        <span>{researchPhaseLabel(run.phase || run.status)}</span>
+                        <span>{researchRunLabel(run)}</span>
                         {run.workspace && (
                           <>
                             <span>·</span>

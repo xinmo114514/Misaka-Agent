@@ -36,6 +36,10 @@ POLL_SECONDS = 3.0
 PENDING_BATCH = 100    # one poll's worth; the rest stay queued (see ``pending``)
 DELIVERY_LEASE_SECONDS = 60
 DELIVERY_RENEW_SECONDS = 30
+# Staging, not a delivery lease: older readers also leave these rows alone. Only the
+# owning desktop continuation releases them after its board claim succeeds.
+CONTINUATION_HOLD_SECONDS = 1 << 60
+CONTINUATION_TOKEN = 'continuation:'
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS messages (
@@ -129,6 +133,10 @@ def send(
 
 
 CARD_ID = re.compile(r"^t_[0-9a-f]{6}$")
+# Task 1: a private scope (the desktop research host and its worker children) can install one
+# woken-card hook through its own cloned namespace. The hook owns the continuation for cards of
+# that scope; when none is installed the global panel route below is used unchanged.
+_SCOPE_WAKE_HOOK = None
 # A card that ended. A parked one (blocked, triage) has not: it waits on an answer, which goes the
 # way the help protocol takes it.
 FINISHED = frozenset({"done", "failed", "stopped"})
@@ -284,6 +292,9 @@ def _run_cards(role, *, sender_task, sender_session):
 
 def wake_card(target, message):
     """Continue a closed card with ``message`` as her next turn, in her own session. Blocking."""
+    hook = globals().get("_SCOPE_WAKE_HOOK")
+    if hook is not None:
+        return hook(target, message)
     from misaka.ui.panel import client as net
 
     pane = os.environ.get("MISAKA_NET_PANE")
@@ -474,7 +485,10 @@ def post(target, body, *, summary, sender, sender_task=None, sender_session=None
         mid = send(con, target["to_addr"], body, summary=summary, sender=sender,
                    generation=target["generation"], to_task=target["to_task"],
                    to_session=target["to_session"], sender_task=sender_task,
-                   sender_session=sender_session)
+                   sender_session=sender_session,
+                   hold_seconds=CONTINUATION_HOLD_SECONDS if target.get('_continuation_hold') else None,
+                   lease_token=(CONTINUATION_TOKEN + str(target['generation'])
+                                if target.get('_continuation_hold') else None))
     finally:
         con.close()
     if not (target["to_task"] or target["to_session"]):
@@ -498,23 +512,46 @@ def send_as(sender, addr, message, summary, *, request_input=False, card_task=No
                        f" · session {sender_session}" if sender_session else ""))
         # A note that asks nothing gets no reply: a reply to a finished card wakes her in turn,
         # and two finished cards thanking each other would wake each other for ever.
+        original_message = message
+        if globals().get('_SCOPE_WAKE_HOOK') is not None:
+            target = {**target, '_continuation_hold': True}
+            mid = post(target, body, summary=summary, sender=sender, sender_task=card_task,
+                       sender_session=sender_session)
+            target = {**target, 'message_id': mid}
+            message = "Read the newly queued task inbox messages and answer their questions."
         out = wake_card(target, f"[Message from {who}. If it asks you something, answer with SendMessage; "
                                 f"a note that asks nothing needs no reply. Then complete the card again "
                                 f"with misaka_card_complete -- your deliverable stands unless you change "
                                 f"it.]\n{message}")
         from misaka.core.platform import cards
         try:
-            cards.append_log(target["workspace"], target["to_task"], sender, f"[message] {message}")
+            cards.append_log(target["workspace"], target["to_task"], sender, f"[message] {original_message}")
         except OSError:
             pass
-        return {"content": [{"type": "text", "text": (
+        woken_where = (f"pane {out['pane_id']}" if out.get("pane_id")
+                       else f"desktop run {out.get('execution_id')}" if out.get("execution_id")
+                       else "the desktop research worker")
+        details = {"to": target["to_addr"], "to_task": target["to_task"], "to_session": None,
+                   "woken": True,
+                   **({"message_id": target['message_id'], "accepted": out.get('accepted', True),
+                       "settled": out.get('settled', False)} if target.get('message_id') else {})}
+        for key in ("pane_id", "execution_kind", "execution_id"):
+            if out.get(key) is not None:
+                details[key] = out[key]
+        notice = (
+            f"Message #{target['message_id']} is durably queued for {target['label']}; "
+            f"the desktop continuation was accepted ({woken_where}), with delivery still pending. "
+            "A reply comes back as a message"
+            if target.get('message_id') else
             f"{target['label']} had finished, so she was woken in her own session with your "
-            f"message as her next turn (pane {out['pane_id']}). A reply comes back as a message"
+            f"message as her next turn ({woken_where}). A reply comes back as a message"
+        )
+        return {"content": [{"type": "text", "text": (
+            notice
             + ("; to hear it before you go on, wait for her with misaka_sister_output "
                f"(task_id={target['to_task']}, block=true)." if sender == "last-order"
                else "; continue working without waiting for it."))}],
-            "details": {"to": target["to_addr"], "to_task": target["to_task"], "to_session": None,
-                        "pane_id": out["pane_id"], "woken": True}}
+            "details": details}
     if request_input:
         mid = request_help(target, body, message, summary, sender=sender, card_task=card_task,
                            sender_session=sender_session)
@@ -600,7 +637,10 @@ def delivery_plan(rows, board_path=None, *, task_generation=None):
         bound = row["generation"]
         if (row["to_task"] and bound is not None and task_generation is not None
                 and int(bound) != int(task_generation)):
-            discard.add(int(row["id"]))          # a note for an attempt that is over
+            if int(bound) < int(task_generation):
+                discard.add(int(row["id"]))      # a note for an attempt that is over
+            # A previous reader may still poll while the next attempt starts. It
+            # must neither consume nor acknowledge that next attempt's mail.
         else:
             deliverable.add(int(row["id"]))
     if not task_rows:

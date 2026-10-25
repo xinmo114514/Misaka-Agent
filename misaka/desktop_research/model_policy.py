@@ -144,9 +144,50 @@ class DesktopTeamModelPolicy:
             key = self._key(executor_id)
             if any(r['executor'] == key for r in state['requests'].values()):
                 raise ValueError('Executor still has active requests')
+            # An executor explicitly marked closing by another process is released here only
+            # when nothing remains; a caller that reaches this door with a live request must
+            # use settle_executor so the pending state is visible instead of being an error.
             state['executors'].pop(key, None)
             self._write(state)
         self._callbacks.pop(executor_id, None)
+
+    def begin_closing(self, executor_id):
+        """Mark one executor as closing: new admissions pause, existing requests drain.
+
+        Task 2: close and release are different facts. ``closing`` stops new work at once so no
+        fresh request can join the barrier while the settlement is still draining; the settle
+        step below is what actually removes the executor and its callback.
+        """
+        with self.lock:
+            state = self._read()
+            key = self._key(executor_id)
+            executor = state['executors'].get(key)
+            if executor is None:
+                return False
+            executor['closing'] = True
+            self._write(state)
+            return True
+
+    def settle_executor(self, executor_id):
+        """The close/drain step: unregister only when no request remains.
+
+        Returns ``'settled'`` when the executor (and its callback) are gone, ``'pending'`` when a
+        request is still live, and ``'absent'`` when it was already released. Task 2: a pending
+        settlement is a state to retry, not a crash to report; the caller keeps the object until
+        this returns ``settled`` or ``absent``.
+        """
+        with self.lock:
+            state = self._read()
+            key = self._key(executor_id)
+            if key not in state['executors']:
+                self._callbacks.pop(executor_id, None)
+                return 'absent'
+            if any(r['executor'] == key for r in state['requests'].values()):
+                return 'pending'
+            state['executors'].pop(key, None)
+            self._write(state)
+            self._callbacks.pop(executor_id, None)
+            return 'settled'
 
     def guard_model(self, expected_epoch=None):
         with self.lock:
@@ -168,6 +209,9 @@ class DesktopTeamModelPolicy:
             executor = state['executors'].get(key)
             if executor is None:
                 raise ValueError('Executor is not registered in this process')
+            if executor.get('closing'):
+                # The executor is being closed: no new admission may join the barrier (Task 2).
+                raise ModelPolicyPaused('Executor is closing')
             if executor['bound'] != state['effective'] or executor['boundEpoch'] != state['epoch']:
                 raise ModelPolicyPaused('Executor needs to synchronize its model')
             ticket = {**state['effective'], 'epoch': state['epoch'], 'requestId': uuid.uuid4().hex}
@@ -339,3 +383,216 @@ class DesktopTeamModelPolicy:
                     executor['ack'] = state['operation']
             self._write(state)
         return await self._finish_boundary(timeout, cancel=True, operation=operation)
+
+
+class DesktopRoleModelPolicy:
+    """Two cooperative boundaries sharing a team identity, but not request drains.
+
+    The historical policy file remains the Sister boundary. A pre-existing single
+    policy is copied exactly into the Last Order boundary on first role-aware open.
+    Both files are independently durable and may be opened by child processes.
+    """
+
+    ROLES = ('last_order', 'sister')
+
+    def __init__(self, path, provider, model_id, *, lo_provider=None, lo_model=None):
+        self.path = Path(path)
+        self._gate_path = self.path.with_name(self.path.stem + '-all-boundary' + self.path.suffix)
+        self._gate_lock = FileLock(str(self._gate_path) + '.lock', timeout=30)
+        # A first opener creates both roles as one migration decision. Without
+        # this lock a concurrent child could mistake the freshly created Sister
+        # file for an old single-policy team and seed LO from the wrong pair.
+        with FileLock(str(self.path) + '.roles.lock', timeout=30):
+            old_team = self.path.exists()
+            self._policies = {'sister': DesktopTeamModelPolicy(path, provider, model_id)}
+            saved = self._policies['sister'].snapshot()['effective']
+            lo_path = self.path.with_name(self.path.stem + '-last-order' + self.path.suffix)
+            initial = saved if old_team else model_pair(lo_provider or provider, lo_model or model_id)
+            self._policies['last_order'] = DesktopTeamModelPolicy(lo_path, initial['provider'], initial['modelId'])
+        self._executor_roles = {}
+        self._all_task = None
+
+    @staticmethod
+    def _role(role):
+        if role not in DesktopRoleModelPolicy.ROLES:
+            raise ValueError(f'Unknown desktop model role: {role}')
+        return role
+
+    def _policy(self, role='sister'):
+        return self._policies[self._role(role)]
+
+    def _gate(self):
+        with self._gate_lock:
+            try:
+                return json.loads(self._gate_path.read_text(encoding='utf-8'))
+            except FileNotFoundError:
+                return None
+
+    def _set_gate(self, state):
+        with self._gate_lock:
+            if state is None:
+                self._gate_path.unlink(missing_ok=True)
+            else:
+                atomic_json(self._gate_path, state)
+
+    def _check_gate(self):
+        gate = self._gate()
+        if gate:
+            raise ModelPolicyPaused(gate.get('error') or 'All-team model switch in progress')
+
+    def snapshot(self, role='sister'):
+        binding = self._policy(role).snapshot()
+        gate = self._gate()
+        if gate and gate['state'] == 'failed':
+            return {**binding, 'state': 'failed', 'error': gate['error'], 'target': gate['target']}
+        return binding
+
+    def bindings(self):
+        return {role: self.snapshot(role=role) for role in self.ROLES}
+
+    def subscribe(self, callback):
+        # Emit for changes in either persisted boundary. The legacy callback
+        # payload remains the primary/Sister binding.
+        unsubscribers = [policy.subscribe(lambda _state: callback(self.snapshot()))
+                         for policy in self._policies.values()]
+        def unsubscribe():
+            for stop in unsubscribers:
+                stop()
+        return unsubscribe
+
+    def guard_model(self, expected_epoch=None, *, role='sister'):
+        self._check_gate()
+        return self._policy(role).guard_model(expected_epoch)
+
+    def register_executor(self, executor_id, prepare=None, *, role='sister'):
+        self._executor_roles[executor_id] = self._role(role)
+        return self._policy(role).register_executor(executor_id, prepare)
+
+    def _executor_policy(self, executor_id):
+        return self._policy(self._executor_roles.get(executor_id, 'sister'))
+
+    def unregister_executor(self, executor_id):
+        result = self._executor_policy(executor_id).unregister_executor(executor_id)
+        self._executor_roles.pop(executor_id, None)
+        return result
+
+    def begin_closing(self, executor_id):
+        return self._executor_policy(executor_id).begin_closing(executor_id)
+
+    def settle_executor(self, executor_id):
+        result = self._executor_policy(executor_id).settle_executor(executor_id)
+        if result != 'pending':
+            self._executor_roles.pop(executor_id, None)
+        return result
+
+    def begin_request(self, executor_id, expected_epoch=None, *, role=None):
+        role = self._role(role or self._executor_roles.get(executor_id, 'sister'))
+        self._check_gate()
+        return {**self._policy(role).begin_request(executor_id, expected_epoch), 'role': role}
+
+    def end_request(self, ticket):
+        if isinstance(ticket, dict) and ticket.get('role') in self.ROLES:
+            return self._policy(ticket['role']).end_request(ticket)
+        # Legacy callers pass a request ID rather than a ticket; locate its
+        # policy without ever releasing another process's request.
+        for policy in self._policies.values():
+            with policy.lock:
+                found = ticket in policy._read()['requests']
+            if found:
+                return policy.end_request(ticket)
+
+    async def synchronize_executor(self, executor_id):
+        return await self._executor_policy(executor_id).synchronize_executor(executor_id)
+
+    @asynccontextmanager
+    async def request(self, executor_id):
+        role = self._executor_roles.get(executor_id, 'sister')
+        while True:
+            await self.synchronize_executor(executor_id)
+            try:
+                ticket = self.begin_request(executor_id, role=role)
+                break
+            except ModelPolicyPaused:
+                if self.snapshot(role=role)['state'] == 'failed':
+                    raise
+                await asyncio.sleep(.01)
+        try:
+            yield {k: ticket[k] for k in ('provider', 'modelId', 'epoch')}
+        finally:
+            self.end_request(ticket)
+
+    async def switch(self, provider, model_id, *, role='all', timeout=30):
+        if role != 'all':
+            self._check_gate()
+            return await self._policy(role).switch(provider, model_id, timeout=timeout)
+        # Preserve the historical all-team operation. Switch Sister first so a
+        # failed root legacy preparation leaves LO unchanged; if LO fails later,
+        # restore Sister and expose the truthful independent failure bindings.
+        originals = {name: policy.snapshot()['effective'] for name, policy in self._policies.items()}
+        gate = self._gate()
+        if gate and gate['state'] != 'failed':
+            raise ModelPolicyPaused('Another all-team model boundary is pending')
+        operation = uuid.uuid4().hex
+        self._set_gate({'state': 'switching', 'target': model_pair(provider, model_id),
+                        'operation': operation})
+        self._all_task = asyncio.current_task()
+        async def cancelled():
+            current = self._gate()
+            if current and current.get('operation') == operation and current['state'] == 'switching':
+                return False
+            for name, original in originals.items():
+                policy = self._policy(name)
+                actual = policy.snapshot()
+                if actual['state'] != 'ready':
+                    await policy.cancel_switch(timeout=timeout)
+                    actual = policy.snapshot()
+                if actual['state'] == 'ready' and actual['effective'] != original:
+                    await policy.switch(original['provider'], original['modelId'], timeout=timeout)
+            current = self._gate()
+            if current and current.get('operation') == operation and current['state'] == 'cancelling':
+                self._set_gate(None)
+            return True
+        try:
+            result = await self._policy('sister').switch(provider, model_id, timeout=timeout)
+            if await cancelled():
+                return self.snapshot()
+            if result['state'] != 'ready':
+                self._set_gate({'state': 'failed', 'target': model_pair(provider, model_id),
+                                'error': result.get('error', 'Sister preparation failed'), 'operation': operation})
+                return self.snapshot()
+            other = await self._policy('last_order').switch(provider, model_id, timeout=timeout)
+            if await cancelled():
+                return self.snapshot()
+            if other['state'] != 'ready':
+                original = originals['sister']
+                await self._policy('sister').switch(original['provider'], original['modelId'], timeout=timeout)
+                self._set_gate({'state': 'failed', 'target': model_pair(provider, model_id),
+                                'error': other.get('error', 'Last Order preparation failed'), 'operation': operation})
+                return self.snapshot()
+            self._set_gate(None)
+            return self.snapshot()
+        except BaseException:
+            current = self._gate()
+            if current and current.get('operation') == operation and current['state'] != 'cancelling':
+                self._set_gate({'state': 'failed', 'target': model_pair(provider, model_id),
+                                'error': 'All-team switch interrupted; cancel or retry explicitly',
+                                'operation': operation})
+            raise
+        finally:
+            if self._all_task is asyncio.current_task():
+                self._all_task = None
+
+    async def cancel_switch(self, *, role='all', timeout=30):
+        if role != 'all':
+            return await self._policy(role).cancel_switch(timeout=timeout)
+        gate = self._gate()
+        if gate and gate['state'] == 'switching':
+            self._set_gate({**gate, 'state': 'cancelling'})
+        for current in self.ROLES:
+            await self._policy(current).cancel_switch(timeout=timeout)
+        task = self._all_task
+        if task is not None and task is not asyncio.current_task():
+            await asyncio.wait_for(asyncio.shield(task), timeout=timeout)
+        if all(p.snapshot()['state'] == 'ready' for p in self._policies.values()) and self._all_task is None:
+            self._set_gate(None)
+        return self.snapshot()

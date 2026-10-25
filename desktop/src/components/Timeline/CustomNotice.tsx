@@ -13,6 +13,7 @@ import type { ChatMessage } from '../../types/session'
 import { useSessionStore } from '../../store/useSessionStore'
 import { ResearchRunPill } from './ResearchRunPill'
 import { ResearchFinalReport } from './ResearchFinalReport'
+import { useChatPermissions } from './ChatSurface'
 
 /**
  * One engine notice from the conversation's own feed.
@@ -35,6 +36,7 @@ const KINDS: Record<string, NoticeKind> = {
   'research-phase': { label: '研究阶段', tone: 'neutral', Icon: ClipboardList },
   'research-review': { label: '审阅意见', tone: 'info', Icon: ShieldAlert },
   'research-question': { label: '待你澄清', tone: 'warning', Icon: AlertTriangle },
+  'research-clarification': { label: '待你澄清', tone: 'warning', Icon: AlertTriangle },
   'research-discipline': { label: '研究规程', tone: 'info', Icon: ScrollText },
   'research-final': { label: '研究结论', tone: 'success', Icon: Flag },
   'research-error': { label: '研究故障', tone: 'danger', Icon: AlertTriangle },
@@ -71,12 +73,19 @@ export const CustomNotice: React.FC<{ message: ChatMessage }> = ({ message }) =>
 
   const customType = message.customType || ''
   const runId = String(message.details?.run_id || message.details?.runId || '')
+  const { hideRunEntry, readOnly } = useChatPermissions()
 
   if (customType === 'research-final') {
     return <ResearchFinalReport message={message} />
   }
 
   if (customType.startsWith('research-') && runId) {
+    // A sub-agent transcript is not where the run is steered, and a surface with its own run
+    // entry (the focus header) already carries the controls: never repeat the pill. A run that is
+    // waiting on the reader still has to say so, so those notices survive as plain rows.
+    const pending = customType === 'research-clarification' || customType === 'research-question'
+    if (!pending && (readOnly || hideRunEntry)) return null
+    if (readOnly || hideRunEntry) return noticed(message, KINDS[customType] ?? { label: '研究通知', tone: 'warning', Icon: AlertTriangle })
     const state = useSessionStore.getState()
     const allMessages = state.agentMode === 'research' && state.researchBinding ? state.researchConversation.messages : state.messages
     const firstNoticeForRun = allMessages.find(m =>
@@ -96,6 +105,16 @@ export const CustomNotice: React.FC<{ message: ChatMessage }> = ({ message }) =>
     tone: 'neutral' as Tone,
     Icon: Info,
   }
+  return noticed(message, kind)
+}
+
+/**
+ * One notice row.
+ *
+ * A run's own transcript keeps the engine's notices, but they must not look like something Last
+ * Order wrote, so they share the block the timeline uses for every other engine notice.
+ */
+function noticed(message: ChatMessage, kind: NoticeKind) {
   const { Icon } = kind
   const timeStr = new Date(message.timestamp).toLocaleTimeString([], {
     hour: '2-digit',

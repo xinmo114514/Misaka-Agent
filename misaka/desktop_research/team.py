@@ -11,7 +11,7 @@ from filelock import FileLock
 
 from misaka.core.network import roster
 
-from .model_policy import DesktopTeamModelPolicy, atomic_json
+from .model_policy import DesktopRoleModelPolicy, atomic_json
 
 _CREDENTIAL_NAME_PATTERN = (
     r'(?:api[\s_.-]*key|(?:access|refresh|auth|session|id)[\s_.-]*token|'
@@ -77,7 +77,8 @@ def create_owned_sister(name, root, responsibility):
 
 
 class DesktopResearchTeam:
-    def __init__(self, session_dir, shared_root, provider, model_id, *, team_id=None, allowed_tools=None):
+    def __init__(self, session_dir, shared_root, provider, model_id, *, team_id=None, allowed_tools=None,
+                 lo_provider=None, lo_model=None):
         self.directory = Path(session_dir).resolve() / 'desktop-team'
         self.directory.mkdir(parents=True, exist_ok=True)
         self.shared_root = Path(shared_root).expanduser().resolve()
@@ -92,7 +93,8 @@ class DesktopResearchTeam:
                              'members': [], 'retentionReceipts': {}})
             elif team_id and self._read()['teamId'] != team_id:
                 raise ValueError('Session already belongs to another team')
-        self.model_policy = DesktopTeamModelPolicy(self.directory / 'model-policy.json', provider, model_id)
+        self.model_policy = DesktopRoleModelPolicy(self.directory / 'model-policy.json', provider, model_id,
+                                                  lo_provider=lo_provider, lo_model=lo_model)
 
     def _read(self):
         return json.loads(self.path.read_text(encoding='utf-8'))
@@ -124,7 +126,7 @@ class DesktopResearchTeam:
                 if any(existing.get(k) != v for k, v in content.items()):
                     raise ValueError('Role name already has different content')
                 return deepcopy(existing)
-            pair = self.model_policy.guard_model()
+            pair = self.model_policy.guard_model(role='sister')
             source = self.shared_root / source_id if source_id else None
             if source is not None and (not source.is_dir() or source.is_symlink()):
                 raise ValueError('Source Sister does not exist or is linked')
@@ -171,17 +173,18 @@ class DesktopResearchTeam:
     def snapshot(self):
         with self.lock:
             state = self._read()
-        binding = self.model_policy.snapshot()
+        bindings = self.model_policy.bindings()
+        binding = bindings['sister']
         members = deepcopy(state['members'])
         for member in members:
             member['effectiveModel'] = {**binding['effective'], 'epoch': binding['epoch']}
         return {'team': {k: state[k] for k in ('teamId', 'scene')} | {'members': members},
-                'modelBinding': binding}
+                'modelBinding': binding, 'modelBindings': bindings}
 
     def pin_profiles(self, provider, model_id):
         """Refresh task-local files after commit, never alter a shared Sister pin."""
         with self.lock:
-            binding = self.model_policy.guard_model()
+            binding = self.model_policy.guard_model(role='sister')
             if (provider, model_id) != (binding['provider'], binding['modelId']):
                 raise ValueError('Profile pins must match the committed team model')
             state = self._read()
@@ -190,6 +193,21 @@ class DesktopResearchTeam:
                 member['effectiveModel'] = binding
             self._write(state)
         return binding
+
+    def role_thinking(self, role):
+        if role not in ('last_order', 'sister'):
+            raise ValueError('Unknown desktop model role')
+        with self.lock:
+            return self._read().get('roleThinking', {}).get(role)
+
+    def set_role_thinking(self, role, level):
+        if role not in ('last_order', 'sister'):
+            raise ValueError('Unknown desktop model role')
+        with self.lock:
+            state = self._read()
+            state.setdefault('roleThinking', {})[role] = level
+            self._write(state)
+        return level
 
     @staticmethod
     def _retained_text(text, goal):

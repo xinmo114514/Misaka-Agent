@@ -11,6 +11,8 @@ from collections.abc import AsyncIterable, Mapping
 from functools import lru_cache
 from typing import Any, Literal, TypedDict, cast
 
+import httpx
+
 from misaka.ai.env_api_keys import get_env_api_key
 from misaka.ai.models import calculate_cost, clamp_thinking_level
 from misaka.ai.providers.simple_options import build_base_options
@@ -65,6 +67,8 @@ from misaka.ai.providers.constrained_sampling import (
 )
 from misaka.ai.providers.sdk import require
 from misaka.ai.utils.headers import apply_provider_headers, headers_to_record
+from misaka.ai.utils.httpx_lifecycle import close_after_setup_failure
+from misaka.ai.utils.network_route import httpx_client_options
 from misaka.ai.utils.user_agent import get_misaka_user_agent
 from misaka.utils.values import maybe_await, signal_aborted
 
@@ -127,6 +131,7 @@ def stream_mistral(
 
     async def run() -> None:
         output = create_output(model)
+        mistral = None
 
         try:
             api_key = _option(options, "apiKey") or get_env_api_key(model.provider)
@@ -135,7 +140,7 @@ def stream_mistral(
 
             mistral = _option(options, "client")
             if mistral is None:
-                mistral = create_client(model, api_key, _option(options, "timeoutMs"))
+                mistral = create_client(model, api_key, _option(options, "timeoutMs"), env=_option(options, "env"))
 
             normalize_tool_call_id = create_mistral_tool_call_id_normalizer()
             transformed_messages = transform_messages(
@@ -192,6 +197,12 @@ def stream_mistral(
             output.errorMessage = format_mistral_error(error)
             stream.push(ErrorEvent(reason=output.stopReason, error=output), cause=error)
         finally:
+            if _option(options, "client") is None and mistral is not None:
+                clients = getattr(mistral, "_misaka_http_clients", ())
+                for owned_client in clients:
+                    close = getattr(owned_client, "aclose", None) or getattr(owned_client, "close", None)
+                    if callable(close):
+                        await maybe_await(close())
             stream.end()
 
     spawn_stream_task(run(), stream=stream)
@@ -223,7 +234,7 @@ def stream_simple_mistral(
     )
 
 
-def create_client(model: Model, api_key: str, timeout_ms: int | None = None) -> Any:
+def create_client(model: Model, api_key: str, timeout_ms: int | None = None, env: Mapping[str, str] | None = None) -> Any:
     mistral_client = _get_mistral_client_class()
     client_options: dict[str, Any] = {
         "api_key": api_key,
@@ -231,7 +242,21 @@ def create_client(model: Model, api_key: str, timeout_ms: int | None = None) -> 
     }
     if timeout_ms is not None:
         client_options["timeout_ms"] = timeout_ms
-    return mistral_client(**client_options)
+    route_options = httpx_client_options(model.baseUrl or "https://api.mistral.ai", env)
+    parameters = inspect.signature(mistral_client).parameters
+    if not any(parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in parameters.values()) and not {"client", "async_client"}.issubset(parameters):
+        raise ValueError("Installed Mistral SDK lacks explicit HTTPX transport support; upgrade mistralai")
+    sync_client = httpx.Client(follow_redirects=True, **route_options)
+    async_client = None
+    try:
+        async_client = httpx.AsyncClient(follow_redirects=True, **route_options)
+        client_options.update(client=sync_client, async_client=async_client)
+        client = mistral_client(**client_options)
+        client._misaka_http_clients = (sync_client, async_client)
+    except BaseException:
+        close_after_setup_failure(sync_client, *([async_client] if async_client is not None else []))
+        raise
+    return client
 
 
 def create_output(model: Model) -> AssistantMessage:

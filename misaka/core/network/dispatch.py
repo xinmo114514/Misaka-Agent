@@ -4,6 +4,7 @@ import json
 import os
 import secrets
 import socket
+import traceback
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -13,6 +14,16 @@ from misaka.core.platform import admission, budget
 from misaka.core.platform import tasks as db
 
 _skipped_logged = set()
+_SCOPE_CONTINUATION_CLAIMING = None
+_SCOPE_CONTINUATION_CLAIMED = None
+
+
+def record_dispatch_error(con, task_id, generation, error):
+    from misaka.utils.redact import redact
+    db.add_event(con, task_id, "dispatch_error", {
+        "reason": redact(f"{type(error).__name__}: {error}"),
+        "traceback": redact("".join(traceback.format_exception(error))),
+    }, generation=generation)
 
 
 def _profile_dir(cfg, assignee):
@@ -171,10 +182,14 @@ def reconcile(con, cfg, *, task_ids=None, workspace=None):
 
 
 
-def run_task(con, t, cfg, *, say=None):
+def run_task(con, t, cfg, *, say=None, consult=False, expected_generation=None):
     """Claim a ready card and run it; with ``say``, continue the settled card ``t`` instead -- a new
     generation in her own conversation, the message being the turn (the headless counterpart of
-    ``pane.continue_card``, which ``misaka_sister_message`` uses in a panel)."""
+    ``pane.continue_card``, which ``misaka_sister_message`` uses in a panel).
+
+    ``consult`` mirrors the panel route: she is woken only to answer a message, so nothing built
+    on her answer goes back to todo. ``expected_generation`` fences against a card that moved on
+    between resolution and the real claim CAS (Task 1: desktop continuations carry both)."""
     from misaka.core.network.ally import presets
     host_cap, assignee_cap = admission.limits()
     identity = _worker_identity()
@@ -198,8 +213,16 @@ def run_task(con, t, cfg, *, say=None):
     lock = f"{socket.gethostname()}:{os.getpid()}:{secrets.token_hex(4)}"
     generation = int(t["generation"])
     if say is not None:
+        if expected_generation is not None and int(expected_generation) != generation:
+            # The card moved on between resolution and this process start: refuse before the CAS
+            # so nothing is reopened (Task 1 stale-generation contract).
+            return False
+        claiming = globals().get('_SCOPE_CONTINUATION_CLAIMING')
+        if claiming is not None:
+            claiming(t['id'], generation, lock, identity)
         if not db.claim_resume(con, t["id"], lock, os.getpid(), worker_identity=identity,
-                               expected_generation=generation, host_cap=host_cap, assignee_cap=assignee_cap):
+                               expected_generation=generation, host_cap=host_cap, assignee_cap=assignee_cap,
+                               consult=consult):
             return False
         t = db.get(con, t["id"])
         generation = int(t["generation"])
@@ -259,6 +282,9 @@ def run_task(con, t, cfg, *, say=None):
         except (AttributeError, IndexError, TypeError):
             usage_db = None
     try:
+        claimed = globals().get('_SCOPE_CONTINUATION_CLAIMED')
+        if claimed is not None:
+            claimed(t['id'], generation, lock)
         verdict = _run_ally(con, task, generation, lock, usage_db, say) if ally else worker.run_card(
             task, run_dir, profile_dir, cfg["provider"], cfg["default_model"],
             on_event=lambda line: (event := _compact_event(line)) is not None and db.add_event(
@@ -283,9 +309,7 @@ def run_task(con, t, cfg, *, say=None):
             reason = f"{type(error).__name__}: {error}"[:2000]
             details = {"reason": reason, "failure_kind": "crash"} if isinstance(error, Exception) else {}
             if settle(con, t["id"], generation=generation, claim_lock=lock, **details):
-                db.add_event(con, t["id"], "dispatch_error",
-                             {"reason": reason},
-                             generation=generation)
+                record_dispatch_error(con, t["id"], generation, error)
         raise
     if verdict.get("budget_stop"):
         if db.back_to_ready(

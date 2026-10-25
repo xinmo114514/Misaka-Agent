@@ -2,10 +2,12 @@ import React from 'react'
 import { Network, X } from 'lucide-react'
 import { useSessionStore } from '../../store/useSessionStore'
 import { ResearchGraphCanvas } from '../ResearchGraph/ResearchGraphCanvas'
+import { consumeEscape, ESCAPE_PRIORITY, useEscapeLayer } from '../../lib/useEscapeLayer'
 
 export const ResearchGraphModal: React.FC = () => {
   const activeGraphRunId = useSessionStore(s => s.activeResearchGraphRunId)
   const setActiveGraphRunId = useSessionStore(s => s.setActiveResearchGraphRunId)
+  useEscapeLayer(Boolean(activeGraphRunId), event => { consumeEscape(event); setActiveGraphRunId(null) }, ESCAPE_PRIORITY.dialog)
 
   if (!activeGraphRunId) return null
 
@@ -32,7 +34,7 @@ export const ResearchGraphModal: React.FC = () => {
           </button>
         </div>
         <div className="flex-1 min-h-0 relative">
-          <ResearchGraphCanvas showRunPicker={false} showNodeDrawer={true} />
+          <ResearchGraphCanvas runId={activeGraphRunId} showRunPicker={false} showNodeDrawer={true} />
         </div>
       </div>
     </div>

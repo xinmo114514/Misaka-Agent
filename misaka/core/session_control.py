@@ -206,21 +206,26 @@ class SessionControl:
             # Keep native in-flight content separate from committed history. A history
             # change also resends the preview after the view rebuilds its branch.
             stream_cursor = [self.session.sessionId, *cursor, self._stream_revision, streaming is not None]
-            return {"id": self.session.sessionId, "cwd": manager.getCwd(),
+            payload = {"id": self.session.sessionId, "cwd": manager.getCwd(),
                     "state": "idle" if self.session.isIdle else "working", "paused": self.paused,
                     "error": self.error, "workflow": self.describe(), "cursor": cursor,
                     "steering": self.session.getSteeringMessages(), "follow_up": self.session.getFollowUpMessages(),
                     "stream_cursor": stream_cursor,
                     "streaming": streaming if command.get("stream_cursor") != stream_cursor else None,
-                    "entries": manager.buildContextEntries() if command.get("cursor") != cursor else None}
+                    "entries": manager.buildContextEntries() if command.get("include_entries", True) and command.get("cursor") != cursor else None}
+            if command.get("telemetry"):
+                from misaka.core.session_telemetry import collect_session_telemetry
+                payload["telemetry"] = collect_session_telemetry(self.session)
+            return payload
         if not self.accepting:
             raise ValueError("The original owner is finishing; no further input is accepted.")
         self._check_input_owner()
         if operation == "stats":
+            from misaka.core.session_telemetry import collect_session_telemetry
             from misaka.modes.jsonl import to_jsonable
-
             return {"stats": to_jsonable(self.session.getSessionStats()),
-                    "contextUsage": to_jsonable(self.session.getContextUsage())}
+                    "contextUsage": to_jsonable(self.session.getContextUsage()),
+                    "telemetry": collect_session_telemetry(self.session)}
         if operation in {"pause", "resume"}:
             self.paused = operation == "pause"
             self.catalog.refresh()

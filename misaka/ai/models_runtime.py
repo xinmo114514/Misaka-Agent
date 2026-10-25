@@ -623,20 +623,62 @@ class ModelsImpl:
             produced = transform(headers or {})
             headers = await produced if asyncio.iscoroutine(produced) else produced
         optionEnv: ProviderEnv | None = _option(options, "env")
-        env = {**(resolution.env or {}), **(optionEnv or {})} if (resolution.env or optionEnv) else None
+        from misaka.ai.utils.env_layers import merge_env_layers
+
+        env = merge_env_layers(resolution.env, optionEnv) if (resolution.env or optionEnv) else None
+
+        # Application routing is selected at ModelRegistry admission, but applied only
+        # after auth has contributed its scoped environment. Applying it before this
+        # merge makes an ambient proxy copied into caller options incorrectly outrank a
+        # credential-scoped proxy. The admission snapshot also keeps ambient routing
+        # stable if the process environment changes while auth is resolving.
+        marker = _option(options, "_misakaProxyPolicy")
+        if isinstance(marker, dict):
+            from misaka.config.proxy_settings import proxy_request_env
+
+            admitted = dict(marker.get("ambient") or {})
+            scoped = env or {}
+            for name in (
+                "http_proxy",
+                "https_proxy",
+                "all_proxy",
+                "no_proxy",
+                "ssl_cert_file",
+                "ssl_cert_dir",
+            ):
+                if name in scoped or name.upper() in scoped:
+                    value = scoped[name] if name in scoped else scoped[name.upper()]
+                    admitted[name] = value
+                    admitted[name.upper()] = value
+            admitted.update({
+                key: value
+                for key, value in scoped.items()
+                if key.lower() not in {
+                    "http_proxy", "https_proxy", "all_proxy", "no_proxy",
+                    "ssl_cert_file", "ssl_cert_dir",
+                }
+            })
+            env = proxy_request_env(
+                admitted,
+                settings=marker.get("settings"),
+            )
 
         requestModel = model.model_copy(update={"baseUrl": auth.baseUrl}) if auth.baseUrl else model
         return requestModel, _mergeRequestOptions(options, apiKey=apiKey, headers=headers, env=env)
 
     def stream(self, model: Model, context: Context, options: Any = None) -> AssistantMessageEventStream:
         transcript = normalize_context(context)
+        effective_env: dict[str, str] = {}
 
         async def setup():
             provider = self._requireProvider(model)
             requestModel, requestOptions = await self._applyAuth(model, options)
+            effective_env.update(requestOptions.env or {})
             return provider.stream(requestModel, transcript, requestOptions)
 
-        return lazy_stream(model, setup)
+        stream = lazy_stream(model, setup)
+        stream.effectiveNetworkEnv = effective_env
+        return stream
 
     async def complete(self, model: Model, context: Context, options: Any = None):
         return await self.stream(model, context, options).result()
@@ -645,13 +687,17 @@ class ModelsImpl:
         self, model: Model, context: Context, options: Any = None
     ) -> AssistantMessageEventStream:
         transcript = normalize_context(context)
+        effective_env: dict[str, str] = {}
 
         async def setup():
             provider = self._requireProvider(model)
             requestModel, requestOptions = await self._applyAuth(model, options)
+            effective_env.update(requestOptions.env or {})
             return provider.streamSimple(requestModel, transcript, requestOptions)
 
-        return lazy_stream(model, setup)
+        stream = lazy_stream(model, setup)
+        stream.effectiveNetworkEnv = effective_env
+        return stream
 
     async def completeSimple(self, model: Model, context: Context, options: Any = None):
         return await self.streamSimple(model, context, options).result()
@@ -732,6 +778,7 @@ def _mergeRequestOptions(
                 merged[name] = getattr(options, name, None)
             merged.update(getattr(options, "model_extra", None) or {})
     merged.pop("transformHeaders", None)
+    merged.pop("_misakaProxyPolicy", None)
     merged.update({"apiKey": apiKey, "headers": headers, "env": env})
     return ProviderStreamOptions(**merged)
 

@@ -1,4 +1,6 @@
-import React, { useEffect, useState } from 'react'
+import { subscribeResearchRun } from '../../lib/researchActivityStore'
+import { ResearchProgressArea } from './ResearchProgressArea'
+import React, { useEffect, useRef, useState } from 'react'
 import {
   AlertCircle,
   AlertTriangle,
@@ -12,16 +14,20 @@ import {
   PauseCircle,
   RefreshCw,
   RotateCcw,
-  Square,
   Users,
 } from 'lucide-react'
 import { useSessionStore } from '../../store/useSessionStore'
+import { useResearchStopStore } from '../../store/useResearchStopStore'
+import { useResearchRunStore } from '../../store/useResearchRunStore'
+import { ResearchStopButton } from '../ResearchWorkspace/ResearchStopButton'
+import { researchStopPresentation, resolveResearchStopBoard } from '../ResearchWorkspace/researchPresentation'
 import { executeResearchControl } from '../../lib/researchBridge'
 import { researchPhaseLabel } from '../../lib/researchStatus'
 import type { ResearchTaskSummary } from '../../types/research'
 import { newRequestId } from '../../lib/bridge'
 import { openResearchConversation, startComposerResearch } from '../../lib/startComposerResearch'
 import { DesktopResearchTeam } from './DesktopResearchTeam'
+import { ResearchApprovalCards } from '../ResearchWorkspace/ResearchApprovalCard'
 
 interface ResearchRunPillProps {
   runId: string
@@ -44,17 +50,30 @@ function taskStatusIcon(status: string) {
 export const ResearchRunPill: React.FC<ResearchRunPillProps> = ({ runId, defaultExpanded = false }) => {
   const card = useSessionStore(s => s.researchCards[runId])
   const runSummary = useSessionStore(s => s.researchRuns.find(r => r.id === runId))
+  const boardRun = useResearchRunStore(s => s.runs[runId]?.run)
   const fetchCardDetails = useSessionStore(s => s.fetchResearchCardDetails)
   const setActiveResearchTask = useSessionStore(s => s.setActiveResearchTask)
   const setActiveResearchGraphRunId = useSessionStore(s => s.setActiveResearchGraphRunId)
   const hasBoundTeam = useSessionStore(s => s.researchBinding?.runId === runId && Boolean(s.researchTeam))
+  const stopEntry = useResearchStopStore(state => state.byRun[runId])
 
   const isWaitingInput = card?.status === 'waiting_input'
-  const isError = card?.status === 'error' || card?.status === 'failed' || Boolean(card?.error)
+  const isError = card?.status === 'error' || card?.status === 'failed'
+    || (card?.status !== 'done' && !stopEntry && Boolean(card?.error))
   const isDone = card?.status === 'done'
   const isStopped = card?.status === 'stopped' || card?.status === 'partial' || card?.status === 'cancelled'
-  const isActive = !isDone && !isStopped && !isError
+  // The same per-run stop wait the workspace buttons show: an ACK is not the end, so 正在停止
+  // stays up (across collapse and remount) until the board reports the run at rest.
+  const board = resolveResearchStopBoard({ status: card?.status }, boardRun, runSummary)
+  const stopView = researchStopPresentation(board.status, stopEntry?.phase, board.stopRequested, board.driving)
+  const stopRecovery = stopView === 'pending' || stopView === 'unconfirmed' || stopView === 'failed'
+  const displayedDone = ['done', 'completed', 'closed'].includes(board.status || '')
+  const displayedStopped = ['stopped', 'partial', 'cancelled', 'canceled'].includes(board.status || '')
+  const displayedWaiting = board.status === 'waiting_input'
+  const displayedError = board.status === 'error' || board.status === 'failed' || isError
 
+  const actionGeneration = useRef(0)
+  useEffect(() => { actionGeneration.current += 1; return () => { actionGeneration.current += 1 } }, [runId])
   const [expanded, setExpanded] = useState(defaultExpanded || isWaitingInput || isError)
   const [answer, setAnswer] = useState('')
   const [busy, setBusy] = useState(false)
@@ -64,11 +83,7 @@ export const ResearchRunPill: React.FC<ResearchRunPillProps> = ({ runId, default
 
   useEffect(() => { setConfirmedEnd(false) }, [runId, card?.status])
 
-  useEffect(() => {
-    void fetchCardDetails(runId)
-    const timer = window.setInterval(() => void fetchCardDetails(runId), 4000)
-    return () => window.clearInterval(timer)
-  }, [runId, fetchCardDetails])
+  useEffect(() => subscribeResearchRun(runId, card?.workspace || runSummary?.workspace), [runId, card?.workspace, runSummary?.workspace])
 
   useEffect(() => {
     if (isWaitingInput || isError) {
@@ -87,46 +102,39 @@ export const ResearchRunPill: React.FC<ResearchRunPillProps> = ({ runId, default
   const handleAnswerClarification = async (e: React.FormEvent) => {
     e.preventDefault()
     if (!answer.trim()) return
+    const operation = ++actionGeneration.current
+    const version = useSessionStore.getState().researchPageVersion
+    const ownsAction = () => actionGeneration.current === operation && useSessionStore.getState().researchPageVersion === version
+    const submittedAnswer = answer.trim()
     setBusy(true)
     setActionError(null)
     try {
       const state = useSessionStore.getState()
-      if (state.researchBinding?.runId !== runId) {
-        state.bindResearchConversation(await openResearchConversation(runId, card?.workspace || runSummary?.workspace), true)
+      let binding = state.researchBinding?.runId === runId ? state.researchBinding : null
+      if (!binding) {
+        const snapshot = await openResearchConversation(runId, card?.workspace || runSummary?.workspace)
+        state.bindResearchConversation(snapshot)
+        binding = {sessionId:snapshot.session.sessionId, sessionFile:snapshot.session.file, workspace:snapshot.session.cwd, runId, streamId:snapshot.streamId}
       }
-      const binding = useSessionStore.getState().researchBinding!
       const requestId = newRequestId('research_input')
-      const host = await startComposerResearch({ question: answer.trim(), workspace: binding.workspace, binding, requestId,
-        onBound: snapshot => { state.bindResearchConversation(snapshot); state.queueResearchMessage(requestId, answer.trim()) },
+      const host = await startComposerResearch({ question: submittedAnswer, workspace: binding.workspace, binding, requestId,
+        onBound: snapshot => { state.bindResearchConversation(snapshot); state.queueResearchMessage(requestId, submittedAnswer, {sessionId:snapshot.session.sessionId,sessionFile:snapshot.session.file,workspace:snapshot.session.cwd,runId:snapshot.run?.id || runId,streamId:snapshot.streamId}) },
         onAccepted: () => state.acceptResearchMessage(requestId),
       })
       state.bindResearchConversation(host)
-      setAnswer('')
+      if (ownsAction()) setAnswer('')
       await fetchCardDetails(runId)
     } catch (err) {
-      setActionError(err instanceof Error ? err.message : String(err))
+      if (ownsAction()) setActionError(err instanceof Error ? err.message : String(err))
     } finally {
-      setBusy(false)
-    }
-  }
-
-  const handleStop = async () => {
-    setBusy(true)
-    setActionError(null)
-    try {
-      await executeResearchControl('stop_research', {
-        runId,
-        workspace: card?.workspace || runSummary?.workspace,
-      })
-      await fetchCardDetails(runId)
-    } catch (err) {
-      setActionError(err instanceof Error ? err.message : String(err))
-    } finally {
-      setBusy(false)
+      if (actionGeneration.current === operation) setBusy(false)
     }
   }
 
   const handleResume = async () => {
+    const operation = ++actionGeneration.current
+    const version = useSessionStore.getState().researchPageVersion
+    const ownsAction = () => actionGeneration.current === operation && useSessionStore.getState().researchPageVersion === version
     setBusy(true)
     setActionError(null)
     try {
@@ -136,9 +144,9 @@ export const ResearchRunPill: React.FC<ResearchRunPillProps> = ({ runId, default
       })
       await fetchCardDetails(runId)
     } catch (err) {
-      setActionError(err instanceof Error ? err.message : String(err))
+      if (ownsAction()) setActionError(err instanceof Error ? err.message : String(err))
     } finally {
-      setBusy(false)
+      if (actionGeneration.current === operation) setBusy(false)
     }
   }
 
@@ -158,13 +166,15 @@ export const ResearchRunPill: React.FC<ResearchRunPillProps> = ({ runId, default
       >
         <div className="flex items-center gap-2.5 min-w-0">
           <div className="flex items-center justify-center w-6 h-6 rounded-lg bg-surface-2 shrink-0">
-            {isDone ? (
+            {stopRecovery && stopView !== 'failed' ? (
+              <Loader2 className="w-4 h-4 text-accent animate-spin" />
+            ) : displayedDone ? (
               <CheckCircle2 className="w-4 h-4 text-success" />
-            ) : isWaitingInput ? (
+            ) : displayedWaiting ? (
               <AlertTriangle className="w-4 h-4 text-warning" />
-            ) : isError ? (
+            ) : displayedError ? (
               <AlertCircle className="w-4 h-4 text-danger" />
-            ) : isStopped ? (
+            ) : displayedStopped ? (
               <PauseCircle className="w-4 h-4 text-dim" />
             ) : (
               <Loader2 className="w-4 h-4 text-accent animate-spin" />
@@ -173,13 +183,15 @@ export const ResearchRunPill: React.FC<ResearchRunPillProps> = ({ runId, default
 
           <div className="min-w-0 flex items-center gap-2">
             <span className="text-xs font-semibold text-text-main truncate">
-              {isDone
+              {stopRecovery
+                ? stopView === 'pending' ? '研究正在停止 · 等待结算' : stopView === 'failed' ? '停止失败 · 请查看原因' : '停止结果待确认 · 请刷新核对'
+                : displayedDone
                 ? '研究已完成 · 查看全部分析过程'
-                : isWaitingInput
-                ? '研究等待澄清 · 需要你的确认'
-                : isError
+                : displayedWaiting
+                ? card?.pendingQuestions?.length ? '研究等待澄清 · 需要你的确认' : '研究已暂停 · 正在同步待回答问题'
+                : displayedError
                 ? '研究中断 · 点击查看详情'
-                : isStopped
+                : displayedStopped
                 ? '研究已暂停'
                 : `正在进行研究 · ${researchPhaseLabel(card?.phase || card?.stage || '多节点协同')}`}
             </span>
@@ -208,11 +220,21 @@ export const ResearchRunPill: React.FC<ResearchRunPillProps> = ({ runId, default
         </div>
       </div>
 
+      <ResearchProgressArea runId={runId} />
+
+      {/* Approvals belong in the conversation: they are the reason this run is waiting.
+          The read is keyed on status+stage so it refreshes exactly when the engine enters or
+          leaves a review wait (plan_review / reconcile_review) or a waiting_input pause, and it
+          re-finds an approval that was still pending when the app was reopened. */}
+      <ResearchApprovalCards runId={runId} workspace={card?.workspace || runSummary?.workspace}
+        enabled={Boolean(card) && !['done', 'completed', 'closed', 'cancelled', 'canceled', 'partial', 'error', 'failed', 'stopped'].includes(card?.status ?? '')}
+        revision={`${card?.status ?? ''}:${card?.stage ?? ''}`} />
+
       {/* Expanded View */}
       {expanded && (
         <div className="px-4 pb-3.5 pt-1 border-t border-border-subtle/60 space-y-3 text-xs">
           {/* Clarification prompt if waiting input */}
-          {isWaitingInput && (
+          {isWaitingInput && Boolean(card?.pendingQuestions?.length) && (
             <div className="p-3 rounded-xl bg-warning-surface/60 border border-warning-border space-y-2">
               <div className="flex items-center gap-1.5 font-medium text-warning text-xs">
                 <AlertTriangle className="w-3.5 h-3.5" />
@@ -289,8 +311,8 @@ export const ResearchRunPill: React.FC<ResearchRunPillProps> = ({ runId, default
 
             {tasks.length === 0 ? (
               <div className="py-4 text-center text-dim text-[11.5px] bg-surface-2/40 rounded-xl">
-                <Loader2 className="w-4 h-4 animate-spin mx-auto mb-1 text-accent" />
-                <span>正在根据课题规划研究节点与分工…</span>
+                {card?.status === 'active' ? <><Loader2 className="w-4 h-4 animate-spin mx-auto mb-1 text-accent" /><span>正在根据课题规划研究节点与分工…</span></>
+                  : <span>{isWaitingInput ? card?.pendingQuestions?.length ? '尚未创建任务，等待你的回答' : '尚未创建任务，正在同步待回答问题' : '暂无任务记录'}</span>}
               </div>
             ) : (
               <div className="space-y-1.5 max-h-64 overflow-y-auto pr-0.5">
@@ -349,17 +371,8 @@ export const ResearchRunPill: React.FC<ResearchRunPillProps> = ({ runId, default
                 <RefreshCw className="w-3.5 h-3.5" />
               </button>
 
-              {isActive && (
-                <button
-                  type="button"
-                  onClick={handleStop}
-                  disabled={busy}
-                  className="inline-flex items-center gap-1 px-2.5 py-1 rounded-md border border-danger-border text-danger hover:bg-danger-surface text-[11px] transition-colors cursor-pointer disabled:opacity-50"
-                >
-                  <Square className="w-3 h-3" />
-                  <span>停止研究</span>
-                </button>
-              )}
+              {card && <ResearchStopButton runId={runId} workspace={card.workspace || runSummary?.workspace}
+                status={board.status} driving={board.driving} stopRequested={board.stopRequested} />}
 
               {isStopped && (
                 <button

@@ -4,6 +4,7 @@ import type { ToolCall } from '../../types/session'
 import { useDisclosure } from '../../lib/sessionViewState'
 import { formatDuration, redactSecrets, toolCallElapsed, toolCallSummary, toolDisplayName } from '../../lib/toolDisplay'
 import { useLiveClock } from '../../lib/useLiveClock'
+import { useChatSurfaceKey } from './ChatSurface'
 
 // Bridge outputs use content arrays, strings, and structured details. Render their
 // actual text rather than dumping transport wrappers into the reading surface.
@@ -28,7 +29,8 @@ const STATUS_ICON = { pending: Clock, running: Loader2, success: CheckCircle2, e
 const STATUS_CLASS = { pending: 'text-dim', running: 'text-warning', success: 'text-success', error: 'text-danger', cancelled: 'text-dim' }
 
 export const ToolCallRow: React.FC<{ toolCall: ToolCall; now?: number }> = ({ toolCall, now: suppliedNow }) => {
-  const [manualExpanded, setExpanded] = useDisclosure(`tool:${toolCall.id}`)
+  const surfaceKey = useChatSurfaceKey()
+  const [manualExpanded, setExpanded] = useDisclosure(`tool:${toolCall.id}`, surfaceKey)
   const expanded = manualExpanded ?? false
   const contentId = useId()
   const isRunning = toolCall.status === 'running' || toolCall.status === 'pending'

@@ -39,6 +39,7 @@ vi.mock('electron', () => ({
     webContents = {
       on: (name: string, callback: (...args: any[]) => void) => this.events.set(name, callback),
       setWindowOpenHandler: vi.fn(),
+      getURL: () => this.url ?? `file:///${(this.file?.path ?? 'index.html').replace(/\\/g, '/')}`,
       send: (channel: string, data: any) => this.pushes.push({ channel, data }),
     }
     constructor(options: any) { this.options = options; fixture.windows.push(this); fixture.routesAtCreation = [...fixture.handlers.keys()] }
@@ -243,7 +244,8 @@ it('hands close confirmation to the current renderer without stopping active res
   let prevented = false
 
   win.events.get('close')!({ preventDefault: () => { prevented = true } })
-  await vi.waitFor(() => expect(win.pushes).toContainEqual({ channel: 'app:request-close', data: undefined }))
+  // The request now carries an id: a late or foreign answer must be ignorable.
+  await vi.waitFor(() => expect(win.pushes).toContainEqual({ channel: 'app:request-close', data: { closeRequestId: expect.any(Number) } }))
 
   expect(prevented).toBe(true)
   expect(fixture.messageBoxCalls).toHaveLength(0)

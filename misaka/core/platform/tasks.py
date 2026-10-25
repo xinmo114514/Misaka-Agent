@@ -225,6 +225,10 @@ class SerializedConnection(sqlite3.Connection):
         super().__init__(*args, **kwargs)
         self._misaka_lock = threading.RLock()
         self._transaction_callbacks = []
+        # Task 3: post-transaction card projections need the actual outcome, not just
+        # "the transaction ended": commit_fast() applies the staged file only after a
+        # commit, and a rollback must leave the old bytes.
+        self._last_outcome = None
 
     @contextmanager
     def serialized(self):
@@ -251,6 +255,10 @@ class SerializedConnection(sqlite3.Connection):
 
     def _finish_transaction(self):
         callbacks, self._transaction_callbacks = self._transaction_callbacks, []
+        # Task 3: a card projection must know whether the row committed; the callback runs
+        # after the outcome exists, so hand it the outcome via one dispatch-scoped attribute.
+        self._dispatch_outcome = self._last_outcome
+        self._last_outcome = None
         for callback in callbacks:
             try:
                 callback()
@@ -258,6 +266,7 @@ class SerializedConnection(sqlite3.Connection):
                 # DB commit/rollback has already happened. The durable projection journal
                 # remains for retry; a cleanup error must not misreport the DB outcome.
                 logger.exception("Deferred filesystem publication needs recovery")
+        self._dispatch_outcome = None
 
     def executemany(self, sql, seq_of_parameters):
         with self._misaka_lock:
@@ -274,19 +283,26 @@ class SerializedConnection(sqlite3.Connection):
     def __exit__(self, *exc):
         with self._misaka_lock:
             try:
-                return super().__exit__(*exc)
+                result = super().__exit__(*exc)
+                self._last_outcome = "rollback" if exc[0] is not None else "commit"
+                return result
+            except BaseException:
+                self._last_outcome = "rollback"
+                raise
             finally:
                 if not self.in_transaction:
                     self._finish_transaction()
 
     def commit(self):
         with self._misaka_lock:
+            self._last_outcome = "commit"
             result = super().commit()
             self._finish_transaction()
             return result
 
     def rollback(self):
         with self._misaka_lock:
+            self._last_outcome = "rollback"
             result = super().rollback()
             self._finish_transaction()
             return result
@@ -307,10 +323,59 @@ def _serialized(operation):
     @wraps(operation)
     def call(con, *args, **kwargs):
         serialized = getattr(con, "serialized", None)
-        if serialized is None:  # Preserve compatibility with caller-owned connections.
-            return operation(con, *args, **kwargs)
-        with serialized():
-            return operation(con, *args, **kwargs)
+        projecting = operation.__name__ in {
+            "link_tasks", "link_dependencies", "promote_task", "promote_dependents",
+            "configure_review", "mark_failed", "mark_stopped", "submit_task", "claim_review",
+            "approve_review", "request_review_changes", "release_review", "back_to_ready",
+            "reclaim_abandoned", "claim_resume", "reopen_task", "block_task", "unblock_task"}
+        from misaka.core.platform import card_publication
+        task_ids = []
+        targets = {}
+        if projecting and not card_publication.locks_held():
+            task_id = args[1] if operation.__name__ in {'link_tasks', 'link_dependencies'} else (args[0] if args else kwargs.get('task_id'))
+            if task_id is not None:
+                task_ids = [task_id]
+                name = operation.__name__
+                if name in {'submit_task', 'approve_review', 'promote_dependents', 'mark_failed'}:
+                    children = _children_of(con, task_id)
+                    task_ids.extend(children)
+                    targets.update({child: [('ready', 0)] for child in children})
+                if (name == 'claim_resume' and not kwargs.get('consult', False)) or (name == 'reopen_task' and kwargs.get('invalidate_descendants', False)):
+                    descendants = _descendant_ids(con, task_id)
+                    task_ids.extend(descendants)
+                    targets.update({child: [('todo', 1)] for child in descendants})
+                if name == 'mark_stopped':
+                    targets[task_id] = [('stopped', 0)]
+                elif name == 'promote_task':
+                    targets[task_id] = [('ready', 0)]
+                elif name == 'submit_task':
+                    targets[task_id] = [('done', 0), ('review', 0)]
+                elif name == 'approve_review':
+                    targets[task_id] = [('done', 0)]
+                elif name == 'reopen_task':
+                    targets[task_id] = [('ready', 1), ('todo', 1)]
+                elif name == 'claim_resume':
+                    # Generation changes, while the file's static status stays as it was.
+                    row = get(con, task_id)
+                    from misaka.core.platform import cards
+                    card = cards.try_read(cards.card_path(row['workspace'], task_id)) if row is not None else None
+                    if card is not None:
+                        targets[task_id] = [(card['fields'].get('status'), 1)]
+                elif name == 'promote_dependents':
+                    task_ids.remove(task_id)
+                elif name == 'mark_failed':
+                    targets[task_id] = [('ready', 0), ('failed', 0)]
+        lock = card_publication.lock_cards(task_ids, timeout=0 if con.in_transaction else card_publication.LOCK_TIMEOUT)
+        with lock:
+            updates = {}
+            if task_ids and operation.__name__ in {'link_tasks', 'link_dependencies'} and len(args) >= 2:
+                parents = [args[0]] if operation.__name__ == 'link_tasks' else list(args[0])
+                child_id = args[1]
+                existing = parent_ids(con, child_id, strict=True)
+                updates[child_id] = {'needs': list(dict.fromkeys([*existing, *parents]))}
+                targets[child_id] = [('ready', 0), ('todo', 0)]
+            with card_publication.prepare_cards(con, task_ids, field_updates=updates, targets=targets), (serialized() if serialized else nullcontext()):
+                return operation(con, *args, **kwargs)
     return call
 
 
@@ -546,7 +611,7 @@ def on_transaction_end(con, callback):
 
 
 @contextmanager
-def _write_txn(con):
+def _write_txn(con, *, card_ids=(), field_updates=None, targets=None):
     """Commit task-row and task-run changes as one crash-safe unit.
 
     The connection lock covers the *whole* transaction, not just individual SQL
@@ -556,7 +621,13 @@ def _write_txn(con):
     outer transaction.
     """
     serialized = getattr(con, "serialized", None)
-    with serialized() if serialized else nullcontext():
+    from misaka.core.platform import card_publication
+    # Metadata-only transactions must not acquire every unrelated card lock. Known
+    # projection callers declare their exact file scope before entering the writer.
+    # Legacy opaque outer transactions retain the immediate (never waiting) card
+    # publication path; they do not claim the pre-serialization guarantee.
+    task_ids = list(card_ids)
+    with card_publication.lock_cards(task_ids, timeout=0 if con.in_transaction else card_publication.LOCK_TIMEOUT), card_publication.prepare_cards(con, task_ids, field_updates=field_updates, targets=targets), (serialized() if serialized else nullcontext()):
         owner = not con.in_transaction
         if owner:
             con.execute("BEGIN IMMEDIATE")
@@ -872,9 +943,13 @@ def link_dependencies(con, parents, child_id) -> bool:
             return False
         for parent_id in additions:
             _validate_dependency(con, parent_id, child_id)
-        from misaka.core.platform import cards
         child = get(con, child_id)
-        cards.set_fields(child["workspace"], child_id, needs=[*needs, *additions])
+        # Task 3: publish the needs list through the bounded projection. A contended card
+        # defers instead of holding this transaction's writer while it waits on the file lock.
+        prepared = _publish_fields(con, child["workspace"], child_id,
+                                   fields={"needs": [*needs, *additions]},
+                                   generation=child["generation"], new_status=None)
+        prepared.publish(con)
         con.execute("UPDATE tasks SET status='todo' WHERE id=? AND status='ready'", (child_id,))
         for parent_id in additions:
             add_event(con, child_id, "dependency_linked", {"parent_id": parent_id})
@@ -928,15 +1003,27 @@ def _mirror_status(con, task_id):
 
     File-write failure aborts the SQLite transition. ``running`` remains lease-only and is
     never mirrored. Nothing is committed: the project's git history is the user's to write.
+
+    Task 3: the card lock is taken with a short bound and the serialized bytes are prepared
+    outside the writer's critical path -- a contended card defers to a journal instead of
+    waiting. That is what kept two writers from colliding into ``database is locked``
+    (2026-10-11): another connection's 5 s busy timeout used to expire while a transition
+    held the board writer and blocked on this file lock.
     """
     row = get(con, task_id)
     if row is None or not row["workspace"]:
         return
-    from misaka.core.platform import cards
+    from misaka.core.platform import card_publication
+
+    def mutate(fields, body):
+        fields["status"] = row["status"]
+        fields["generation"] = int(row["generation"])
+        return fields, body
+
     try:
-        cards.set_fields(
-            row["workspace"], task_id, status=row["status"], generation=int(row["generation"])
-        )
+        prepared = card_publication.stage(row["workspace"], task_id, mutate,
+                                          generation=int(row["generation"]), new_status=row["status"],
+                                          con=con)
     except FileNotFoundError:
         # The card file is not merely unwritable, it is gone -- the project directory was
         # deleted or moved. There is no at-rest truth left to protect, so aborting here only
@@ -951,8 +1038,41 @@ def _mirror_status(con, task_id):
         add_event(con, task_id, "card_file_missing",
                   {"status": row["status"], "workspace": row["workspace"]},
                   generation=row["generation"])
+        return
+    prepared.publish(con)
+    if not con.in_transaction:
+        prepared.finish(con)
 
 
+def _settle_deferred(con, workspace, task_id, generation):
+    """A deferred card projection settles once its SQL transaction has an outcome."""
+    from misaka.core.platform import card_publication
+    outcome = card_publication.settle(con, workspace, task_id)
+    if outcome == "conflict":
+        add_event(con, task_id, "card_projection_conflict",
+                  {"reason": "card file changed externally during a deferred projection"},
+                  generation=generation)
+
+
+def _publish_fields(con, workspace, task_id, *, fields, generation, new_status):
+    """Publish at-rest card fields OUTSIDE the write transaction, bounded (Task 3).
+
+    The board writer must never wait on a card's FileLock: another process holding that lock
+    used to stall a transition inside its SQLite transaction until a second writer hit
+    ``database is locked`` (2026-10-11 incident; reproduced red in
+    tests/test_research_board_contention.py). The lock is taken with a short bound; a contended
+    card stages its bytes to a journal, and the committed marker goes into this same
+    transaction (when one is active), so the marker and the state change commit or roll back
+    together -- exactly the fence the deferred settle reads afterwards.
+    """
+    from misaka.core.platform import card_publication
+
+    def mutate(values, body):
+        values.update(fields)
+        return values, body
+
+    return card_publication.stage(workspace, task_id, mutate,
+                                  generation=int(generation), new_status=new_status, con=con)
 class UnreadableCard(ValueError):
     """A card file had to be read to answer this, and could not be parsed."""
 
@@ -1253,6 +1373,7 @@ _FAILURE_KINDS = (
         r"|(?:error code|status(?: code)?)[: ]+40[13]\b|\(40[13]\)"
         r"|exceeded your (?:current )?quota|payment required|credit balance|insufficient[ _-]?credit"
         r"|gousagelimiterror|freeusagelimiterror|monthly usage limit reached|available balance"
+        r"|usage[ _-]limit[ _-]reached"
         r"|insufficient[ _-]?quota|out of budget|quota exceeded|billing|token_cap reached")),
     ("rate_limit", re.compile(r"rate[ _-]?limit|too many requests|\b429\b")),
     ("context_overflow", re.compile(
@@ -1759,9 +1880,14 @@ def claim_resume(
         # Publish the new generation under the card lock before its worker can run.
         # Submission's Git tail holds that lock without a SQLite transaction, so an
         # old generation can never commit bytes written by this continuation.
-        from misaka.core.platform import cards
         workspace = get(con, task_id)["workspace"]
-        cards.set_fields(workspace, task_id, generation=int(row["generation"]))
+        # Task 3: the generation publishes through the bounded projection (deferred when the
+        # card is busy), so this CAS never waits on the card's FileLock while holding the writer.
+        new_generation = int(row["generation"])
+        prepared = _publish_fields(con, workspace, task_id,
+                                   fields={"generation": new_generation},
+                                   generation=new_generation, new_status=None)
+        prepared.publish(con)
     return True
 
 

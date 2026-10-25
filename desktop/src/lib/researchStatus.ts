@@ -7,6 +7,7 @@ const PHASE_LABELS: Record<string, string> = {
   adjudication_survey: '报告生成', adjudication_draft: '报告生成',
   adjudication_review: '报告审查', done: '已完成', stopped: '已停止',
   stopping: '正在停止', failed: '失败', error: '失败',
+  partial: '已暂停', cancelled: '已停止', closed: '已完成',
 }
 
 export function researchPhaseLabel(raw?: string | null): string {
@@ -36,4 +37,18 @@ export function researchOverview(nodes: Array<{ status?: string }>): Array<{ sta
     counts.set(status, (counts.get(status) ?? 0) + 1)
   }
   return [...counts.entries()].map(([status, count]) => ({ status, label: researchNodeLabel(status), count }))
+}
+
+const RUN_TERMINAL = new Set(['done', 'stopped', 'failed', 'error', 'cancelled', 'partial', 'closed'])
+
+/** The run's display label: a business terminal state wins over a stale phase (Task 6).
+ *
+ * The 2026-10-11 incident showed a failed run as 执行中 because the UI read phase || status;
+ * the phase column legitimately still said active while the status column said failed.
+ */
+export function researchRunLabel(run: { status?: string | null; phase?: string | null } | null | undefined): string {
+  if (!run) return '状态待同步'
+  const statusValue = (run.status || '').toLowerCase()
+  if (statusValue && (RUN_TERMINAL.has(statusValue) || statusValue === 'stopping' || statusValue === 'waiting_input')) return researchPhaseLabel(statusValue)
+  return researchPhaseLabel(run.phase || run.status)
 }

@@ -8,10 +8,19 @@ import time
 from collections.abc import AsyncIterator, Iterable, Mapping
 from typing import Any, Literal, NotRequired, TypedDict
 
+import httpx
+
 try:
-    from anthropic import AsyncAnthropic, omit
+    from anthropic import (
+        DEFAULT_CONNECTION_LIMITS,
+        AsyncAnthropic,
+        DefaultAsyncHttpxClient,
+        omit,
+    )
 except ImportError:  # optional extra: misaka[anthropic]
     AsyncAnthropic = omit = None
+    DefaultAsyncHttpxClient = None
+    DEFAULT_CONNECTION_LIMITS = None
 
 from misaka.ai.env_api_keys import get_env_api_key
 from misaka.ai.models import calculate_cost
@@ -74,6 +83,7 @@ from misaka.ai.utils.estimate import clamp_max_tokens_to_context
 from misaka.ai.utils.event_stream import AssistantMessageEventStream, spawn_stream_task
 from misaka.ai.utils.headers import headers_to_record
 from misaka.ai.utils.json_parse import StreamingArgs, parse_json_with_repair
+from misaka.ai.utils.network_route import httpx_client_options
 from misaka.ai.utils.provider_retry import retry_provider_request
 from misaka.ai.utils.sanitize_unicode import sanitize_surrogates
 from misaka.ai.utils.text import get_system_message_text, render_system_message_update
@@ -323,7 +333,16 @@ def create_client(
     dynamic_headers: Mapping[str, str] | None = None,
     session_id: str | None = None,
     native_tool_changes: bool = False,
+    env: Mapping[str, str] | None = None,
 ) -> tuple[AsyncAnthropic, bool]:
+    endpoint = resolve_cloudflare_base_url(model) if model.provider == "cloudflare-ai-gateway" else model.baseUrl
+    network_options = httpx_client_options(endpoint, env)
+    # The SDK creates environment-derived proxy mounts even with trust_env=False.
+    # Supplying the transport skips that discovery, retaining SDK timeout/limits.
+    http_client = require(DefaultAsyncHttpxClient, "anthropic")(
+        transport=httpx.AsyncHTTPTransport(**network_options, limits=DEFAULT_CONNECTION_LIMITS),
+        trust_env=False,
+    )
     # MISAKA fork: pi computes the beta list in `getBetaFeatures` inside `buildParams` and
     # sends it as the request's `betas`; this port puts it on the client's `anthropic-beta`
     # header, so the one beta that depends on the request (`native_tool_changes`, decided
@@ -343,6 +362,7 @@ def create_client(
 
     if model.provider == "cloudflare-ai-gateway":
         client = require(AsyncAnthropic, "anthropic")(
+            http_client=http_client,
             # The real credential is `cf-aig-authorization` in default_headers. The Python
             # SDK, unlike the TS one pi builds on, refuses to send a request with neither
             # api_key nor auth_token -- so a placeholder satisfies that check, and the
@@ -368,6 +388,7 @@ def create_client(
 
     if model.provider == "github-copilot":
         client = require(AsyncAnthropic, "anthropic")(
+            http_client=http_client,
             api_key=None,
             auth_token=api_key,
             base_url=model.baseUrl,
@@ -387,6 +408,7 @@ def create_client(
 
     if is_oauth_token(api_key):
         client = require(AsyncAnthropic, "anthropic")(
+            http_client=http_client,
             api_key=None,
             auth_token=api_key,
             base_url=model.baseUrl,
@@ -419,6 +441,7 @@ def create_client(
     # the only auth on the wire is the one the caller supplied.
     header_only_auth = api_key is None
     client = require(AsyncAnthropic, "anthropic")(
+        http_client=http_client,
         api_key=api_key if api_key is not None else "header-auth-placeholder",
         auth_token=None,
         base_url=model.baseUrl,
@@ -1272,6 +1295,7 @@ def stream_anthropic(
                     copilot_dynamic_headers,
                     cache_session_id,
                     _native_tool_changes(model, normalized_context),
+                    env=_option(options, "env"),
                 )
                 owned_client = client
             else:

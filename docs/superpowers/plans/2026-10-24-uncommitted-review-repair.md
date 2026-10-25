@@ -1,0 +1,55 @@
+# Uncommitted Review Repair Implementation Plan
+
+**Goal:** Implement the user-approved 11 repair groups while preserving all existing work.
+
+**Spec:** User-approved plan in this chat, 2026-10-24.
+
+## Global Constraints
+- Preserve every existing uncommitted change; modify the current codex/research-tiling-workspace checkout in place.
+- No Git commits, pushes, worktree switches, dependency installs or real provider requests.
+- Existing external IPC commands and persistent database formats remain compatible; no new database tables.
+- Use minimal root-cause fixes; tests first, record expected RED then GREEN and covering suite evidence.
+- Tests use temporary MISAKA_HOME, offline fixtures and mocked process/network boundaries, never live user state.
+- Implementers own only their assigned subsystem/files, do not dispatch subagents and do not modify the shared ledger.
+- Reports record changed files, tests/commands/results, self-review, remaining concerns; final response is a compact status only.
+
+### Task 1: Frontend editor and control ownership
+Own desktop/src/store/useSessionStore.ts, desktop/src/components/Composer/Composer.tsx, desktop/src/components/ResearchWorkspace/ResearchApprovalCard.tsx and their existing/new tests only. Do not edit generic transcript/paging/sessionViewState or Electron code.
+Fix three proven P1 regressions:
+1. setAgentMode('research') clears draft/attachments before selectResearchView saves the research owner; research->agent->research deletes the saved research editor. Switch atomically: save outgoing ordinary/research editor under its actual owner and restore incoming editor; preserve text, attachment identities, revision and model/config for both new-entry and conversation owners.
+2. Composer.abortGeneration picks the first active researchCards entry globally. With selected terminal/historical A and active B, explicit /stop A passes binding validation but dispatches a stop of B. Conversation stops and explicit /stop use the selected binding captured at action time; only the new-entry background-stop affordance chooses background B. Cover both cases without losing startup/turn cancellation behavior.
+3. useResearchApprovalState has fetched??shared state and setFetched(await readApprovalDetail()) without run/workspace/revision/request fence. Deferred A reload after navigation to B overwrites B question; answer sends to B. Scope fetched, errors and pending reads to owner+revision and discard stale completions; reset card feedback/answer/fold/busy state on owner change as needed. Test actual mounted cards: A approve triggers held reload, rerender B, resolve A late, B remains correct and no A answer submits to B.
+Add regressions before code changes and run focused Vitest and typecheck. Do not weaken existing tests or snapshots.
+
+### Task 2: Durable continuation messages and dependency repair
+Own misaka/core/network/messages.py, misaka/core/network/dispatch.py, misaka/desktop_research/card_control.py, misaka/desktop_research/worker_entry.py, misaka/desktop_research/runtime.py if necessary, misaka/core/research/workflow.py and corresponding Python tests. Do not edit desktop_bridge.py, AI/provider files or frontend.
+Fix P1 continuation inbox loss: messages.send_as lines509-513 queues exact body at old generation G, substitutes generic --say; real tasks.claim_resume advances to G+1 and MessagesPart delivery_plan discards then ACKs G row. Keep durable messages protected from old-generation readers until the successful continuation CAS, then bind/release at actually claimed generation. Preserve exact body once, mail receipt dedup and concurrent accepted messages. Reuse existing leases/receipt/continuation registry, no database table or schema migration. Failed CAS or launch must retain recoverable messages rather than report delivery; account for process crash/retry. Do not merely add 1 to generation or inline first message in --say while dropping later queued messages.
+Add integration regression using actual send_as, queue, claim_resume and MessagesPart._deliver_once (process/model boundaries may be mocked): completed G->G+1 gets original body once, concurrent messages survive, CAS failure/worker failure leave recoverable input, replay does not duplicate.
+Fix P2 workflow._submit_tasks dependency recovery targets only current status. Repro actual normal path: create a,b->a, cards.remove(a) promotes b ready and removes needs; replay recreates a then linking b to unfinished new a transitions to todo, currently throws 'Card transition needs an explicitly prepared projection'. Prepare ready/todo projection candidates and needs consistently. Test real remove+replay, verify b.todo + new a needs. Cover existing plan-change/recovery suites.
+Use .venv/Scripts/python.exe -m pytest with scoped files and record RED/GREEN evidence. Preserve safety of existing generation/ownership CAS.
+
+### Task 3: Concrete Google endpoints and proxy precedence
+Own misaka/ai/providers/google.py, google_vertex.py, shared new helper under misaka/ai/utils if needed, misaka/ai/models_runtime.py, misaka/ai/auth/resolve.py if needed, misaka/cli/desktop_bridge.py networking snapshot context only, and corresponding provider/network Python tests. Do not edit backend research or frontend files.
+Fix Google endpoint/routing mismatch: Vertex build_http_options freezes route using catalog/default regional host before google-genai applies GOOGLE_VERTEX_BASE_URL or set_default_base_urls; NO_PROXY and HTTP-vs-HTTPS selection target wrong endpoint. Gemini with empty model.baseUrl has analogous override behavior. Resolve effective endpoint once honoring explicit URL, SDK default overrides/environment, then region/global/multi-region defaults, and pin it into HTTP options used by SDK plus route. Keep baseUrlResourceScope/API-version behavior compatible; use installed SDK/primary code truth, no network calls.
+Share concrete endpoint resolution with desktop_bridge._ordinary_model_network_context so real catalog Vertex https://{location}-aiplatform.googleapis.com becomes a configured concrete global/regional address for saved route display and diagnostics, without auth operation/model request.
+Fix cross-case proxy override layering: credential env https_proxy='credential' defeats caller HTTPS_PROXY='' or replacement because merged dict chooses lowercase. Normalize aliases per source layer before merging, caller values including empty strings winning; preserve unrelated env and admission snapshots. Resolve any earlier credential+caller merge in auth path too rather than normalize an already flattened lossy dictionary.
+Test constructor-only actual SDK effective URL matches routing for explicit/global/us/eu/regional/SDK defaults/env override, NO_PROXY and HTTP scheme. Test _proxy_settings_snapshot catalog Vertex no template failure. Test caller uppercase/lowercase clear/replacement versus opposite-case credential, all proxy/cert alias types where applicable. Run scoped Python network suites and record RED/GREEN. No live network/auth/settings writes.
+
+### Task 4: Electron close and verified process ownership
+Own desktop/electron/closeFlow.ts, main.ts and covering electron tests/E2E if needed.
+P1: after rendererTookOver, phase renderer-dialog survives noteUnresponsive and BUSY_PHASES rejects all further closes. Revoke renderer ownership on freeze/crash; subsequent close must use native confirmation. Also cover loss racing the renderer ACK before requestClose commits renderer-dialog. Preserve closeRequestId stale reply fences and duplicate-stop serialization.
+P2: forceTerminateOwnedProcesses clears process refs before verified termination; failed force cleanup forgets live children then next stop returns true. Retain each surviving process ref until verified close, clear only matching child refs to avoid deleting a replacement; retry must wait/escalate on original child, and replacement must not create duplicate hosts after failed cleanup.
+Tests first: after painted dialog freeze/crash then close native; forced kill/wait failure then repeat exit continues tracking same child; partial success clears only exited target. Existing stop/tray/cancel/escalation behavior remains intact. Keep tests on fake child processes, no real process killing.
+
+### Task 5: Shared transcript pagination and independent disclosure state
+Own desktop/src/components/Timeline/ChatSurface.tsx, MessageItem.tsx if needed, desktop/src/lib/sessionViewState.ts, ExecutionGroup.tsx if needed and corresponding tests.
+P2 pagination: each canonical text segment renders ChatText with same entryId/content cache; clicking one full-message read changes [FIRST,SECOND] into [FIRSTSECOND,FIRSTSECOND]. Preserve text/tool original order, multi-text message has exactly one separate combined-full-body expander (reuse ResearchPaneMessage pattern); single-text paging must not shrink 32KiB preview when first requested page is 8KiB. Keep visible preview until fetched text catches up. Cover CJK/emoji character offsets and repeated reads/errors. Maintain external content API/field names, no block-index IPC change.
+P2 disclosure: per-surface useDisclosure pathOverride now exists, but global openDisclosures Set uses only tool/thinking key; hasOpenDisclosure(path,keys) sees another surface. Scope open state by path+key, count duplicate mounts so unmounting one does not erase another. Test main/side with identical tool ID stay independent, remount persistence, duplicate mount cleanup, ordinary pathless disclosures.
+Add failing tests first, then minimal production changes, run focused Vitest and typecheck.
+
+### Task 6: Incremental lint cleanup and integrated validation
+After Tasks1-5 finish, clean only lint diagnostics introduced by the original uncommitted changes/new files plus repair changes. Baseline original Ruff84,12 matching HEAD,72 original new/untracked. Preserve baseline diagnostics and avoid whole-repo formatting churn; fix real F821 Path in tests/test_research_stop_ended_run.py and related new unused imports/variables, import order and straightforward findings without deleting tests or asserted behavior. If fixing symbol fixture import warnings, retain pytest fixture registration semantics.
+Run frontend typecheck, Vitest full suite, oxlint; selected modified/new Python tests and added tests; targeted existing plan/dependency tests. Run offline Electron/browser E2E fixture scenarios after build; track WinError5 if transient repeats, do not mask failures. Keep all process fixture homes isolated and avoid live model E2E.
+
+### Task 7: Independent final review and evidence
+Produce review packages comparing current contents against initial uncommitted snapshot rather than only HEAD. Independent reviewers must check both spec compliance and code quality, especially message handoff recovery, stale-owner controls, process references, Google endpoint behavior and full-text/disclosure isolation. Fix actionable review regressions, rerun covering tests and final broad checks. Leave changes uncommitted and deliver compact Chinese result with passed test counts, residual caveats and report path.

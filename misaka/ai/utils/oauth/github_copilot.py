@@ -20,6 +20,7 @@ from misaka.ai.utils.oauth.types import (
     OAuthLoginCallbacks,
     OAuthPrompt,
 )
+from misaka.config.proxy_settings import proxy_httpx_options
 from misaka.utils.values import signal_aborted
 
 CLIENT_ID = base64.b64decode("SXYxLmI1MDdhMDhjODdlY2ZlOTg=").decode("utf-8")
@@ -92,7 +93,7 @@ def get_github_copilot_base_url(token: str | None = None, enterprise_domain: str
 
 
 async def _fetch_json(url: str, **kwargs: Any) -> Any:
-    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT_MS / 1000) as client:
+    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT_MS / 1000, **proxy_httpx_options(url)) as client:
         response = await client.request(kwargs.pop("method", "GET"), url, **kwargs)
     if response.status_code >= 400:
         raise RuntimeError(f"{response.status_code} {response.reason_phrase}: {response.text}")
@@ -207,7 +208,7 @@ async def _enable_github_copilot_model(token: str, model_id: str, enterprise_dom
     url = f"{base_url}/models/{model_id}/policy"
     try:
         # pi bounds this request at 5 s (``AbortSignal.timeout(5000)`` in fetchWithRateLimitRetry).
-        async with httpx.AsyncClient(timeout=_REQUEST_TIMEOUT_SECONDS) as client:
+        async with httpx.AsyncClient(timeout=_REQUEST_TIMEOUT_SECONDS, **proxy_httpx_options(url)) as client:
             response = await client.post(
                 url,
                 headers={
@@ -302,30 +303,30 @@ async def _fetch_with_rate_limit_retry(
     deadline = (
         time.monotonic() + max_elapsed_ms / 1000 if max_retries > 0 and max_elapsed_ms > 0 else None
     )
-    async with httpx.AsyncClient(timeout=_REQUEST_TIMEOUT_SECONDS) as client:
-        for retry in range(max_retries + 1):
+    for retry in range(max_retries + 1):
+        async with httpx.AsyncClient(timeout=_REQUEST_TIMEOUT_SECONDS, **proxy_httpx_options(url)) as client:
             response = await client.get(url, headers=headers)
-            if response.status_code != 429 or retry == max_retries:
-                return response
+        if response.status_code != 429 or retry == max_retries:
+            return response
 
-            delay_ms: float = 500 * 2**retry
-            retry_after = response.headers.get("retry-after")
-            if retry_after:
-                try:
-                    delay_ms = float(retry_after) * 1000
-                except ValueError:
-                    parsed = parsedate_to_datetime(retry_after)
-                    if parsed is None:
-                        return response
-                    delay_ms = (parsed.timestamp() - time.time()) * 1000
-                if not math.isfinite(delay_ms):
+        delay_ms: float = 500 * 2**retry
+        retry_after = response.headers.get("retry-after")
+        if retry_after:
+            try:
+                delay_ms = float(retry_after) * 1000
+            except ValueError:
+                parsed = parsedate_to_datetime(retry_after)
+                if parsed is None:
                     return response
-            delay_ms = max(0.0, delay_ms)
-            if deadline is not None and delay_ms / 1000 >= deadline - time.monotonic():
+                delay_ms = (parsed.timestamp() - time.time()) * 1000
+            if not math.isfinite(delay_ms):
                 return response
-            if signal_aborted(signal):
-                raise RuntimeError("Login cancelled")
-            await asyncio.sleep(delay_ms / 1000)
+        delay_ms = max(0.0, delay_ms)
+        if deadline is not None and delay_ms / 1000 >= deadline - time.monotonic():
+            return response
+        if signal_aborted(signal):
+            raise RuntimeError("Login cancelled")
+        await asyncio.sleep(delay_ms / 1000)
     raise RuntimeError("unreachable")  # pragma: no cover - the loop always returns
 
 

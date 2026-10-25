@@ -27,12 +27,14 @@ export function clearSessionViewsExcept(currentPath: string | null): void {
 export function messageHeights(path: string): Map<string, number> { return view(path).heights }
 
 /** Mounted rows the reader opened by hand, even before a session path exists. */
-const openDisclosures = new Set<string>()
-export function isDisclosureOpen(key: string): boolean { return openDisclosures.has(key) }
+const openDisclosures = new Map<string | null, Map<string, number>>()
+export function isDisclosureOpen(key: string, path: string | null = null): boolean {
+  return Boolean(openDisclosures.get(path)?.get(key))
+}
 
 /** True when the reader left one of these rows open and expects the lane to stay open. */
 export function hasOpenDisclosure(path: string | null, keys: string[]): boolean {
-  if (keys.some(isDisclosureOpen)) return true
+  if (keys.some(key => isDisclosureOpen(key, path))) return true
   if (!path) return false
   const choices = view(path).disclosures
   return keys.some(key => choices.get(key) === true)
@@ -57,17 +59,25 @@ export function migrateEntryDisclosures(path: string, liveId: string, entryId: s
  * The conversation actually on screen. Research mode renders a different transcript
  * than `currentSessionPath`, so reading state must not be filed under the agent row.
  */
-export function selectSessionViewKey(state: { agentMode: string; currentSessionPath: string | null; researchBinding: { sessionFile: string | null } | null }): string | null {
-  return state.agentMode === 'research' && state.researchBinding ? state.researchBinding.sessionFile : state.currentSessionPath
+export function selectSessionViewKey(state: { agentMode: string; currentSessionPath: string | null; researchBinding: { sessionFile: string | null } | null; researchPageView?: 'new' | 'conversation'; researchView?: {ownerKey: string} }): string | null {
+  if (state.agentMode === 'research' && state.researchPageView === 'new') return state.researchView?.ownerKey || 'research:new'
+  return state.agentMode === 'research' && state.researchPageView !== 'new' && state.researchBinding ? state.researchBinding.sessionFile : state.currentSessionPath
 }
 
 export function useSessionViewKey(): string | null {
   return useSessionStore(selectSessionViewKey)
 }
 
-/** Manual choices outlive DOM rows. Defaults (such as streaming thinking) stay live. */
-export function useDisclosure(key: string): [boolean | null, (expanded: boolean) => void] {
-  const path = useSessionViewKey()
+/**
+ * Manual choices outlive DOM rows. Defaults (such as streaming thinking) stay live.
+ *
+ * `pathOverride` files the choice under an explicit surface instead of the mounted session.
+ * The research workspace reads several transcripts at once (main area, side panel, tiles), so
+ * an executor's tool fold must not be shared with another area showing the same executor.
+ */
+export function useDisclosure(key: string, pathOverride?: string | null): [boolean | null, (expanded: boolean) => void] {
+  const storePath = useSessionViewKey()
+  const path = pathOverride === undefined ? storePath : pathOverride
   const [choice, setChoice] = useState(() => ({ path, key, value: path ? view(path).disclosures.get(key) ?? null : null }))
   const manual = choice.path === path ? choice.value : path ? view(path).disclosures.get(key) ?? null : null
   // A live message acquires its durable entryId without remounting. Migrate the
@@ -92,8 +102,15 @@ export function useDisclosure(key: string): [boolean | null, (expanded: boolean)
   }
   useEffect(() => {
     if (!manual) return
-    openDisclosures.add(key)
-    return () => { openDisclosures.delete(key) }
-  }, [key, manual])
+    const mounted = openDisclosures.get(path) ?? new Map<string, number>()
+    openDisclosures.set(path, mounted)
+    mounted.set(key, (mounted.get(key) ?? 0) + 1)
+    return () => {
+      const count = (mounted.get(key) ?? 1) - 1
+      if (count) mounted.set(key, count)
+      else mounted.delete(key)
+      if (!mounted.size) openDisclosures.delete(path)
+    }
+  }, [key, manual, path])
   return [manual, setExpanded]
 }

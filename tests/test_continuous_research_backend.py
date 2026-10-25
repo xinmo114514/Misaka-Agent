@@ -112,7 +112,8 @@ def own_run(con, session, **kwargs):
 async def test_first_input_starts_automatic_research_and_prepares_experts(coordinator):
     con, session, control, received, tmp_path = coordinator
     ingress = ingress_for(session, tmp_path)
-    ack = await ingress.send({"text": "What is the evidence?", "sessionId": session.sessionId, "requestId": "q1"}, con)
+    ack = await ingress.send({"text": "What is the evidence?", "sessionId": session.sessionId, "requestId": "q1",
+                              "limits": {"plan_approval": False}}, con)
     await asyncio.gather(*control.inputs)
     assert ack == {"accepted": True, "sessionId": session.sessionId, "runId": None, "requestId": "q1", "mode": "start"}
     assert "--plan-approval automatic -- What is the evidence?" in received[0]
@@ -124,7 +125,7 @@ async def test_start_new_refuses_to_fold_into_a_settled_run(coordinator):
     ingress = ingress_for(session, tmp_path)
     own_run(con, session, status="done", phase="done")
     ack = await ingress.send({"text": "A brand new question", "sessionId": session.sessionId,
-                              "requestId": "new-1", "startNew": True}, con)
+                              "requestId": "new-1", "startNew": True, "limits": {"plan_approval": False}}, con)
     await asyncio.gather(*control.inputs)
     assert ack["mode"] == "start"
     assert ack["runId"] is None

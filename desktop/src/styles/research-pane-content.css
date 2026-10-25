@@ -1,0 +1,67 @@
+/* Content details share the reader's existing semantic colors and typography. */
+.research-agent-pane--reading .research-tool-fields {
+  display: grid;
+  gap: 10px;
+  padding: 8px;
+  border-top: 1px solid var(--border-subtle);
+}
+.research-agent-pane--reading .research-tool-field,
+.research-agent-pane--reading .research-paged-field { min-width: 0; }
+.research-agent-pane--reading .research-tool-field h4,
+.research-agent-pane--reading .research-full-message h4 {
+  margin: 0 0 4px;
+  font: 600 12px/1.5 var(--font-sans, sans-serif);
+  color: var(--research-secondary-ink);
+}
+.research-agent-pane--reading .research-tool-field pre,
+.research-agent-pane--reading .research-paged-field > pre {
+  margin: 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  font-family: var(--font-mono, monospace);
+}
+.research-agent-pane--reading .research-content-read {
+  margin-top: 4px;
+  min-height: 28px;
+  padding: 2px 0;
+  color: var(--md-link);
+  font: 12px/1.5 var(--font-sans, sans-serif);
+  text-decoration: underline;
+  text-underline-offset: 3px;
+  cursor: pointer;
+}
+.research-agent-pane--reading .research-session-error .research-content-read { color: var(--research-error-ink); }
+.research-agent-pane--reading .research-content-read:disabled { opacity: .55; cursor: progress; }
+.research-agent-pane--reading .research-content-read:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: 2px; }
+.research-agent-pane--reading .research-content-hint {
+  display: block;
+  margin: 4px 0 0;
+  color: var(--research-tertiary-ink);
+  font: 12px/1.5 var(--font-sans, sans-serif);
+  overflow-wrap: anywhere;
+}
+.research-agent-pane--reading .research-content-error,
+.research-agent-pane--reading .research-message-error {
+  margin: 4px 0 0;
+  color: var(--research-error-ink);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.research-agent-pane--reading .research-full-message {
+  margin-top: 10px;
+  padding: 8px;
+  border: 1px solid var(--border-subtle);
+  border-radius: 5px;
+  background: var(--surface-2);
+}
+.research-agent-pane--reading .research-report-state {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 10px;
+  margin-bottom: 8px;
+  color: var(--warning);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+.research-agent-pane--reading .research-report-state p { flex-basis: 100%; margin: 0; }

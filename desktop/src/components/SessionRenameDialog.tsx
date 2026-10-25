@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
+import { consumeEscape, ESCAPE_PRIORITY, useEscapeLayer } from '../lib/useEscapeLayer'
 
 interface SessionRenameDialogProps {
   open: boolean
@@ -14,6 +15,7 @@ export function SessionRenameDialog({ open, path, name, onRename, onClose }: Ses
   const [error, setError] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
   const inputRef = useRef<HTMLInputElement>(null)
+  useEscapeLayer(open, event => { consumeEscape(event); if (!busy) onClose() }, ESCAPE_PRIORITY.dialog)
 
   useEffect(() => {
     if (!open) return

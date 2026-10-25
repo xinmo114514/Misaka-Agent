@@ -6,8 +6,9 @@ import { clipboardErrorMessage, copyTextToClipboard } from '../../lib/clipboard'
 import { ExecutionGroup } from './ExecutionGroup'
 import { ToolCallCard } from './ToolCallCard'
 import { CustomNotice } from './CustomNotice'
-import { MarkdownContent } from './MarkdownContent'
 import { getMessageBlocks } from '../../lib/messageBlocks'
+import { ResearchStartupFailure } from './ResearchStartupFailure'
+import { useChatPermissions, useChatSurface, ChatText } from './ChatSurface'
 
 interface MessageItemProps {
   message: ChatMessage
@@ -30,9 +31,15 @@ export const MessageItem = React.memo(function MessageItem({ message }: MessageI
       s.researchConversation.messages.some(row => row.requestId === message.requestId && row.deliveryStatus === 'pending') : s.isAborting))
   const isUser = message.role === 'user'
   const researchView = useSessionStore(s => s.agentMode === 'research' && Boolean(s.researchBinding))
+  // A sub-agent transcript is evidence, not the user's own conversation: it takes no actions.
+  const { readOnly } = useChatPermissions()
+  const startupFailure = !readOnly && researchView && (message.errorStage === 'recruitment' || message.errorCode?.startsWith('RESEARCH_RECRUITMENT_') || message.researchNeedsConfiguration) &&
+    (message.deliveryStatus === 'failed' || message.deliveryStatus === 'unconfirmed' || Boolean(message.executionError))
   // Only persisted messages carry a real session entry; a live/unsaved turn cannot be a fork point.
-  const canFork = !researchView && Boolean(message.entryId) && !message.isStreaming
+  const canFork = !readOnly && !researchView && Boolean(message.entryId) && !message.isStreaming
   const blocks = getMessageBlocks(message)
+  const textBlocks = blocks.filter(block => block.type === 'text')
+  const combinedPaging = Boolean(useChatSurface()?.paging && message.contentTruncated && message.entryId && textBlocks.length > 1)
 
   useEffect(() => () => {
     if (copyTimerRef.current) clearTimeout(copyTimerRef.current)
@@ -90,14 +97,14 @@ export const MessageItem = React.memo(function MessageItem({ message }: MessageI
         </div>
 
         <div className="text-[length:var(--font-size-body)] leading-relaxed text-text-main whitespace-pre-wrap selection:bg-accent/20">
-          {message.content}
+          <ChatText message={message} text={message.content} plain className="whitespace-pre-wrap" />
         </div>
         {message.deliveryStatus === 'pending' && <p role="status" className="mt-1 text-[11px] text-dim">发送中…</p>}
         {message.deliveryStatus === 'unconfirmed' && <p role="status" className="mt-1 text-[11px] text-warning">{message.deliveryReconciled
           ? '发送结果尚未确认，已核对研究记录' : '发送结果尚未确认，正在核对研究记录…'}</p>}
         {message.deliveryStatus === 'accepted' && <p role="status" className="mt-1 text-[11px] text-dim">已接收，等待协调 Agent 处理</p>}
         {message.deliveryStatus === 'created' && <p role="status" className="mt-1 text-[11px] text-dim">已记录</p>}
-        {message.executionError && <p role="status" className="mt-1 text-xs text-warning">执行异常：{message.executionError}</p>}
+        {message.executionError && !startupFailure && <p role="status" className="mt-1 text-xs text-warning">执行异常：{message.executionError}</p>}
         {message.images?.length ? <div className="mt-2 flex flex-wrap gap-2" aria-label="已发送图片">
           {message.images.map((image, index) => <img
             key={`${message.id}-image-${index}`}
@@ -107,16 +114,17 @@ export const MessageItem = React.memo(function MessageItem({ message }: MessageI
             className="max-h-64 max-w-full rounded-lg border border-border-subtle object-contain"
           />)}
         </div> : null}
-        {message.submissionError && message.deliveryStatus !== 'unconfirmed' && <div className="mt-2 flex items-center gap-2 text-xs text-danger">
+        {startupFailure && <ResearchStartupFailure message={message} retryDisabled={retryDisabled} />}
+        {!readOnly && !startupFailure && message.submissionError && message.deliveryStatus !== 'unconfirmed' && <div className="mt-2 flex items-center gap-2 text-xs text-danger">
           <span role="status">提交失败：{message.submissionError}</span>
           <button type="button" disabled={retryDisabled} onClick={() => researchView ? retryResearchMessage(message.id) : retryMessage(message.id)}
             className="shrink-0 rounded-md border border-border-subtle px-2 py-1 hover:bg-surface-2 disabled:opacity-40">重试</button>
         </div>}
-        {message.executionError && message.researchSubmission && canRetryStartupExecution && !message.submissionError &&
+        {!readOnly && !startupFailure && message.executionError && message.researchSubmission && canRetryStartupExecution && !message.submissionError &&
           message.deliveryStatus !== 'pending' && message.deliveryRetryable !== false &&
           <button type="button" disabled={retryDisabled} onClick={() => retryResearchMessage(message.id)}
             className="mt-2 rounded-md border border-border-subtle px-2 py-1 text-xs hover:bg-surface-2 disabled:opacity-40">重试</button>}
-        {message.deliveryStatus === 'unconfirmed' && message.deliveryReconciled && message.deliveryRetryable !== false && <button type="button" disabled={retryDisabled}
+        {!readOnly && !startupFailure && message.deliveryStatus === 'unconfirmed' && message.deliveryReconciled && message.deliveryRetryable !== false && <button type="button" disabled={retryDisabled}
           onClick={() => retryResearchMessage(message.id)} className="mt-2 shrink-0 rounded-md border border-border-subtle px-2 py-1 text-xs hover:bg-surface-2 disabled:opacity-40">重试</button>}
       </div>
     )
@@ -141,7 +149,7 @@ export const MessageItem = React.memo(function MessageItem({ message }: MessageI
       <div className="conversation-message-body">
         {segments.map((segment, index) => {
           if (segment.kind === 'text') {
-            return <MarkdownContent key={segment.block.id} content={segment.block.text} isStreaming={Boolean(segment.block.isStreaming)} />
+            return <ChatText key={segment.block.id} message={message} text={segment.block.text} isStreaming={Boolean(segment.block.isStreaming)} paginate={!combinedPaging} />
           }
           const [only] = segment.blocks
           if (segment.blocks.length === 1 && only?.type === 'toolCall') {
@@ -150,6 +158,10 @@ export const MessageItem = React.memo(function MessageItem({ message }: MessageI
           return <ExecutionGroup key={only.id} stateKey={`${message.entryId ?? message.id}:${only.contentIndex}`}
             blocks={segment.blocks} active={Boolean(message.isStreaming) && index === segments.length - 1} />
         })}
+        {combinedPaging && <section aria-label="完整消息正文">
+          <h4>完整消息正文</h4>
+          <ChatText message={message} text={message.content || textBlocks.map(block => block.text).join('')} revealOnRead />
+        </section>}
       </div>
       {message.errorMessage && <p className="conversation-message-error" role="status">{message.errorMessage}</p>}
       {/* Message action bar matching screenshot: Copy, Fork, Timestamp */}

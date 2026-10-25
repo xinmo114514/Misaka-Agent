@@ -203,7 +203,7 @@ it('does not follow incoming content when the reader has scrolled up', () => {
   expect(screen.getByRole('button', { name: '回到底部' })).toBeVisible()
 })
 
-it('keeps the visible paragraph anchored when historical details expand above it', () => {
+it('keeps the visible paragraph anchored when historical details expand above it', async () => {
   let resize: (() => void) | undefined
   const PreviousObserver = globalThis.ResizeObserver
   globalThis.ResizeObserver = class {
@@ -228,9 +228,37 @@ it('keeps the visible paragraph anchored when historical details expand above it
     fireEvent.scroll(viewport)
     fireEvent.click(screen.getByRole('button', { name: /执行记录/ }))
     paragraphTop = 220
+    // Size changes are decided once per animation frame, not once per event that caused them.
     act(() => resize?.())
+    await act(async () => { await new Promise<void>(resolve => requestAnimationFrame(() => resolve())) })
     expect(viewport.scrollTop).toBe(470)
   } finally { globalThis.ResizeObserver = PreviousObserver }
+})
+
+it('reads the reading anchor once per frame however many tokens arrive', async () => {
+  useSessionStore.setState({ messages: [{ ...base, content: '第一条' }], currentSessionPath: 'anchor-budget' })
+  render(<Timeline />)
+  const viewport = screen.getByLabelText('对话记录')
+  Object.defineProperties(viewport, { scrollHeight: { get: () => 4000 }, clientHeight: { get: () => 500 } })
+  viewport.scrollTop = 300
+  fireEvent.scroll(viewport)          // the reader scrolled up: every frame now needs an anchor
+  const landmarkQueries: string[] = []
+  const previous = Element.prototype.querySelectorAll
+  Element.prototype.querySelectorAll = function (this: Element, selector: string) {
+    if (selector.includes('conversation-markdown')) landmarkQueries.push(selector)
+    return previous.call(this, selector)
+  }
+  try {
+    for (let index = 0; index < 40; index += 1) {
+      act(() => useSessionStore.setState({ messages: [{ ...base, content: `第一条 ${index}` }] }))
+    }
+    // Inside one frame the geometry pass runs at most once, however many updates piled up.
+    act(() => { /* no frame has run yet */ })
+    const withinFrame = landmarkQueries.length
+    await act(async () => { await new Promise<void>(resolve => requestAnimationFrame(() => resolve())) })
+    expect(withinFrame).toBe(0)
+    expect(landmarkQueries.length).toBeLessThanOrEqual(2)
+  } finally { Element.prototype.querySelectorAll = previous }
 })
 
 
@@ -261,4 +289,3 @@ it('folds a finished history lane until the reader asks for the status rows', ()
   expect(screen.queryByText('完整输出')).not.toBeInTheDocument()
   expect(screen.queryByText('验证失败原因')).not.toBeInTheDocument()
 })
-

@@ -22,6 +22,8 @@ from typing import Any
 
 import httpx
 
+from misaka.config.proxy_settings import proxy_httpx_options
+
 API_FORMATS = ("openai-completions", "openai-responses", "anthropic-messages")
 
 
@@ -322,7 +324,11 @@ async def fetch_remote_models(
             ]
 
     last_error: str | None = None
-    async with httpx.AsyncClient(timeout=timeout_seconds, verify=False, follow_redirects=True) as client:
+    async with httpx.AsyncClient(
+        timeout=timeout_seconds,
+        follow_redirects=True,
+        **proxy_httpx_options(url),
+    ) as client:
         for probe_url in candidate_urls:
             try:
                 resp = await client.get(probe_url, headers=req_headers)

@@ -6,13 +6,14 @@ import contextlib
 import json
 import os
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Mapping
 from typing import Any, Literal, TypedDict
 
 try:
-    from openai import AsyncOpenAI
+    from openai import AsyncOpenAI, DefaultAsyncHttpxClient
 except ImportError:  # optional extra: misaka[openai]
     AsyncOpenAI = None
+    DefaultAsyncHttpxClient = None
 
 from misaka.ai.env_api_keys import get_env_api_key
 from misaka.ai.models import clamp_thinking_level
@@ -61,6 +62,7 @@ from misaka.ai.utils.headers import (
     headers_to_record,
     provider_headers_to_record,
 )
+from misaka.ai.utils.network_route import httpx_client_options
 from misaka.ai.utils.provider_retry import retry_provider_request
 from misaka.ai.utils.transcript import (
     get_declared_tools,
@@ -166,6 +168,7 @@ def create_client(
     api_key: str | None = None,
     options_headers: dict[str, str] | None = None,
     session_id: str | None = None,
+    env: Mapping[str, str] | None = None,
 ) -> AsyncOpenAI:
     if not api_key:
         env_key = os.environ.get("OPENAI_API_KEY")
@@ -209,10 +212,12 @@ def create_client(
     else:
         default_headers = headers
 
+    endpoint = resolve_cloudflare_base_url(model) if is_cloudflare_provider(model.provider) else model.baseUrl
     return require(AsyncOpenAI, "openai")(
         api_key=api_key,
-        base_url=resolve_cloudflare_base_url(model) if is_cloudflare_provider(model.provider) else model.baseUrl,
+        base_url=endpoint,
         default_headers=default_headers,
+        http_client=require(DefaultAsyncHttpxClient, "openai")(**httpx_client_options(endpoint, env)),
     )
 
 
@@ -366,6 +371,7 @@ def stream_openai_responses(
             timestamp=time.time_ns() // 1_000_000,
         )
 
+        owned_client = None
         try:
             api_key = _option(options, "apiKey") or get_env_api_key(model.provider) or ""
             cache_retention = resolve_cache_retention(_option(options, "cacheRetention"), _option(options, "env"))
@@ -376,7 +382,9 @@ def stream_openai_responses(
                 api_key,
                 _option(options, "headers"),
                 cache_session_id,
+                env=_option(options, "env"),
             )
+            owned_client = client
             params = build_params(model, normalized_context, options)
             on_payload = _option(options, "onPayload")
             if callable(on_payload):
@@ -424,7 +432,10 @@ def stream_openai_responses(
             output.errorMessage = format_openai_responses_error(error, model)
             stream.push(ErrorEvent(reason=output.stopReason, error=output), cause=error)
         finally:
-            stream.end()
+            try:
+                await _close_stream(owned_client)
+            finally:
+                stream.end()
 
     spawn_stream_task(run(), stream=stream)
     return stream

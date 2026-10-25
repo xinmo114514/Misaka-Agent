@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import os
 import re
@@ -765,6 +766,72 @@ _REJECTED_CREDENTIAL_PATTERN = re.compile(
 def is_rejected_credential_error(text: str | None) -> bool:
     """Whether a failed request says the credential was refused rather than the service."""
     return bool(text) and bool(_REJECTED_CREDENTIAL_PATTERN.search(str(text)))
+
+
+def _copy_options(options: Any, updates: Mapping[str, Any]) -> Any:
+    if options is None:
+        return dict(updates)
+    if isinstance(options, Mapping):
+        copied = dict(options)
+        copied.update(updates)
+        return copied
+    if isinstance(options, BaseModel):
+        return options.model_copy(update=dict(updates))
+    copied = copy.copy(options)
+    for name, value in updates.items():
+        setattr(copied, name, value)
+    return copied
+
+
+def _deferred_proxy_request_options(options: Any) -> Any:
+    """Copy options and carry the admission-time policy to post-auth routing."""
+    from misaka.ai.utils.network_route import snapshot_network_env
+    from misaka.config.proxy_settings import get_proxy_settings
+
+    marker = {
+        "settings": get_proxy_settings(),
+        "ambient": snapshot_network_env(),
+    }
+    caller_env = (
+        options.get("env")
+        if isinstance(options, Mapping)
+        else getattr(options, "env", None)
+    )
+    updates: dict[str, Any] = {"_misakaProxyPolicy": marker}
+    if caller_env is not None:
+        # The options object is shallow-copied to retain live signals/callbacks and
+        # typed budgets, but env is request data: freeze it before async auth can yield.
+        updates["env"] = dict(caller_env)
+    return _copy_options(options, updates)
+
+
+def _proxy_request_options(
+    options: Any, *, default_type: type[BaseModel] | None = None
+) -> tuple[Any, dict[str, str]]:
+    """Copy request options and freeze the live application route into the copy.
+
+    A shallow Pydantic copy is intentional: signals, callbacks and typed nested
+    values such as ``ThinkingBudgets`` are live runtime objects, not JSON data.
+    """
+    from misaka.config.proxy_settings import proxy_request_env
+
+    if options is None and default_type is not None:
+        options = default_type()
+    effective_env = proxy_request_env(
+        options.get("env") if isinstance(options, Mapping) else getattr(options, "env", None)
+    )
+    return _copy_options(options, {"env": effective_env}), effective_env
+
+
+def _attach_effective_network_env(stream: Any, effective_env: Mapping[str, str]) -> Any:
+    """Keep diagnostics on the returned stream, never in persisted request data."""
+    try:
+        stream.effectiveNetworkEnv = dict(effective_env)
+    except (AttributeError, TypeError):
+        # Extension streams may be slotted or expose read-only attributes. Optional
+        # diagnostics must not turn an otherwise valid provider stream into a failure.
+        pass
+    return stream
 
 
 class ModelRegistry:
@@ -1798,7 +1865,9 @@ class ModelRegistry:
         options: Any = None,
     ) -> AssistantMessageEventStream:
         """Stream through the configured provider with request-time authentication."""
-        return self._authModels.stream(model, context, options)
+        return self._authModels.stream(
+            model, context, _deferred_proxy_request_options(options)
+        )
 
     def streamSimple(
         self,
@@ -1808,6 +1877,9 @@ class ModelRegistry:
     ) -> AssistantMessageEventStream:
         """Stream with provider-neutral options; the transcript is normalized before any
         provider sees it (pi `Models.streamSimple`)."""
+        request_options, effective_env = _proxy_request_options(
+            options, default_type=SimpleStreamOptions
+        )
         resolved_context = normalize_context(context)
         provider = self._authModels.getProvider(model.provider)
         instance_owned = (
@@ -1819,26 +1891,37 @@ class ModelRegistry:
             and provider is not None
             and self.find(model.provider, model.id) is not None
         ):
-            return provider.streamSimple(model, resolved_context, options)
+            return _attach_effective_network_env(
+                provider.streamSimple(model, resolved_context, request_options),
+                effective_env,
+            )
         api = get_api_provider(model.api)
         if api is None:
             raise RuntimeError(f"No API provider registered for api: {model.api}")
-        return api.streamSimple(model, resolved_context, options)
+        return _attach_effective_network_env(
+            api.streamSimple(model, resolved_context, request_options), effective_env
+        )
 
     async def complete(
         self, model: Model, context: Context, options: Any = None
     ) -> AssistantMessage:
-        return await self._authModels.complete(model, context, options)
+        return await self._authModels.complete(
+            model, context, _deferred_proxy_request_options(options)
+        )
 
     async def fetchDeferred(
         self, model: Model, handle: DeferredHandle, options: Any = None
     ) -> AssistantMessage:
-        return await self._authModels.fetchDeferred(model, handle, options)
+        return await self._authModels.fetchDeferred(
+            model, handle, _deferred_proxy_request_options(options)
+        )
 
     async def cancelDeferred(
         self, model: Model, handle: DeferredHandle, options: Any = None
     ) -> None:
-        await self._authModels.cancelDeferred(model, handle, options)
+        await self._authModels.cancelDeferred(
+            model, handle, _deferred_proxy_request_options(options)
+        )
 
     async def checkProviderAuth(
         self,

@@ -11,6 +11,7 @@ import { ToolsSection } from './sections/ToolsSection'
 import { DataSection } from './sections/DataSection'
 import { ShortcutsSection } from './sections/ShortcutsSection'
 import { AboutSection } from './sections/AboutSection'
+import { NetworkSection } from './sections/NetworkSection'
 
 interface SettingsPageProps {
   onClose: () => void
@@ -50,6 +51,8 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({ onClose }) => {
         return <ToolsSection />
       case 'data':
         return <DataSection />
+      case 'network':
+        return <NetworkSection />
       case 'shortcuts':
         return <ShortcutsSection />
       case 'about':

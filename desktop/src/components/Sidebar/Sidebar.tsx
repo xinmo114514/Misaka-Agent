@@ -10,6 +10,12 @@ import type { UpdateStatus } from '../../types/research'
 import type { SessionRow } from '../../types/session'
 import { normalizeWorkspacePath, useSessionStore } from '../../store/useSessionStore'
 import { SessionRenameDialog } from '../SessionRenameDialog'
+import { useResearchRunStore } from '../../store/useResearchRunStore'
+import { useResearchWorkspaceStore } from '../../store/useResearchWorkspaceStore'
+import { ResearchSessionTree } from '../ResearchWorkspace/ResearchSessionTree'
+import { ResearchBackgroundEntry } from './ResearchBackgroundEntry'
+import { openResearchConversation } from '../../lib/startComposerResearch'
+import type { ResearchSessionDescriptor } from '../../types/research'
 
 interface SidebarProps {
   onOpenSettings?: () => void
@@ -57,6 +63,30 @@ export const Sidebar: React.FC<SidebarProps> = ({ onOpenSettings, isSettingsActi
   const requestSessionDeletion = useSessionStore(state => state.requestSessionDeletion)
   const renameSession = useSessionStore(state => state.renameSession)
   const setResearchHistoryOpen = useSessionStore(state => state.setResearchHistoryOpen)
+  const researchListings = useResearchRunStore(state => state.runs)
+  const focusResearchExecutor = useResearchWorkspaceStore(state => state.focusExecutor)
+  const selectResearchNode = useResearchWorkspaceStore(state => state.selectNode)
+  const [researchOpenError, setResearchOpenError] = useState('')
+  const researchGroups = useMemo(() => Object.values(researchListings).reduce<Record<string, typeof researchListings[string][]>>((groups, listing) => {
+    const key = listing.run.workspace
+    ;(groups[key] ??= []).push(listing)
+    return groups
+  }, {}), [researchListings])
+  const openResearchRun = async (runId: string, workspace: string) => {
+    try {
+      const state = useSessionStore.getState()
+      if (state.researchBinding?.runId !== runId || state.researchPageView === 'new') {
+        const host = await openResearchConversation(runId, workspace)
+        state.bindResearchConversation(host)
+        useSessionStore.getState().selectResearchView({ kind: 'conversation', sessionId: host.session.sessionId, ownerKey: `conversation:${host.session.sessionId}` })
+        useSessionStore.getState().setAgentMode('research')
+      }
+    } catch (error) { setResearchOpenError(String(error)) }
+  }
+  const focusResearch = async (runId: string, item: ResearchSessionDescriptor) => {
+    await openResearchRun(runId, item.workspace)
+    focusResearchExecutor(runId, item)
+  }
 
   const scrollRef = useRef<HTMLDivElement>(null)
   const [filter, setFilter] = useState('')
@@ -278,8 +308,9 @@ export const Sidebar: React.FC<SidebarProps> = ({ onOpenSettings, isSettingsActi
       </div>
 
       <div ref={scrollRef} className="min-h-0 flex-1 overflow-y-auto px-2.5 py-2" aria-label="项目与最近会话">
+        <ResearchBackgroundEntry />
         {showSearch && (
-          <div className="sticky top-0 z-10 bg-canvas pb-2 pt-0.5">
+          <div className="misaka-chrome-sticky sticky top-0 z-10 pb-2 pt-0.5">
             <div className="flex items-center gap-1.5 rounded-lg border border-border-subtle bg-surface-1 px-2.5 focus-within:border-border-accent/60">
               <Search className="h-3.5 w-3.5 shrink-0 text-dim" />
               <input autoFocus value={filter} onChange={event => setFilter(event.target.value)}
@@ -300,6 +331,19 @@ export const Sidebar: React.FC<SidebarProps> = ({ onOpenSettings, isSettingsActi
             ))}
           </div>
         ) : <div className="space-y-0.5">{listRows.map(renderRow)}</div>}
+        {Object.keys(researchGroups).length > 0 && <section aria-label="Sessions · Agents" className="mt-3 border-t border-border-subtle pt-2">
+          <h2 className="px-2 text-[12px] font-semibold text-muted">Sessions · Agents</h2>
+          {Object.entries(researchGroups).map(([workspace, runs]) => <div key={workspace} className="mt-2">
+            <div className="truncate px-2 font-mono text-[10px] text-dim" title={workspace}>{workspace}</div>
+            {runs.map(listing => <div key={listing.runId} className="mt-1">
+              <div className="truncate px-2 text-[11px] text-muted" title={listing.run.question}>{listing.run.question} · {listing.run.status}</div>
+              <ResearchSessionTree listing={listing} selectedNodeId={null}
+                onSelectNode={nodeId => { void openResearchRun(listing.runId, listing.run.workspace).then(() => selectResearchNode(listing.runId, nodeId)) }}
+                onFocus={item => { void focusResearch(listing.runId, item) }} />
+            </div>)}
+          </div>)}
+          {researchOpenError && <p role="alert" className="px-2 text-danger">{researchOpenError}</p>}
+        </section>}
       </div>
 
       {updateStatus && !checkingUpdate && (

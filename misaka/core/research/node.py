@@ -383,12 +383,16 @@ def _run(label, routine, *, row_id, runner_key):
     return 3 if result in ("stopped", "budget") else 0
 
 
-def main_card(task_id, *, say=None):
+def main_card(task_id, *, say=None, consult=False, expected_generation=None):
     """Run one ready card in this process, or with ``say`` continue a settled one: the entry point
     ``HeadlessRunner`` spawns. Claim, admission, budget and settle are ``dispatch.run_task``'s and
     are not repeated here, so a card started this way is the same card the daemon or a pane would
     have run. Exit 0 when this process ran the card, 1 when it did not (no such card, someone else
-    holds the claim, the budget stopped, the assignee has no profile)."""
+    holds the claim, the budget stopped, the assignee has no profile).
+
+    ``consult`` and ``expected_generation`` are the desktop continuation's fences (Task 1): the
+    generation is checked again here, before the real claim CAS, so a stale continuation exits
+    without reopening anything."""
     from misaka.core.network import dispatch
     con = task_store.connect(os.path.expanduser(CFG["db"]))
     try:
@@ -396,7 +400,8 @@ def main_card(task_id, *, say=None):
         if row is None:
             print(f"card {task_id}: not on the board", flush=True)
             return 1
-        return 0 if dispatch.run_task(con, row, current_config(), say=say) else 1
+        return 0 if dispatch.run_task(con, row, current_config(), say=say, consult=consult,
+                                      expected_generation=expected_generation) else 1
     finally:
         con.close()
 

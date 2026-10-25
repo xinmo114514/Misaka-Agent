@@ -5,6 +5,9 @@ moved with them (2026-09-23 23:27). The window path now refuses unless the sessi
 `--here` says the adoption is meant; the CLI path, which reopens the saved session, is
 unchanged."""
 import asyncio
+import os
+import socket
+import time
 from contextlib import closing
 from types import SimpleNamespace
 
@@ -96,3 +99,59 @@ async def test_stop_reenters_a_waiting_run_with_no_live_driver(chat, board, tmp_
     assert chat.driven[-1]["run_id"] == chat.run["id"]
     assert chat.driven[-1].get("resume") is not True
     assert "Stop request recorded" in chat.notices[-1][0]
+
+
+@pytest.mark.parametrize("lease", ["absent", "expired", "dead-local"])
+async def test_stop_reenters_persisted_stopping_run_after_driver_disappears(chat, board, lease):
+    """An orphaned stop needs a settlement driver, not another user/model turn."""
+    runs.set_state(board, chat.run["id"], status="stopping")
+    runs.request_stop(board, chat.run["id"])
+    if lease == "expired":
+        lock, expires = "driver:remote-fixture:42:old", int(time.time()) - 10
+    elif lease == "dead-local":
+        lock, expires = f"driver:{socket.gethostname()}:2147483647:dead", int(time.time()) + 600
+    else:
+        lock, expires = None, None
+    board.execute("UPDATE research_runs SET driver_lock=?,driver_expires=? WHERE id=?",
+                  (lock, expires, chat.run["id"]))
+
+    await chat.command(f"stop {chat.run['id']}", chat.ctx)
+    await asyncio.wait_for(chat.started.wait(), 3)
+
+    assert len(chat.driven) == 1
+    assert chat.driven[0]["run_id"] == chat.run["id"]
+    assert chat.driven[0]["resume"] is False
+    assert runs.get(board, chat.run["id"])["stop_requested"] == 1
+
+
+@pytest.mark.parametrize("lock", [
+    f"driver:{socket.gethostname()}:{os.getpid()}:live",
+    "driver:remote-fixture:42:live",
+])
+async def test_stop_does_not_duplicate_a_live_or_foreign_driver(chat, board, lock):
+    runs.set_state(board, chat.run["id"], status="stopping")
+    runs.request_stop(board, chat.run["id"])
+    board.execute("UPDATE research_runs SET driver_lock=?,driver_expires=? WHERE id=?",
+                  (lock, int(time.time()) + 600, chat.run["id"]))
+
+    await chat.command(f"stop {chat.run['id']}", chat.ctx)
+    await asyncio.sleep(0)
+
+    assert chat.driven == []
+    assert runs.get(board, chat.run["id"])["stop_requested"] == 1
+    assert "Stop request recorded" in chat.notices[-1][0]
+
+
+@pytest.mark.parametrize("status", ["stopped", "failed", "done"])
+async def test_repeated_stop_on_terminal_run_does_not_redrive(chat, board, status):
+    runs.set_state(board, chat.run["id"], status=status, error="previous failure" if status == "failed" else None)
+
+    await chat.command(f"stop {chat.run['id']}", chat.ctx)
+    await asyncio.sleep(0)
+
+    current = runs.get(board, chat.run["id"])
+    assert current["status"] == status
+    assert current["stop_requested"] == 0
+    assert current["last_error"] == ("previous failure" if status == "failed" else None)
+    assert chat.driven == []
+    assert f"already {status}" in chat.notices[-1][0]

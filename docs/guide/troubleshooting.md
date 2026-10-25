@@ -33,6 +33,38 @@ the key and run `misaka setup model` again.
 ripgrep or fd is missing. Install it ([step 1 of Getting started](../getting-started.md#1-install-what-misaka-needs))
 and try again.
 
+## Desktop network and proxy
+
+**Model connections still use an old proxy port.**
+Open **设置 → 网络与代理**. Turn on **使用代理**, select the protocol, enter the proxy
+server and its actual port, then click **保存代理设置**. MISAKA does not guess a proxy
+software port or change your system proxy. New native model requests, including Last Order
+and Sisters, use the saved application policy; requests already in flight keep their route.
+
+**I want to turn the application proxy off.**
+Turn off **使用代理**, then choose **关闭代理时**:
+
+- **直接连接** ignores proxy environment variables for native model requests.
+- **沿用环境代理** uses the existing scoped/environment proxy configuration. This is the
+  default for an installation that has not saved application proxy settings yet.
+
+Save the choice. Custom proxies still honor the effective `NO_PROXY` bypass list; the
+**当前聊天模型的已保存有效路径** card shows the ordinary chat model's actual route. Different
+model endpoints may match different bypass entries.
+
+**The connection check passes, but the model still reports an error.**
+**检查连接** tests TCP reachability of the selected path only. It sends no question or model
+credential and does not validate TLS, authentication, quota or a model response. Use the
+provider's separate model test for an inference check. A failed explicit proxy remains a
+failed proxy route; MISAKA does not silently fall back to direct connection. Saving settings
+does not automatically restart or replay a failed research submission.
+
+This setting also covers model-list discovery and MISAKA's own OAuth login/token HTTP
+requests. Web/search/download tools, browser traffic, MCP and terminal subprocesses retain
+their separate network policies. Vendor-managed credential chains, such as Google ADC and
+AWS metadata/refresh, retain their SDK configuration. Bedrock's SDK accepts HTTP(S) proxies;
+selecting SOCKS produces a protocol-capability error instead of changing the route.
+
 ## The panel
 
 **`The panel's terminal library (libghostty-vt) is not available ...`, and plain chat opens.**

@@ -1,6 +1,7 @@
 import React, { useEffect, useRef, useState } from 'react'
 import { Check } from 'lucide-react'
 import { useSettingsStore } from '../store/useSettingsStore'
+import { consumeEscape, ESCAPE_PRIORITY, useEscapeLayer } from '../lib/useEscapeLayer'
 
 export interface CloseConfirmDialogProps {
   open: boolean
@@ -17,6 +18,7 @@ export const CloseConfirmDialog: React.FC<CloseConfirmDialogProps> = ({
   const setCloseWindowAction = useSettingsStore((s) => s.setCloseWindowAction)
   const cancelRef = useRef<HTMLButtonElement>(null)
   const previousFocus = useRef<HTMLElement | null>(null)
+  useEscapeLayer(open, event => { consumeEscape(event); onClose() }, ESCAPE_PRIORITY.dialog)
 
   useEffect(() => {
     if (open) {
@@ -29,18 +31,6 @@ export const CloseConfirmDialog: React.FC<CloseConfirmDialogProps> = ({
       previousFocus.current = null
     }
   }, [open])
-
-  useEffect(() => {
-    if (!open) return
-    const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') {
-        event.preventDefault()
-        onClose()
-      }
-    }
-    window.addEventListener('keydown', onKeyDown)
-    return () => window.removeEventListener('keydown', onKeyDown)
-  }, [open, onClose])
 
   if (!open) return null
 

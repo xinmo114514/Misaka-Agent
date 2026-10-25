@@ -40,6 +40,8 @@ NON_RETRYABLE_PROVIDER_LIMIT_ERROR_PATTERN = _build_provider_error_pattern(
         # OpenCode Go subscription-limit text asks users to enable available-balance
         # usage after rolling/weekly/monthly limits are reached.
         "Monthly usage limit reached",
+        "usage_limit_reached",
+        "usage limit reached",
         "available balance",
         # Generic quota/budget/billing exhaustion. `insufficient_quota` is OpenAI's
         # quota/billing error code; the other strings cover common gateway wording.

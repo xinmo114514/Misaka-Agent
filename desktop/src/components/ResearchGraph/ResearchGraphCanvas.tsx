@@ -1,3 +1,4 @@
+import { researchActivity, subscribeResearchHistory, subscribeResearchRun, useResearchActivityStore } from '../../lib/researchActivityStore'
 import React, { useEffect, useMemo, useCallback } from 'react'
 import {
   ReactFlow,
@@ -16,10 +17,9 @@ import { ResearchNodeComponent } from './ResearchNodeComponent'
 import { NodeDetailDrawer } from './NodeDetailDrawer'
 import { useThemeTokens } from '../../theme/useThemeTokens'
 import { useSessionStore } from '../../store/useSessionStore'
-import { researchNodeLabel } from '../../lib/researchStatus'
+import { researchRunLabel } from '../../lib/researchStatus'
 import type { ResearchGraphNode, ResearchGraphPayload, ResearchNodeData } from '../../types/research'
 
-const POLL_INTERVAL_MS = 4000
 
 /** Node status → the four visual states the card understands. Anything transient is "running",
  *  the terminal trio keeps its own state, and everything not yet started reads as pending. */
@@ -117,33 +117,34 @@ function buildEdges(nodes: ResearchGraphNode[], palette: EdgePalette): Edge[] {
 }
 
 interface ResearchGraphCanvasProps {
+  runId?: string | null
   showRunPicker?: boolean
   showNodeDrawer?: boolean
   onSelectNode?: (node: ResearchGraphNode) => void
 }
 
 export const ResearchGraphCanvas: React.FC<ResearchGraphCanvasProps> = ({
-  showRunPicker = true, showNodeDrawer = true, onSelectNode,
+  runId: requestedRunId, showRunPicker = true, showNodeDrawer = true, onSelectNode,
 }) => {
   const tokens = useThemeTokens()
-  const researchGraph = useSessionStore((s) => s.researchGraph)
+  const legacyGraph = useSessionStore((s) => s.researchGraph)
   const researchRuns = useSessionStore((s) => s.researchRuns)
-  const researchRunId = useSessionStore((s) => s.researchRunId)
-  const fetchResearchRuns = useSessionStore((s) => s.fetchResearchRuns)
-  const fetchResearchGraph = useSessionStore((s) => s.fetchResearchGraph)
+  const selectedRunId = useSessionStore((s) => s.researchRunId)
+  const researchRunId = requestedRunId ?? selectedRunId ?? researchRuns[0]?.id
+  const detailGraph = useResearchActivityStore(s=>researchRunId ? s.details[researchRunId]?.graph : undefined)
+  const researchGraph = detailGraph ?? (legacyGraph?.run === researchRunId ? legacyGraph : null)
+  const workspace = researchRuns.find(run=>run.id === researchRunId)?.workspace
 
   const [nodes, setNodes, onNodesChange] = useNodesState<Node<ResearchNodeData>>([])
   const [selectedNode, setSelectedNode] = React.useState<ResearchNodeData | null>(null)
 
-  // Refresh on open, then poll: a run is driven by a separate process with no event channel.
+  // Graph views use the same run-detail subscription as the history and task pills.
+  useEffect(() => showRunPicker ? subscribeResearchHistory() : undefined, [showRunPicker])
   useEffect(() => {
-    fetchResearchRuns()
-    fetchResearchGraph()
-    const timer = window.setInterval(() => {
-      fetchResearchGraph(useSessionStore.getState().researchRunId || undefined)
-    }, POLL_INTERVAL_MS)
-    return () => window.clearInterval(timer)
-  }, [fetchResearchRuns, fetchResearchGraph])
+    setSelectedNode(null)
+    if (!researchRunId) return
+    return subscribeResearchRun(researchRunId,workspace)
+  }, [researchRunId,workspace])
 
   const graphNodes: ResearchGraphNode[] = researchGraph?.nodes || []
 
@@ -178,18 +179,18 @@ export const ResearchGraphCanvas: React.FC<ResearchGraphCanvasProps> = ({
         <div className="absolute top-3 left-3 z-20 flex items-center gap-2">
           <select
             value={researchRunId || ''}
-            onChange={(e) => fetchResearchGraph(e.target.value)}
+            onChange={(e) => useSessionStore.setState({researchRunId:e.target.value})}
             className="max-w-[320px] bg-card text-text-main border border-border-subtle rounded-lg px-2.5 py-1.5 text-xs outline-none focus:border-accent cursor-pointer shadow-e1"
           >
             {researchRuns.map((run) => (
               <option key={run.id} value={run.id}>
-                {researchNodeLabel(run.phase || run.status)} · {run.question || run.id}
+                {researchRunLabel(run)} · {run.question || run.id}
               </option>
             ))}
           </select>
           <button
             type="button"
-            onClick={() => fetchResearchGraph(researchRunId || undefined)}
+            onClick={() => void researchActivity.refresh()}
             className="w-7 h-7 flex items-center justify-center rounded-lg bg-card border border-border-subtle text-dim hover:text-text-main transition-colors cursor-pointer shadow-e1"
             title="刷新研究图"
           >

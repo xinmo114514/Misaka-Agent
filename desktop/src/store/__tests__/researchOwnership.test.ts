@@ -34,7 +34,7 @@ const otherWorkspace = (sessionId: string, streamId: string) => ({ ...host(null)
 it('lets the user reopen a run whose binding was retired by an automatic switch', () => {
   const workspaceA = otherWorkspace('root-a', 'stream-a')
   useSessionStore.getState().bindResearchConversation(workspaceA)
-  useSessionStore.getState().bindResearchConversation(otherWorkspace('root-b', 'stream-b'))
+  useSessionStore.getState().bindResearchConversation(otherWorkspace('root-b', 'stream-b'), true)
   // A late event-driven rebind to the retired host stays fenced, so the live host keeps its own transcript.
   useSessionStore.getState().bindResearchConversation(workspaceA)
   expect(useSessionStore.getState().researchBinding?.sessionId).toBe('root-b')

@@ -2,10 +2,13 @@ export type MessageRole = 'user' | 'assistant' | 'system' | 'custom'
 
 import type { PromptImage } from './attachment'
 import type { ResearchSubmissionInput } from '../lib/startComposerResearch'
+import type { ResearchFailureMetadata } from './research'
 
 export interface ToolCall {
   id: string
   name: string
+  argumentsTruncated?: boolean
+  resultTruncated?: boolean
   arguments?: Record<string, any>
   result?: any
   status: 'pending' | 'running' | 'success' | 'error' | 'cancelled'
@@ -23,12 +26,13 @@ export type MessageBlock =
   | { type: 'thinking'; id: string; contentIndex: number; thinking: string; isStreaming?: boolean }
   | { type: 'toolCall'; id: string; contentIndex: number; toolCall: ToolCall }
 
-export interface ChatMessage {
+export interface ChatMessage extends ResearchFailureMetadata {
   id: string
   /** The persisted session entry this message came from (absent for live/unsaved turns). */
   entryId?: string
   role: MessageRole
   content: string
+  contentTruncated?: boolean
   /** Image inputs preserved on optimistic rows and hydrated session history. */
   images?: PromptImage[]
   /** Canonical ordered content; legacy text/tool fields are derived projections. */
@@ -57,7 +61,7 @@ export interface ChatMessage {
   submissionError?: string
   /** Immutable original native input, retained for request-idempotent retry. */
   researchSubmission?: Readonly<ResearchSubmissionInput>
-  researchDraft?: { text: string; attachmentPaths: string[]; sessionId: string; streamId?: string; mode: 'research'; revision?: number }
+  researchDraft?: { ownerKey?: string; attachmentIdentities?: Array<{attachmentId: string; preparationId: string}>; text: string; attachmentPaths: string[]; sessionId: string; streamId?: string; mode: 'research'; revision?: number }
   /** Delivery succeeded; execution subsequently failed. */
   executionError?: string
   stopReason?: string
@@ -81,6 +85,8 @@ export interface SessionInfoOut {
   fileRevision?: string
   messageCount: number
   firstMessage: string
+  /** Persisted desktop research intake/recruitment, including roots without a Run. */
+  desktopResearch?: boolean
   parentSessionPath?: string | null
 }
 

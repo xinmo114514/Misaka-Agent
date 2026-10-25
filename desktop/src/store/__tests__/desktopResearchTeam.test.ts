@@ -16,7 +16,9 @@ beforeEach(() => {
   window.bridge = { send: command => ordinary.push(command), on: () => () => {} }
   window.researchBridge = { send: command => research.push(command), on: handler => { deliver = handler; return () => {} } }
   release = installResearchBridge()
-  useSessionStore.setState({ agentMode: 'research', researchBinding: null, researchTeam: null, researchModelBinding: null } as any)
+  useSessionStore.setState({ agentMode: 'research', researchPageView:'conversation', researchBinding: null,
+    researchBindings: {}, researchConversations: {}, researchSnapshots: {}, researchEditors: {},
+    researchTeam: null, researchModelBinding: null } as any)
   useSessionStore.getState().bindResearchConversation({ ...host(), team, modelBinding: binding() } as any)
   useSettingsStore.setState({ models: ['a', 'b'].map(id => ({ id, name: id.toUpperCase(), provider: 'fixture', reasoning: true, thinkingLevels: id === 'b' ? ['high'] : ['low', 'high'], input: [], maxTokens: 100, contextWindow: 1000, configured: true })), currentModel: { ...effective, name: 'A', thinking: 'low' }, thinkingLevel: 'low', defaultProvider: 'fixture', defaultModel: 'a', modelSwitchPending: false, pickerError: null, researchModelBinding: null } as any)
 })
@@ -114,4 +116,10 @@ it('keeps the fresh pick over an old team binding until the binding catches up',
   // Once the team commits the choice, the binding legitimately paints it.
   useSettingsStore.getState().applyResearchModelBinding('root', { effective: { provider: 'fixture', modelId: 'b' }, target: null, epoch: 5, state: 'ready' })
   expect(useSettingsStore.getState().currentModel?.modelId).toBe('b')
+})
+
+it('stores committed model configuration in its conversation editor bucket', () => {
+ useSessionStore.setState({researchEditors:{}})
+ useSettingsStore.getState().applyResearchModelBinding('root', binding(20) as any)
+ expect(useSessionStore.getState().researchEditors['conversation:root'].model?.modelId).toBe('a')
 })

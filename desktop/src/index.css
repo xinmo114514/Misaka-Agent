@@ -1,5 +1,11 @@
 @import './styles/conversation.css';
 @import './styles/materials.css';
+@import './styles/research-workspace.css';
+@import './styles/research-toolbar.css';
+@import './styles/research-panes.css';
+@import './styles/research-pane-content.css';
+@import './styles/research-multi.css';
+@import './styles/research-composer.css';
 @import "tailwindcss";
 
 @theme inline {
@@ -62,6 +68,10 @@
   --color-accent: var(--accent);
   --color-rose: var(--rose);
   --color-rose-lite: var(--rose-lite);
+  --color-research-notice-border: var(--research-notice-border);
+  --color-research-notice-surface: var(--research-notice-surface);
+  --color-research-notice-text: var(--research-notice-text);
+  --color-research-contract: var(--research-contract);
   --color-surface-0: var(--surface-0);
   --color-surface-1: var(--surface-1);
   --color-surface-2: var(--surface-2);
@@ -189,12 +199,8 @@ html.theme-switching *::after {
   z-index: 0;
   pointer-events: none;
   background-color: color-mix(in srgb, var(--rose) 5%, transparent);
-  -webkit-mask-image:
-    radial-gradient(720px 420px at 16% -6%, #000 0%, transparent 66%),
-    radial-gradient(640px 380px at 90% 106%, #000 0%, transparent 70%);
-  mask-image:
-    radial-gradient(720px 420px at 16% -6%, #000 0%, transparent 66%),
-    radial-gradient(640px 380px at 90% 106%, #000 0%, transparent 70%);
+  -webkit-mask-image: radial-gradient(720px 420px at 16% -6%, #000 0%, transparent 66%);
+  mask-image: radial-gradient(720px 420px at 16% -6%, #000 0%, transparent 66%);
 }
 
 /* Keep light-mode canvases pure white; accents belong to local controls and states. */
@@ -637,6 +643,15 @@ body {
 
 /* Override every visible XYFlow color default, including its SVG-only inks.
    Layout and stroke widths remain the library's responsibility. */
+.research-tiling-container {
+  container-type: inline-size;
+}
+.research-tile-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); grid-template-rows: repeat(3, minmax(220px, 1fr)); }
+.research-tile-lo { grid-column: 1 / -1; }
+@container (min-width: 820px) {
+  .research-tile-grid { grid-template-columns: minmax(240px, 1fr) repeat(2, minmax(0, 1fr)); grid-template-rows: repeat(2, minmax(220px, 1fr)); }
+  .research-tile-lo { grid-column: 1; grid-row: span 2; }
+}
 .misaka-research-graph {
   --xy-background-color: var(--graph-background);
   --xy-background-pattern-color: var(--graph-grid);

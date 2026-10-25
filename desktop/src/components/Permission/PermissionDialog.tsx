@@ -1,11 +1,14 @@
 import React, { useState } from 'react'
 import { ShieldAlert, Terminal, FileCode, Check, X, Bot, ShieldCheck } from 'lucide-react'
 import { useSessionStore } from '../../store/useSessionStore'
+import { consumeEscape, ESCAPE_PRIORITY, useEscapeLayer } from '../../lib/useEscapeLayer'
 
 export const PermissionDialog: React.FC = () => {
   const pending = useSessionStore((s) => s.pendingPermissionRequest)
   const respondPermission = useSessionStore((s) => s.respondPermission)
   const [feedback, setFeedback] = useState('')
+  // This decision stays open until explicitly answered; Escape must not act on the reader below.
+  useEscapeLayer(Boolean(pending), consumeEscape, ESCAPE_PRIORITY.dialog)
 
   if (!pending) return null
 

@@ -5,6 +5,7 @@ import asyncio
 import inspect
 import json
 import logging
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -20,12 +21,31 @@ from misaka.core.research.ingress import (
 from misaka.utils.values import read_field
 
 from .auxiliary import prepare_desktop_assembly
-from .model_policy import ModelPolicyPaused, atomic_json
+from .card_control import DesktopCardControl
+from .model_policy import DesktopRoleModelPolicy, ModelPolicyPaused, atomic_json
 from .native_scope import NativeScope
 from .team import DesktopResearchTeam
 
 logger = logging.getLogger(__name__)
 __all__ = ['DesktopExecutionScope', 'DesktopResearchController', 'prepare_desktop_assembly']
+
+
+async def retry_end_request(policy, ticket, *, attempts=5, delay=0.2):
+    """Release one model request, retrying a transient store failure a bounded number of times.
+
+    Task 2: the request ticket is the barrier's record. A release that fails once (a concurrent
+    policy write, a briefly held lock) must not leave the ticket behind forever; the final failure
+    still propagates so the caller keeps a retryable settlement instead of a silent leak.
+    """
+    last = None
+    for _ in range(max(1, attempts)):
+        try:
+            policy.end_request(ticket)
+            return
+        except Exception as error:  # noqa: BLE001 - a retryable release failure
+            last = error
+            await asyncio.sleep(delay)
+    raise last
 
 # A recruitment turn is a real model conversation (it inspects the question, then recruits each
 # role), so it is slow by design. The bound exists only to turn "never settles" into a visible,
@@ -65,35 +85,59 @@ def desktop_child_argv(argv, policy_path, binding, *, launch_id=None):
         lane, args = 'node', argv[4:]
     else:
         return argv
+    role = binding.get('role') or ('last_order' if lane == 'node' else 'sister')
     return [argv[0], '-m', 'misaka.desktop_research.worker_entry', '--policy', str(policy_path),
             '--epoch', str(binding['epoch']), '--provider', binding['provider'], '--model', binding['modelId'],
-            *(['--launch-id', launch_id] if launch_id else []), '--lane', lane, '--', *args]
+            *(['--launch-id', launch_id] if launch_id else []), '--role', role, '--lane', lane, '--', *args]
 
 
 class _BoundStream:
-    def __init__(self, stream, release):
-        self.stream, self.release = stream, release
+    """One admitted model request plus the cleanup its producer owns (Task 2).
+
+    Cancellation now asks this request's own transport to stop before joining its producer, so
+    停止研究 settles a blocked stream instead of hanging on it (2026-10-19: a stop left the root
+    waiting on its own model request, the ticket unreleased). The abort door belongs to this
+    request alone -- the caller's upstream signal is never touched -- and the request ticket
+    still releases only after the producer's finalizers have drained.
+    """
+
+    def __init__(self, stream, release, abort=None):
+        self.stream, self.release, self.abort = stream, release, abort
 
     def __getattr__(self, name):
         return getattr(self.stream, name)
+
+    def _request_abort(self):
+        """Raise this request's own door; the turn's abort belongs to its caller."""
+        if self.abort is not None:
+            self.abort()
 
     def __aiter__(self):
         return self._events()
 
     async def _events(self):
+        cancelled = None
         try:
             async for event in self.stream:
                 yield event
+        except (asyncio.CancelledError, GeneratorExit) as error:
+            # The consumer gave up: end the provider wait first, then join its cleanup below.
+            cancelled = error
+            self._request_abort()
         finally:
-            await self._drain_release()
+            await self._drain_release(cancelled)
 
     async def result(self):
+        cancelled = None
         try:
             return await _maybe(self.stream.result())
+        except (asyncio.CancelledError, GeneratorExit) as error:
+            cancelled = error
+            self._request_abort()
         finally:
-            await self._drain_release()
+            await self._drain_release(cancelled)
 
-    async def _drain_release(self):
+    async def _drain_release(self, cancelled=None):
         from misaka.utils.async_lifecycle import settle
         async def drain():
             try:
@@ -102,17 +146,32 @@ class _BoundStream:
                     await _maybe(settled())
             finally:
                 await self.release()
-        _value, cancelled = await settle(asyncio.create_task(drain()))
-        if cancelled is not None:
-            raise cancelled
+        task = asyncio.create_task(drain())
+        if cancelled is None:
+            try:
+                await asyncio.shield(task)
+                return
+            except asyncio.CancelledError as error:
+                # Cancelled mid-join: raise the door so a cooperative producer can end...
+                self._request_abort()
+                cancelled = error
+        else:
+            self._request_abort()
+        # ...then finish the one cleanup task anyway, so the ticket releases only after its
+        # finalizers. A second cancellation is still waited through (settle), never abandoned.
+        _value, late = await settle(task)
+        raise late or cancelled
 
     async def aclose(self):
+        # An explicit close is an explicit stop of THIS request: signal it before waiting on
+        # the underlying close or its finalizers.
+        self._request_abort()
         try:
             close = getattr(self.stream, 'aclose', None)
             if close:
                 await _maybe(close())
         finally:
-            await self._drain_release()
+            await self._drain_release(None)
 
 
 class DeferredBoundStream:
@@ -120,24 +179,52 @@ class DeferredBoundStream:
     def __init__(self, opening):
         self.opening = asyncio.create_task(opening)
 
+    async def _open(self):
+        """Await admission; a consumer that gives up takes the request down with it.
+
+        Cancelling this waiter does not cancel the admission task on its own, so a stop landing
+        mid-admission left the opened request registered with nobody to release it (2026-10-19
+        停止研究 hang). Aborting here cancels the opening task -- whose failure path releases
+        the request ticket -- and the join survives a second cancellation (settle). A stream
+        that finished opening after the cancellation is closed through its own request-local door.
+        """
+        cancelled = None
+        while not self.opening.done():
+            try:
+                await asyncio.shield(self.opening)
+            except asyncio.CancelledError as error:
+                if cancelled is None:
+                    cancelled = error
+                    self.opening.cancel()
+        if cancelled is None:
+            return self.opening.result()
+        if not self.opening.cancelled():
+            try:
+                opened = self.opening.result()
+            except BaseException:  # noqa: BLE001 - the stored failure belongs to the cancelled waiter
+                opened = None
+            if isinstance(opened, _BoundStream):
+                await opened._drain_release(cancelled)
+        raise cancelled
+
     async def result(self):
-        stream = await self.opening
+        stream = await self._open()
         return await stream.result()
 
     def __aiter__(self):
         return self._events()
 
     async def _events(self):
-        stream = await self.opening
+        stream = await self._open()
         try:
             async for event in stream:
                 yield event
         finally:
-            await stream._drain_release()
+            await stream._drain_release(None)
 
     async def settled(self):
-        stream = await self.opening
-        await stream._drain_release()
+        stream = await self._open()
+        await stream._drain_release(None)
 
 
 class DesktopModelRegistry:
@@ -164,7 +251,7 @@ class DesktopModelRegistry:
         return await self.stream(model, context, options).result()
 
 
-def install_model_binding(session, policy, executor_id):
+def install_model_binding(session, policy, executor_id, scope=None, *, role='sister'):
     if getattr(session, '_desktop_model_policy', None) is policy:
         return
     inner = session.agent.streamFn
@@ -186,14 +273,25 @@ def install_model_binding(session, policy, executor_id):
             await session.setModel(model, persist=False)
         return model
 
-    policy.register_executor(executor_id, prepare)
+    if isinstance(policy, DesktopRoleModelPolicy):
+        policy.register_executor(executor_id, prepare, role=role)
+    else:
+        policy.register_executor(executor_id, prepare)
 
-    async def bound_stream(_override_model, context, options=None, *, _transport=None):
+    async def open_bound_stream(_override_model, context, options=None, *, _transport=None):
+        from misaka.ai.utils.abort import AbortController, combine_abort_signals
         from misaka.core.sdk import _to_dict
         request_options = _to_dict(options)
-        signal = request_options.get('signal')
+        # Every admitted request owns one cancellation door. It composes over the caller's
+        # signal so a consumer who gives up can end exactly this transport (停止研究), while a
+        # turn-wide abort still reaches the request as before; the caller's signal itself is
+        # never raised from here.
+        door = AbortController()
+        signal = combine_abort_signals(request_options.get('signal'), door)
         while True:
-            await wait_model_ready(policy, signal)
+            if getattr(session, '_desktop_closing', False):
+                raise asyncio.CancelledError('Executor closing')
+            await wait_model_ready(policy, signal, role=role)
             await policy.synchronize_executor(executor_id)
             try:
                 binding = policy.begin_request(executor_id)
@@ -203,19 +301,33 @@ def install_model_binding(session, policy, executor_id):
                 # responsive rather than entering policy.request's blind wait.
                 await asyncio.sleep(.01)
         released = False
+        bound = None
+        tickets = getattr(session, '_desktop_release_tickets', None)
+        if tickets is None:
+            tickets = session._desktop_release_tickets = {}
+        release_lock = asyncio.Lock()
 
         async def release():
             nonlocal released
-            if not released:
-                released = True
-                policy.end_request(binding)
+            async with release_lock:
+                if not released:
+                    await retry_end_request(policy, binding)
+                    released = True
+                    tickets.pop(binding['requestId'], None)
+                    if scope is not None and bound is not None:
+                        scope.stream_closed(session, bound)
+
+        tickets[binding['requestId']] = release
 
         try:
             model = await prepare(binding['provider'], binding['modelId'], binding['epoch'])
+            if scope is not None:
+                scope.apply_thinking(session)
             # Caller/compaction/hook options may have been built under an older
             # model. Re-resolve auth AFTER admission, using native registry only.
             from misaka.core.sdk import _to_dict
             request_options = _to_dict(options)
+            request_options['signal'] = signal
             auth_resolver = getattr(session.modelRegistry, 'getAuth', None)
             if auth_resolver is not None:
                 from misaka.ai.auth.resolve import AuthResolutionOverrides
@@ -228,11 +340,42 @@ def install_model_binding(session, policy, executor_id):
                 request_options['env'] = resolution.env or {}
                 if resolution.auth.baseUrl and hasattr(model, 'model_copy'):
                     model = model.model_copy(update={'baseUrl': resolution.auth.baseUrl})
+            # Keep effective routing only in memory for diagnostics. The registry fills
+            # ``effectiveNetworkEnv`` after auth and application policy merge; retain that
+            # same in-memory mapping so a later setup failure still reports the route the
+            # request actually used. Never persist auth or routing data here.
+            network_context = {'endpoint': read_field(model, 'baseUrl'),
+                'provider': read_field(model, 'provider'), 'modelId': read_field(model, 'id'),
+                'modelBaseUrl': read_field(session.model, 'baseUrl'),
+                'secrets': [request_options.get('apiKey'), *(request_options.get('headers') or {}).values()]}
+            session._desktop_network_context = None
             stream = await _maybe((_transport or inner)(model, context, request_options))
-            return _BoundStream(stream, release)
+            effective_env = getattr(stream, 'effectiveNetworkEnv', None)
+            if effective_env is None:
+                from misaka.ai.utils.network_route import snapshot_network_env
+                effective_env = snapshot_network_env(request_options.get('env'))
+            network_context['env'] = effective_env
+            session._desktop_network_context = network_context
+            bound = _BoundStream(stream, release, abort=door.abort)
+            if scope is not None:
+                scope.stream_opened(session, bound)
+            return bound
         except BaseException:
             await release()
             raise
+
+    async def bound_stream(_override_model, context, options=None, *, _transport=None):
+        if getattr(session, '_desktop_closing', False):
+            raise asyncio.CancelledError('Executor closing')
+        opening = asyncio.current_task()
+        openings = getattr(session, '_desktop_opening_streams', None)
+        if openings is None:
+            openings = session._desktop_opening_streams = set()
+        openings.add(opening)
+        try:
+            return await open_bound_stream(_override_model, context, options, _transport=_transport)
+        finally:
+            openings.discard(opening)
 
     proxy = DesktopModelRegistry(source_registry, bound_stream)
     if hasattr(session, '_modelRegistry'):
@@ -248,10 +391,11 @@ def install_model_binding(session, policy, executor_id):
     session.agent.streamFn = bound_stream
     session._desktop_model_policy = policy
     session._desktop_executor_id = executor_id
+    session._desktop_model_role = role
     session._desktop_model_prepare = prepare
 
 
-async def wait_model_ready(policy, signal=None):
+async def wait_model_ready(policy, signal=None, *, role=None):
     from misaka.utils.values import signal_aborted
     # Failed targets remain paused until the user explicitly retries or cancels;
     # a native abort still exits promptly without requiring a model decision.
@@ -259,7 +403,7 @@ async def wait_model_ready(policy, signal=None):
         if signal_aborted(signal):
             raise asyncio.CancelledError('Request aborted during team model boundary')
         try:
-            return policy.guard_model()
+            return policy.guard_model(role=role) if role and isinstance(policy, DesktopRoleModelPolicy) else policy.guard_model()
         except ModelPolicyPaused:
             await asyncio.sleep(.01)
 
@@ -317,13 +461,29 @@ class DeferredDesktopProcess:
         self.process = None
         self.cancelled = False
         self.error = None
+        self.started = False
+        self.settled = threading.Event()
+        if not hasattr(scope, 'pending_launches'):
+            scope.pending_launches = set()
+        scope.pending_launches.add(self)
         self.job = asyncio.run_coroutine_threadsafe(self._launch(), loop)
+        self.job.add_done_callback(self._before_start_cancelled)
+
+    def _before_start_cancelled(self, future):
+        if future.cancelled() and not self.started:
+            self.scope.pending_launches.discard(self)
+            self.settled.set()
 
     async def _launch(self):
+        self.started = True
         from misaka.core.research.node import ProcessSpawner
         try:
-            binding = await wait_model_ready(self.scope.policy)
-            if self.cancelled:
+            if getattr(self.scope, '_launch_closed', False):
+                raise asyncio.CancelledError('Launch admission closed')
+            binding = await wait_model_ready(self.scope.policy, role=self.scope.launch_role(self.argv))
+            binding = {**binding, 'role': self.scope.launch_role(self.argv)}
+            if self.cancelled or getattr(self.scope, '_launch_closed', False):
+                self.cancelled = True
                 return
             argv = desktop_child_argv(self.argv, self.scope.policy.path, binding,
                                       launch_id=self.scope.record_launch(binding))
@@ -340,6 +500,9 @@ class DeferredDesktopProcess:
             raise
         except (OSError, ValueError, RuntimeError) as error:
             self.error = error
+        finally:
+            self.scope.pending_launches.discard(self)
+            self.settled.set()
 
     @property
     def pid(self):
@@ -386,12 +549,24 @@ class DesktopExecutionScope:
         ('misaka.core.network.messages', 'MessagesPart'),
     }
 
-    def __init__(self, team, config, *, controller=None):
+    def __init__(self, team, config, role='last_order', *, controller=None):
         self.team, self.policy = team, team.model_policy
+        self.role = role
         self.base_config = dict(config)
         atomic_json(self.team.directory / 'runtime-config.json', self.base_config)
         self.controller = controller
         self.sessions, self.idle_jobs = {}, {}
+        # Registered model streams per session: close drains them before the executor settles
+        # (Task 2). A stream registers itself in install_model_binding's bound_stream.
+        self.releasing = {}
+        self.pending_launches = set()
+        self.pending_launch_jobs = set()
+        self._launch_closed = False
+        self._startup_settlement = None
+        # Task 1: the desktop-owned continuation owner. The scope's cloned messages module uses
+        # this hook, so a finished card of this run is woken through the private team/policy
+        # chain instead of the global panel continuation.
+        self.card_control = DesktopCardControl(self)
         self.catalog_views = []
         self.counter = 0
         self.adapted_extensions = set()
@@ -405,10 +580,11 @@ class DesktopExecutionScope:
 
         class DesktopSpawner(node.ProcessSpawner):
             def spawn(self, argv, **kwargs):
-                if owner.policy.snapshot()['state'] != 'ready':
+                role = owner.launch_role(argv)
+                if owner.policy.snapshot(role=role)['state'] != 'ready':
                     return owner.defer_spawn(self, argv, kwargs)
                 try:
-                    binding = owner.launch_binding()
+                    binding = owner.launch_binding(role=role)
                 except ModelPolicyPaused:
                     return owner.defer_spawn(self, argv, kwargs)
                 launch_id = owner.record_launch(binding)
@@ -421,25 +597,23 @@ class DesktopExecutionScope:
                     super().stop(process)
 
         async def create_subprocess_exec(*argv, **kwargs):
-            binding = await wait_model_ready(owner.policy)
-            launch_id = owner.record_launch(binding)
-            return await asyncio.create_subprocess_exec(
-                *desktop_child_argv(argv, owner.policy.path, binding, launch_id=launch_id), **kwargs)
+            return await owner.launch_subprocess(argv, kwargs)
 
         async def resolve_task_model(_manager, _context, _call_model, _definition_model):
             signal = read_field(_context, 'signal') or getattr(_manager.session.agent, 'signal', None)
-            binding = await wait_model_ready(owner.policy, signal)
+            binding = await wait_model_ready(owner.policy, signal, role=owner.role)
             await owner.ensure_session(_manager.session, binding)
             return binding['provider'], binding['modelId']
 
         async def open_session(flags, cwd, assembly=None):
-            binding = await wait_model_ready(owner.policy)
+            binding = await wait_model_ready(owner.policy, role=owner.role)
             if assembly is not None:
                 owner.adapt_assembly(assembly)
             runtime, session, error = await platform_session.open_session(pinned_flags(flags, binding), cwd, assembly)
             if session is not None and not error:
                 owner.bind_session(session)
                 await owner.ensure_session(session, binding)
+                owner.apply_thinking(session)
             return runtime, session, error
 
         async def dispose(runtime):
@@ -461,7 +635,7 @@ class DesktopExecutionScope:
                               'sisters': lambda: {m['name'] for m in self.team.snapshot()['team']['members']}},
             'misaka.config.product': {'CFG': self.current_config(), 'current_config': self.current_config},
             'misaka.config.profiles': {'explicit_model_override': lambda *_args, **_kwargs:
-                f"{self.policy.snapshot()['effective']['provider']}/{self.policy.snapshot()['effective']['modelId']}"},
+                f"{self.policy.snapshot(role=self.role)['effective']['provider']}/{self.policy.snapshot(role=self.role)['effective']['modelId']}"},
             'misaka.core.research.node': {'ProcessSpawner': DesktopSpawner, 'PaneSpawner': DesktopSpawner,
                 'PaneRunner': lambda con, cfg, *_args: self.native.module('misaka.core.research.node').HeadlessRunner(con, cfg)},
             'misaka.core.platform.session': {'open_session': open_session, 'dispose': dispose},
@@ -472,6 +646,12 @@ class DesktopExecutionScope:
         modules, classes = set(self.MODULES), set(self.CLASSES)
         install_auxiliary_factories(self, overrides, modules, classes)
         self.native = NativeScope(overrides, modules=modules, classes=classes)
+        # Task 1: scope-local continuation hook. The cloned messages module reads this from its
+        # private namespace, so a finished card of this run is woken through the desktop worker
+        # chain (private team, policy and profiles) instead of the global panel route.
+        self.native.namespace('misaka.core.network.messages')['_SCOPE_WAKE_HOOK'] = self.card_control.wake_card
+        self.native.namespace('misaka.core.network.dispatch')['_SCOPE_CONTINUATION_CLAIMING'] = self.card_control.claiming
+        self.native.namespace('misaka.core.network.dispatch')['_SCOPE_CONTINUATION_CLAIMED'] = self.card_control.claimed
         # Only this scope's subclass is modified. Native SubagentManager remains identical.
         manager_class = self.native.module('misaka.core.subagent.runtime').SubagentManager
         manager_class._resolve_task_model = resolve_task_model
@@ -481,16 +661,116 @@ class DesktopExecutionScope:
             '_roster': self.catalog, 'validate_plan': planner.validate_plan,
             '_validate_tasks': planner._validate_tasks, '_validate_decisions': planner._validate_decisions}
         self.native.modules.add('misaka.core.research.planner')
+
+    def stream_opened(self, session, stream):
+        """Track one live model stream so session settlement can close it (Task 2)."""
+        streams = getattr(session, '_desktop_active_streams', None)
+        if streams is None:
+            streams = set()
+            session._desktop_active_streams = streams
+        streams.add(stream)
+
+    def stream_closed(self, session, stream):
+        streams = getattr(session, '_desktop_active_streams', None)
+        if streams is not None:
+            streams.discard(stream)
+
+    async def cancel_startup_now(self):
+        """Cancel every owned research startup and wait for it to actually stop.
+
+        Task 2: ``task.cancel()`` only requests cancellation; the caller must be able to say the
+        startup has settled. Returns the gather results, whose cancelled entries are the settled
+        cancellations.
+        """
+        job = getattr(self, '_startup_settlement', None)
+        if job is None or (job.done() and (job.cancelled() or job.exception() is not None)):
+            self._launch_closed = True
+            job = asyncio.create_task(self._settle_startup_now())
+            self._startup_settlement = job
+        return await asyncio.shield(job)
+
+    async def _settle_startup_now(self):
+        sessions = list(getattr(self, 'sessions', {}).values())
+        root = getattr(getattr(self, 'controller', None), 'session', None)
+        if root is None:
+            root = getattr(self, 'session', None)  # legacy standalone scopes
+        if root is not None:
+            sessions.append(root)
+        owned = set()
+        for session in sessions:
+            for part in getattr(getattr(session, 'moments', None), 'parts', ()):
+                owned.update(getattr(part, '_starts', ()) or ())
+        owned.update(getattr(self, 'pending_launch_jobs', ()))
+        owned.discard(asyncio.current_task())
+        deferred = [handle for handle in list(getattr(self, 'pending_launches', ()))
+                    if isinstance(handle, DeferredDesktopProcess)]
+        for handle in deferred:
+            handle.stop(handle.spawner)
+        for task in owned:
+            task.cancel()
+        control = getattr(self, 'card_control', None)
+        if control is not None:
+            await asyncio.to_thread(control.stop_all)
+        results = await asyncio.gather(*owned, return_exceptions=True) if owned else []
+        for handle in deferred:
+            if not await asyncio.to_thread(handle.settled.wait, 30):
+                raise RuntimeError('Native launch settlement remains pending')
+        return results
         # No commands/phase validators are cloned: their native module is deliberately absent.
 
+    async def launch_subprocess(self, argv, kwargs):
+        """Own nested model-boundary and subprocess creation through cancellation settlement."""
+        from misaka.utils.async_lifecycle import settle
+        if self._launch_closed:
+            raise asyncio.CancelledError('Launch admission closed')
+        job = asyncio.current_task()
+        self.pending_launch_jobs.add(job)
+        try:
+            binding = await wait_model_ready(self.policy, role=self.role)
+            binding = {**binding, 'role': self.role}
+            if self._launch_closed:
+                raise asyncio.CancelledError('Launch admission closed')
+            launch_id = self.record_launch(binding)
+            process, cancelled = await settle(asyncio.create_task(asyncio.create_subprocess_exec(
+                *desktop_child_argv(argv, self.policy.path, binding, launch_id=launch_id), **kwargs)))
+            if cancelled is not None or self._launch_closed:
+                if process.returncode is None:
+                    process.terminate()
+                    try:
+                        await asyncio.wait_for(process.wait(), 5)
+                    except TimeoutError:
+                        process.kill()
+                        await process.wait()
+                raise cancelled or asyncio.CancelledError('Launch admission closed')
+            return process
+        finally:
+            self.pending_launch_jobs.discard(job)
+
+    def begin_launch_admission(self):
+        settlement = getattr(self, '_startup_settlement', None)
+        if settlement is not None and not settlement.done():
+            raise ValueError('Previous startup cancellation is still settling')
+        self._launch_closed = False
+        self._startup_settlement = None
+
     def current_config(self):
-        pair = self.policy.snapshot()['effective']
+        pair = self.policy.snapshot(role=self.role)['effective']
+        lo = self.policy.snapshot(role='last_order')['effective']
         return {**self.base_config, 'profiles_root': str(self.team.profile_root),
                 'provider': pair['provider'], 'default_model': pair['modelId'],
-                'lo_model': f"{pair['provider']}/{pair['modelId']}"}
+                'lo_model': f"{lo['provider']}/{lo['modelId']}"}
 
-    def launch_binding(self):
-        return self.policy.guard_model()
+    def launch_role(self, argv):
+        argv = list(argv)
+        if argv[1:3] == ['-m', 'misaka.cli.research_node']:
+            return 'sister'
+        if argv[1:3] == ['-m', 'misaka'] and len(argv) > 3 and argv[3] == 'research':
+            return 'last_order'
+        return self.role
+
+    def launch_binding(self, *, role=None):
+        role = role or self.role
+        return {**self.policy.guard_model(role=role), 'role': role}
 
     def record_launch(self, binding):
         launch_id = uuid.uuid4().hex
@@ -498,6 +778,8 @@ class DesktopExecutionScope:
         return launch_id
 
     def defer_spawn(self, spawner, argv, kwargs):
+        if getattr(self, '_launch_closed', False):
+            raise asyncio.CancelledError('Launch admission closed')
         # HeadlessRunner calls synchronous spawn inside its async loop. Returning
         # a process-shaped pending handle keeps that loop responsive to cancel.
         try:
@@ -506,7 +788,9 @@ class DesktopExecutionScope:
             loop = getattr(self, 'loop', None)
         if loop is None or not loop.is_running():
             # Native node spawns use an off-loop thread; no event loop is blocked.
-            while self.policy.snapshot()['state'] != 'ready':
+            while self.policy.snapshot(role=self.launch_role(argv))['state'] != 'ready':
+                if getattr(self, '_launch_closed', False):
+                    raise asyncio.CancelledError('Launch admission closed')
                 time.sleep(.01)
             return spawner.spawn(argv, **kwargs)
         return DeferredDesktopProcess(self, spawner, argv, kwargs, loop)
@@ -561,13 +845,18 @@ class DesktopExecutionScope:
     async def ensure_session(self, session, binding):
         await session._desktop_model_prepare(binding['provider'], binding['modelId'], binding['epoch'])
 
+    def apply_thinking(self, session):
+        level = self.team.role_thinking(self.role)
+        if level is not None:
+            session.setThinkingLevel(level)
+
     def bind_session(self, session):
         if id(session) in self.sessions:
             return
         self.counter += 1
         self.loop = asyncio.get_running_loop()
         executor_id = f'{session.sessionId}:{self.counter}'
-        install_model_binding(session, self.policy, executor_id)
+        install_model_binding(session, self.policy, executor_id, scope=self, role=self.role)
         self.sessions[id(session)] = session
         from .auxiliary import adapt_live_extensions
         adapt_live_extensions(self, session)
@@ -581,15 +870,63 @@ class DesktopExecutionScope:
                 logger.warning('Desktop executor preparation failed; the recorded model boundary remains paused')
             await asyncio.sleep(.05)
 
-    async def release_session(self, session):
-        job = self.idle_jobs.pop(id(session), None)
-        if job:
-            job.cancel()
-            await asyncio.gather(job, return_exceptions=True)
-        self.sessions.pop(id(session), None)
+    async def release_session(self, session, *, timeout=30.0):
+        """Close one session's executor: drain its requests, then release it (Task 2).
+
+        The old shape unregistered immediately and raised ``Executor still has active requests``
+        when a stream was still finishing, which surfaced as a worker crash even though the card
+        had settled (2026-10-11). Now: stop new admission, close registered streams, wait a bounded
+        time for the barrier to drain, and keep a still-pending settlement registered so a later
+        call (or process exit) can finish it. A clean release removes the session from the scope.
+        """
         executor_id = getattr(session, '_desktop_executor_id', None)
-        if executor_id:
-            self.policy.unregister_executor(executor_id)
+        if not executor_id:
+            self.sessions.pop(id(session), None)
+            return 'settled'
+        session._desktop_closing = True
+        key = id(session)
+        job = self.releasing.get(key)
+        if job is None or (job.done() and (job.cancelled() or job.exception() is not None)):
+            job = asyncio.create_task(self._settle_session(session, executor_id))
+            self.releasing[key] = job
+        try:
+            result = await asyncio.wait_for(asyncio.shield(job), max(.001, timeout))
+        except TimeoutError:
+            return 'cleanup_pending'
+        except Exception:
+            logger.warning('Desktop executor settlement remains retryable', exc_info=True)
+            return 'cleanup_pending'
+        self.releasing.pop(key, None)
+        return result
+
+    async def _settle_session(self, session, executor_id):
+        self.policy.begin_closing(executor_id)
+        key = id(session)
+        idle = self.idle_jobs.pop(key, None)
+        opening = set(getattr(session, '_desktop_opening_streams', ()))
+        opening.discard(asyncio.current_task())
+        if idle is not None:
+            opening.add(idle)
+        for job in opening:
+            job.cancel()
+        if opening:
+            await asyncio.gather(*opening, return_exceptions=True)
+        while True:
+            for stream in list(getattr(session, '_desktop_active_streams', ())):
+                try:
+                    await _maybe(stream.aclose())
+                except Exception:
+                    logger.warning('Desktop stream release remains retryable', exc_info=True)
+            for release in list(getattr(session, '_desktop_release_tickets', {}).values()):
+                try:
+                    await release()
+                except Exception:
+                    logger.warning('Desktop request release remains retryable', exc_info=True)
+            status = self.policy.settle_executor(executor_id)
+            if status in ('settled', 'absent'):
+                self.sessions.pop(key, None)
+                return 'settled'
+            await asyncio.sleep(.05)
 
 
 class DesktopResearchController:
@@ -601,9 +938,24 @@ class DesktopResearchController:
         from .storage import root_team_directory
         directory = root_team_directory(manager, session.sessionId)
         model = session.model
+        lo_reference = str(self.config.get('lo_model') or '').strip()
+        lo_pair = {'provider': model.provider, 'modelId': model.id}
+        if lo_reference and not (Path(directory) / 'desktop-team' / 'model-policy.json').exists():
+            from misaka.config.profiles import resolve_model_reference
+            canonical = resolve_model_reference(lo_reference, session.modelRegistry,
+                                                fallback_provider=self.config.get('provider') or model.provider)
+            lo_pair = dict(zip(('provider', 'modelId'), canonical.split('/', 1)))
         self.team = DesktopResearchTeam(directory, self.config['profiles_root'], model.provider, model.id,
-            team_id=session.sessionId, allowed_tools=session.getActiveToolNames())
+            team_id=session.sessionId, allowed_tools=session.getActiveToolNames(),
+            lo_provider=lo_pair['provider'], lo_model=lo_pair['modelId'])
         self.scope = DesktopExecutionScope(self.team, self.config, controller=self)
+        # The continuation owner needs to know which root conversation this team serves: a card
+        # of another root must be continued in that root's window, never here (Task 1).
+        atomic_json(self.scope.team.directory / 'owner.json', {
+            'teamId': self.team.snapshot()['team']['teamId'],
+            'rootSession': str(manager.sessionFile or ''),
+            'workspace': str(manager.getCwd() or ''),
+        })
         self.ingress = self.scope.native.module('misaka.core.research.ingress').ResearchMessageIngress(
             session, config=self.scope.current_config())
         self.lock = asyncio.Lock()
@@ -698,6 +1050,8 @@ class DesktopResearchController:
             submissions.trace_input(obj, stage='controller', session_id=self.session.sessionId,
                                     model=getattr(self.session, 'model', None))
             stripped, control_spec = validate_research_input(obj, self.session.sessionId)
+            if control_spec is None or control_spec.get('action') == 'resume':
+                self.scope.begin_launch_admission()
             request_id = obj['requestId']
             obj = {**obj, 'text': stripped}
             if obj.get('runId') and session_run(self.session, con) is None:
@@ -714,52 +1068,81 @@ class DesktopResearchController:
                     raise ValueError('The original research session changed owners.')
                 control._check_input_owner()
                 from misaka.core.research.ingress import current_request_id
+
+                from . import recruitment
+                previous_attempt = recruitment.original_attempt(self.session, obj)
+                attempt = previous_attempt.get('attempt', 0) + 1
+                previous = submissions.recorded_input(self.session, request_id, 'desktop-intake')
+                if previous and str(previous.get('content') or '').strip() != stripped:
+                    raise submissions.request_conflict()
                 self.scene.intake = True
                 token = current_request_id.set(request_id)
+                before = getattr(self.session, '_find_last_assistant_message', lambda: None)()
+                self.session._desktop_network_context = None
+                recruitment.record(self.session, obj, 'preparing', attempt=attempt)
+                intake_task = None
                 try:
                     # Hidden native custom intake preserves the user's exact input once;
                     # the workflow publishes its existing research-question entry on start.
-                    previous = submissions.recorded_input(self.session, request_id, 'desktop-intake')
-                    if previous and str(previous.get('content') or '').strip() != stripped:
-                        raise submissions.request_conflict()
                     members = self.team.snapshot()['team']['members']
                     last = getattr(self.session, '_find_last_assistant_message', lambda: None)()
                     interrupted = last is not None and read_field(last, 'stopReason') != 'stop'
-                    if previous is None and request_id not in self.intake_requests:
-                        await self.session.sendCustomMessage({'customType': 'desktop-intake',
-                            'display': False, 'content': stripped,
-                            'details': {'requestId': request_id}},
-                            {'triggerTurn': True, 'prepareTurn': True,
-                             '_deliveryId': f'desktop-intake:{self.session.sessionId}:{request_id}'})
-                    elif not members or interrupted:
-                        # This is an internal continuation, not another copy of user intent.
-                        attempt = 1 + sum(entry.get('customType') == 'desktop-intake-resume'
-                            and (entry.get('details') or {}).get('requestId') == request_id
-                            for entry in submissions.entries(self.session))
-                        await self.session.sendCustomMessage({'customType': 'desktop-intake-resume',
-                            'display': False,
-                            'content': 'Continue preparing the task-specific research team for the original '
-                                       'desktop-intake question already recorded in this conversation. '
-                                       'Complete recruitment before handing off to the native planner.',
-                            'details': {'requestId': request_id, 'kind': 'recruitment-continuation'}},
-                            {'triggerTurn': True, 'prepareTurn': True,
-                             '_deliveryId': f'desktop-intake-resume:{self.session.sessionId}:{request_id}:{attempt}'})
-                    # The intake turn is now durably recorded, so a retry of this requestId must
-                    # resume with the start instead of re-delivering (and re-recruiting) it.
-                    # Recruitment is a real model turn, so it is allowed to take a long time --
-                    # but not forever. Without a bound, a stalled provider left the caller with
-                    # no ack and no failure event, and the desktop waited out its whole startup
-                    # budget before reporting nothing.
-                    await asyncio.wait_for(self.session.waitForIdle(), RECRUITMENT_TURN_TIMEOUT_SECONDS)
+                    async def _run_intake():
+                        if previous is None and request_id not in self.intake_requests:
+                            await self.session.sendCustomMessage({'customType': 'desktop-intake',
+                                'display': False, 'content': stripped,
+                                'details': {'requestId': request_id}},
+                                {'triggerTurn': True, 'prepareTurn': True,
+                                 '_deliveryId': f'desktop-intake:{self.session.sessionId}:{request_id}'})
+                        elif not members or interrupted:
+                            # This is an internal continuation, not another copy of user intent.
+                            attempt = 1 + sum(entry.get('customType') == 'desktop-intake-resume'
+                                and (entry.get('details') or {}).get('requestId') == request_id
+                                for entry in submissions.entries(self.session))
+                            await self.session.sendCustomMessage({'customType': 'desktop-intake-resume',
+                                'display': False,
+                                'content': 'Continue preparing the task-specific research team for the original '
+                                           'desktop-intake question already recorded in this conversation. '
+                                           'Complete recruitment before handing off to the native planner.',
+                                'details': {'requestId': request_id, 'kind': 'recruitment-continuation'}},
+                                {'triggerTurn': True, 'prepareTurn': True,
+                                 '_deliveryId': f'desktop-intake-resume:{self.session.sessionId}:{request_id}:{attempt}'})
+                        await self.session.waitForIdle()
+
+                    # The intake turn and model prompt are bounded by the recruitment timeout.
+                    # wait_for cancels and drains BEFORE returning its timeout. A provider's
+                    # finalizer may itself need native abort, so signal abort before draining.
+                    intake_task = asyncio.create_task(_run_intake())
+                    done, _ = await asyncio.wait({intake_task}, timeout=RECRUITMENT_TURN_TIMEOUT_SECONDS)
+                    if not done:
+                        raise TimeoutError('Research recruitment deadline exceeded')
+                    await intake_task
+                    after = getattr(self.session, '_find_last_assistant_message', lambda: None)()
+                    if after is not None and after is not before and read_field(after, 'stopReason') in {'error', 'aborted'}:
+                        raise recruitment.failure(self.session, after, attempt=attempt)
+                    if not self.team.snapshot()['team']['members']:
+                        raise recruitment.failure(self.session, 'No research roles were recruited.', attempt=attempt,
+                            code='RESEARCH_RECRUITMENT_INCOMPLETE')
                 except TimeoutError as error:
-                    raise submissions.ResearchInputError(
-                        '研究团队招募未在预期时间内完成，研究尚未启动；原始课题已保留，可以重试。',
-                        'RESEARCH_RECRUITMENT_TIMEOUT', stage='recruitment', retryable=True) from error
+                    await recruitment.abort_and_settle(self.session, intake_task)
+                    failure = recruitment.failure(self.session, error, attempt=attempt, code='RESEARCH_RECRUITMENT_TIMEOUT')
+                    recruitment.record(self.session, obj, 'failed', attempt=attempt, error=failure)
+                    raise failure from error
+                except asyncio.CancelledError:
+                    await recruitment.abort_and_settle(self.session, intake_task)
+                    failure = recruitment.failure(self.session, 'Research startup cancelled', attempt=attempt,
+                        code='RESEARCH_STARTUP_CANCELLED')
+                    recruitment.record(self.session, obj, 'failed', attempt=attempt, error=failure)
+                    raise
+                except Exception as error:  # noqa: BLE001 - preserve any native recruitment failure
+                    failure = error if isinstance(error, submissions.ResearchInputError) else recruitment.failure(
+                        self.session, error, attempt=attempt)
+                    recruitment.record(self.session, obj, 'failed', attempt=attempt, error=failure)
+                    raise failure from (None if failure is error else error)
                 finally:
                     current_request_id.reset(token)
                     self.scene.intake = False
-                if not self.team.snapshot()['team']['members']:
-                    raise ValueError('The coordinator has not recruited any task-specific roles; research has not started.')
+                recruitment.record(self.session, obj, 'completed', attempt=attempt)
                 self.intake_requests.add(request_id)
             self.ingress.config = self.scope.current_config()
             return await self.ingress.send(obj, con)
@@ -771,22 +1154,68 @@ class DesktopResearchController:
             job.add_done_callback(self._event_jobs.discard)
         self._unsubscribe_model_events = self.team.model_policy.subscribe(changed)
 
-    async def set_team_model(self, provider, model_id, action='switch'):
+    async def set_team_model(self, provider, model_id, action='switch', role='all'):
         try:
             if action == 'cancel':
-                await self.team.model_policy.cancel_switch()
+                await self.team.model_policy.cancel_switch(role=role)
             elif action in {'switch', 'retry'}:
-                binding = await self.team.model_policy.switch(provider, model_id)
-                if binding['state'] == 'ready':
-                    pair = binding['effective']
+                if role in {'sister', 'last_order'}:
+                    # A role may have no live executor yet (for example Sisters
+                    # while the plan awaits approval). Validate its selection
+                    # without changing the other role's session/model.
+                    registry = self.session.modelRegistry
+                    refresh = getattr(registry, 'refresh', None)
+                    if refresh:
+                        await _maybe(refresh())
+                    selected = registry.find(provider, model_id)
+                    if selected is None:
+                        raise ValueError(f'Team model is missing from the native registry: {provider}/{model_id}')
+                    if read_field(selected, 'api') == 'moa' or provider == 'moa':
+                        raise ValueError('Strict role binding requires a native physical model.')
+                    if not await registry.checkConfiguredAuth(selected):
+                        raise ValueError(f'Team model credentials are missing: {provider}/{model_id}')
+                binding = await self.team.model_policy.switch(provider, model_id, role=role)
+                sister = self.team.model_policy.snapshot(role='sister')
+                if binding['state'] == 'ready' and sister['state'] == 'ready':
+                    pair = sister['effective']
                     self.team.pin_profiles(pair['provider'], pair['modelId'])
             else:
                 raise ValueError('Unknown team model action')
+            if role in {'last_order', 'all'} and self.team.model_policy.snapshot(role='last_order')['state'] == 'ready':
+                self.session._desktop_network_context = None
         finally:
             # Subscribers report genuine persisted transitions, including failed targets.
             if self._event_jobs:
                 await asyncio.gather(*tuple(self._event_jobs))
         return self.snapshot()
+
+    async def set_team_thinking(self, level, *, role='last_order'):
+        if role not in ('last_order', 'sister'):
+            raise ValueError('Unknown desktop thinking role')
+        if level not in ('off', 'minimal', 'low', 'medium', 'high', 'xhigh'):
+            raise ValueError('Unknown thinking level')
+        if role == 'last_order':
+            if getattr(self.session, '_desktop_model_prepare', None) is not None:
+                await self.scope.ensure_session(self.session,
+                    self.team.model_policy.guard_model(role='last_order'))
+            self.session.setThinkingLevel(level)
+            level = self.session.thinkingLevel
+        else:
+            for session in self.scope.sessions.values():
+                if getattr(session, '_desktop_model_role', None) == 'sister':
+                    session.setThinkingLevel(level)
+        self.team.set_role_thinking(role, level)
+        return {'role': role, 'thinkingLevel': level}
+
+    async def cancel_startup(self):
+        """Cancel every owned startup and WAIT for it to settle (Task 2).
+
+        task.cancel() only requests cancellation; the abort door must be able to treat the
+        startup as stopped before it reports the cancel as settled. ``cancel_startup_now``
+        below returns the gather results; this keeps the historical signature used by
+        ``desktop_bridge`` while gaining the settle wait.
+        """
+        await self.scope.cancel_startup_now()
 
     async def retain_roles(self, selections, request_id, con):
         run = session_run(self.session, con)
@@ -799,10 +1228,8 @@ class DesktopResearchController:
         self._unsubscribe_model_events()
         if self._event_jobs:
             await asyncio.gather(*tuple(self._event_jobs), return_exceptions=True)
+        await asyncio.to_thread(self.scope.card_control.stop_all)
         if self.manager:
             await self.manager.close()
         for session in list(self.scope.sessions.values()):
             await self.scope.release_session(session)
-
-
-

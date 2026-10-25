@@ -35,6 +35,7 @@ from misaka.ai.auth.types import (
 )
 from misaka.ai.utils.abort import race_with_abort_signal
 from misaka.ai.utils.diagnostics import format_thrown_value
+from misaka.ai.utils.env_layers import merge_env_layers
 from misaka.utils.values import signal_aborted
 
 ModelsErrorCode: TypeAlias = Literal[
@@ -97,10 +98,10 @@ class _EnvOverlayAuthContext:
 
     def __init__(self, base: AuthContext, env: ProviderEnv) -> None:
         self._base = base
-        self._env = env
+        self._env = merge_env_layers(env)
 
     async def env(self, name: str) -> str | None:
-        return self._env.get(name) or await self._base.env(name)
+        return self._env[name] if name in self._env else await self._base.env(name)
 
     async def fileExists(self, path: str) -> bool:
         return await self._base.fileExists(path)
@@ -159,7 +160,7 @@ async def _resolveProviderAuthWithSignal(
             credential = stored
             if overrides is not None and overrides.env:
                 credential = stored.model_copy(
-                    update={"env": {**(stored.env or {}), **overrides.env}}
+                    update={"env": merge_env_layers(stored.env, overrides.env)}
                 )
             return await _resolveApiKey(
                 requestAuthContext, provider.auth.apiKey, provider.id, credential, signal

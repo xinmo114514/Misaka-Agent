@@ -1,11 +1,14 @@
 import { app, BrowserWindow, dialog, ipcMain, shell, Tray, Menu, nativeImage } from 'electron'
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process'
 import fs from 'node:fs'
+import os from 'node:os'
 import path from 'node:path'
 import { validatedExternalHttpUrl } from './externalUrl'
 import { themeRegistry } from '../src/theme/registry'
 import { createThemeRuntime, themeStartupQuery, windowThemeOptions } from './themeRuntime'
-import { researchBridgeArgs, researchCloseOutcome, resolvedResearchBridgeLaunch, sameResearchBridge, type ResearchBridgeLaunch } from './researchBridge'
+import { bridgeEnvironment, researchBridgeArgs, resolvedResearchBridgeLaunch, sameResearchBridge, type ResearchBridgeLaunch } from './researchBridge'
+import { createCloseFlow, TERMINATE_WAIT_MS, type CloseFlow } from './closeFlow'
+import { createDiagnostics, collectBuildIdentity, eventIdentity, type DiagnosticFields, type Diagnostics } from './diagnostics'
 const projectRoot = path.resolve(__dirname, '..', '..')
 let mainWindow: BrowserWindow | null = null
 let bridgeProcess: ChildProcessWithoutNullStreams | null = null
@@ -15,26 +18,67 @@ let researchHostIdentity: { sessionId: string; streamId?: string } | null = null
 let researchActive = false
 let researchPendingCount = 0
 let researchTray: Tray | null = null
-let closeChoiceOpen = false
+let researchStarting = false
 let allowClose = false
 let allowQuit = false
+let closeFlow: CloseFlow | null = null
 const researchWaiters = new Map<string, { resolve: (value: any) => void; reject: (error: Error) => void; timer: ReturnType<typeof setTimeout> }>()
 const recentResearchMessages: unknown[] = []
 let themeRuntime: ReturnType<typeof createThemeRuntime>
+let diagnostics: Diagnostics | null = null
+/** What the main thread saw between two flushes; a flood must not become a record per event. */
+let streamWindow = { received: 0, sent: 0, dropped: 0, bytes: 0, maxBytes: 0, lastSeq: 0, since: Date.now() }
 
-function dispatchResearchMessage(message: any): void {
+function noteStreamLine(bytes: number, message: any): void {
+  streamWindow.received += 1
+  streamWindow.bytes += bytes
+  streamWindow.maxBytes = Math.max(streamWindow.maxBytes, bytes)
+  if (typeof message?.seq === 'number') streamWindow.lastSeq = message.seq
+}
+
+function flushStreamWindow(): void {
+  if (!diagnostics) return
+  const now = Date.now()
+  if (streamWindow.received > 0) {
+    diagnostics.record('bridge:window', {
+      ...streamWindow, windowMs: now - streamWindow.since, pending: researchWaiters.size, buffered: recentResearchMessages.length,
+    })
+  }
+  streamWindow = { received: 0, sent: 0, dropped: 0, bytes: 0, maxBytes: 0, lastSeq: 0, since: now }
+}
+
+function dispatchResearchMessage(message: any, bytes = 0): void {
   if (message?.type === 'ack' && typeof message.requestId === 'string') {
     const waiter = researchWaiters.get(message.requestId)
     if (waiter) {
       researchWaiters.delete(message.requestId)
       clearTimeout(waiter.timer)
-      if (message.ok === false) waiter.reject(new Error(message.error || '研究桥接请求失败'))
-      else waiter.resolve(message.data ?? message)
+      if (message.ok === false) {
+        diagnostics?.record('bridge:ack-failed', { ...eventIdentity(message), type: 'ack' })
+        waiter.reject(new Error(message.error || '研究桥接请求失败'))
+      } else waiter.resolve(message.data ?? message)
     }
   }
   recentResearchMessages.push(message)
-  if (recentResearchMessages.length > 300) recentResearchMessages.splice(0, recentResearchMessages.length - 300)
-  if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('research:event', message)
+  if (recentResearchMessages.length > 300) {
+    streamWindow.dropped += recentResearchMessages.length - 300
+    recentResearchMessages.splice(0, recentResearchMessages.length - 300)
+  }
+  if (!mainWindow || mainWindow.isDestroyed()) {
+    streamWindow.dropped += 1
+    return
+  }
+  // The renderer turns this into "how long was this message waiting before it reached me".
+  const stamped = { ...message, mainSentAt: Date.now(), mainBytes: bytes }
+  try {
+    mainWindow.webContents.send('research:event', stamped)
+    streamWindow.sent += 1
+    if (diagnostics && message?.event?.type && message.event.type !== 'message_update') {
+      diagnostics.record('bridge:event', { ...eventIdentity(message), windowMs: Date.now() - streamWindow.since })
+    }
+  } catch (error) {
+    diagnostics?.record('bridge:send-failed', { ...eventIdentity(message), error: error instanceof Error ? error.message : String(error) })
+  }
 }
 
 function sendResearchCommand(command: Record<string, unknown>): void {
@@ -69,14 +113,17 @@ async function startResearchBridge(input: ResearchBridgeLaunch): Promise<any> {
     const sameHost = sameResearchBridge(researchBridgeLaunch, input)
     if (sameHost) return requestResearchCommand('get_research_host')
     if (researchActive) throw new Error('已有研究运行时正在另一项目工作；先完成或停止当前研究。')
-    if (!(await stopResearchBridgeForQuit())) throw new Error('切换研究项目已取消。')
+    if (!(await stopResearchBridge(30000))) {
+      throw new Error('上一个研究运行时仍在停止中；请在窗口关闭时选择停止或退出，再切换研究项目。')
+    }
   }
 
   const isWin = process.platform === 'win32'
+  researchStarting = true
   const child = spawn(isWin ? 'uv.exe' : 'uv', researchBridgeArgs(input), {
     cwd: projectRoot,
-    env: { ...process.env, PYTHONUNBUFFERED: '1', PYTHONIOENCODING: 'utf-8' },
-    shell: isWin,
+    env: bridgeEnvironment(),
+    shell: false,
     windowsHide: true,
   })
   researchBridgeProcess = child
@@ -89,34 +136,42 @@ async function startResearchBridge(input: ResearchBridgeLaunch): Promise<any> {
     for (const line of lines) {
       const trimmed = line.trim()
       if (!trimmed) continue
-      try { dispatchResearchMessage(JSON.parse(trimmed)) }
-      catch (error) { console.error('Failed to parse research bridge JSON:', trimmed, error) }
+      let parsed: any = null
+      try { parsed = JSON.parse(trimmed) }
+      catch (error) { console.error('Failed to parse research bridge JSON:', trimmed, error); continue }
+      noteStreamLine(trimmed.length, parsed)
+      dispatchResearchMessage(parsed, trimmed.length)
     }
   })
   child.stderr.on('data', (chunk: Buffer) => process.stderr.write(chunk))
-  child.on('exit', (code) => {
+  child.on('close', (code) => {
+    diagnostics?.record('bridge:exit', { code, pending: researchWaiters.size })
     if (researchBridgeProcess === child) {
+      researchStarting = false
       if (researchHostIdentity) dispatchResearchMessage({ seq: 0, ...researchHostIdentity,
         event: { type: 'research_connection_error', error: `研究连接已断开 (${code})，再次发送将恢复原会话。` } })
       researchBridgeProcess = null
       researchBridgeLaunch = null
       researchHostIdentity = null
     }
-    for (const [id, waiter] of researchWaiters) {
-      clearTimeout(waiter.timer)
-      waiter.reject(new Error(`研究桥接进程已退出 (${code})`))
-      researchWaiters.delete(id)
-    }
+    releaseResearchWaiters(`研究桥接进程已退出 (${code})`)
   })
 
-  const host = await requestResearchCommand('get_research_host', {}, 30000)
-  if (!host?.enabled || !host?.session?.file) {
-    child.kill()
-    throw new Error('独立研究会话未能启动。')
+  try {
+    const host = await requestResearchCommand('get_research_host', {}, 30000)
+    if (!host?.enabled || !host?.session?.file) {
+      child.kill()
+      throw new Error('独立研究会话未能启动。')
+    }
+    researchBridgeLaunch = resolvedResearchBridgeLaunch(input, host.session.file)
+    researchHostIdentity = { sessionId: host.session.sessionId, streamId: host.streamId }
+    researchStarting = false
+    return host
+  } catch (error) {
+    // A start that failed still counts as work in progress while its process is ours.
+    researchStarting = researchBridgeProcess !== null
+    throw error
   }
-  researchBridgeLaunch = resolvedResearchBridgeLaunch(input, host.session.file)
-  researchHostIdentity = { sessionId: host.session.sessionId, streamId: host.streamId }
-  return host
 }
 
 function syncResearchTray(): void {
@@ -128,7 +183,7 @@ function syncResearchTray(): void {
     { label: '打开 Misaka Agent', click: () => { mainWindow?.show(); mainWindow?.focus() } },
     { label: researchActive ? `研究进行中 · ${researchPendingCount} 项待处理` : '研究已空闲', enabled: false },
     { type: 'separator' },
-    { label: '退出 Misaka Agent', click: () => { void quitApplication() } },
+    { label: '退出 Misaka Agent', click: () => { void closeFlow?.quitDirectly() } },
   ]))
 }
 
@@ -163,22 +218,13 @@ function startBridgeProcess(win: BrowserWindow) {
     bridgeArgs.push('--no-session')
   }
 
-  const env: Record<string, string | undefined> = {
-    ...process.env,
-    PYTHONUNBUFFERED: '1',
-    PYTHONIOENCODING: 'utf-8',
-  }
-  delete env.ALL_PROXY
-  delete env.all_proxy
-  delete env.HTTP_PROXY
-  delete env.http_proxy
-  delete env.HTTPS_PROXY
-  delete env.https_proxy
+  const env = bridgeEnvironment()
 
   bridgeProcess = spawn(uvExecutable, bridgeArgs, {
     cwd: projectRoot,
     env: env as NodeJS.ProcessEnv,
-    shell: isWin,
+    shell: false,
+    windowsHide: true,
   })
 
   let buffer = ''
@@ -208,9 +254,10 @@ function startBridgeProcess(win: BrowserWindow) {
     process.stderr.write(chunk)
   })
 
-  bridgeProcess.on('exit', (code) => {
+  const child = bridgeProcess
+  child.on('close', (code) => {
     console.log(`Bridge process exited with code ${code}`)
-    bridgeProcess = null
+    if (bridgeProcess === child) bridgeProcess = null
   })
   bridgeProcess.stdin.write(JSON.stringify({ type: 'get_active_research_runs', requestId: 'electron-active-research' }) + '\n')
 }
@@ -237,27 +284,29 @@ function existingTargetPath(value: unknown): string | null {
 }
 
 function waitForChildExit(child: ChildProcessWithoutNullStreams, timeoutMs: number): Promise<boolean> {
-  if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve(true)
+  const pipesClosed = [child.stdout, child.stderr].every(stream => stream.readableEnded || stream.destroyed)
+  if ((child.exitCode !== null || child.signalCode !== null) && pipesClosed) return Promise.resolve(true)
   return new Promise(resolve => {
     let settled = false
     const finish = (exited: boolean) => {
       if (settled) return
       settled = true
       clearTimeout(timer)
-      child.removeListener('exit', onExit)
+      child.removeListener('close', onExit)
       resolve(exited)
     }
     const onExit = () => finish(true)
     const timer = setTimeout(() => finish(false), timeoutMs)
-    child.once('exit', onExit)
+    child.once('close', onExit)
   })
 }
 
-async function terminateResearchProcessTree(child: ChildProcessWithoutNullStreams): Promise<void> {
+async function terminateProcessTree(child: ChildProcessWithoutNullStreams): Promise<void> {
   if (process.platform !== 'win32' || child.pid === undefined) {
     child.kill('SIGKILL')
     return
   }
+  // Ours to clean: this child's own tree by PID, never a name match across other applications.
   await new Promise<void>(resolve => {
     const terminator = spawn('taskkill.exe', ['/PID', String(child.pid), '/T', '/F'], {
       windowsHide: true,
@@ -269,9 +318,15 @@ async function terminateResearchProcessTree(child: ChildProcessWithoutNullStream
   child.kill()
 }
 
-async function stopResearchBridgeForQuit(): Promise<boolean> {
+/** Cooperative: ask the runtime to shut down, close stdin so its reader sees EOF, then wait. */
+async function stopResearchBridge(timeoutMs: number): Promise<boolean> {
   const child = researchBridgeProcess
   if (!child) return true
+  // This stop is ours, on purpose: the host is about to be replaced, so its exit is not a
+  // connection loss the renderer should report. Dropping the identity before the exit event
+  // keeps it from broadcasting `research_connection_error` over the run being started next
+  // (2026-10-18 e2e: a new round began under "研究连接已断开 (0)").
+  researchHostIdentity = null
   try {
     if (child.stdin.writable) {
       child.stdin.write(JSON.stringify({ type: 'shutdown' }) + '\n')
@@ -280,97 +335,119 @@ async function stopResearchBridgeForQuit(): Promise<boolean> {
       child.stdin.end()
     }
   } catch { /* the exit event below is the authoritative signal */ }
-  while (true) {
-    if (await waitForChildExit(child, 30000)) return true
-    const result = await dialog.showMessageBox({
-      type: 'warning',
-      title: '研究仍在停止',
-      message: '研究运行时已等待 30 秒仍未退出。',
-      detail: '可继续等待、确认退出应用，或取消关闭并保留当前窗口。',
-      buttons: ['继续等待', '仍然退出', '取消'],
-      cancelId: 2,
-      defaultId: 0,
-      noLink: true,
-    })
-    if (result.response === 0) continue
-    if (result.response === 2) return false
-    await terminateResearchProcessTree(child)
-    await waitForChildExit(child, 3000)
-    return true
+  const exited = await waitForChildExit(child, timeoutMs)
+  if (exited && researchBridgeProcess === child) {
+    researchBridgeProcess = null
+    researchBridgeLaunch = null
+    researchHostIdentity = null
+  }
+  diagnostics?.record('close:stopped-research', { exited })
+  return exited
+}
+
+async function stopOrdinaryBridge(timeoutMs: number): Promise<boolean> {
+  const child = bridgeProcess
+  if (!child) return true
+  try {
+    if (child.stdin.writable && !child.stdin.writableEnded) {
+      child.stdin.write(JSON.stringify({ type: 'shutdown' }) + '\n')
+      child.stdin.end()
+    }
+  } catch { /* retain ownership until the process close is verified */ }
+  let exited = await waitForChildExit(child, timeoutMs)
+  if (!exited) {
+    try { await terminateProcessTree(child) }
+    catch (error) { diagnostics?.record('close:terminate-failed', { error: pathActionError(error) }) }
+    exited = await waitForChildExit(child, TERMINATE_WAIT_MS)
+  }
+  if (exited && bridgeProcess === child) bridgeProcess = null
+  return exited
+}
+
+/** Exiting owns both runtimes, including a survivor of an earlier failed force cleanup. */
+async function stopOwnedBridges(timeoutMs: number): Promise<boolean> {
+  const exited = await Promise.all([stopResearchBridge(timeoutMs), stopOrdinaryBridge(Math.min(timeoutMs, 1000))])
+  return exited.every(Boolean) && researchBridgeProcess === null && bridgeProcess === null
+}
+
+/**
+ * Force: clean up the two children this application started and their descendants, then verify they
+ * really went away. An unverified cleanup is reported as a failure, never as a successful exit.
+ */
+async function forceTerminateOwnedProcesses(): Promise<boolean> {
+  const targets = [researchBridgeProcess, bridgeProcess].filter(Boolean) as ChildProcessWithoutNullStreams[]
+  researchHostIdentity = null
+  for (const child of targets) {
+    try { await terminateProcessTree(child) }
+    catch (error) { diagnostics?.record('close:terminate-failed', { error: pathActionError(error) }) }
+  }
+  const gone = await Promise.all(targets.map(child => waitForChildExit(child, TERMINATE_WAIT_MS)))
+  for (const [index, child] of targets.entries()) {
+    if (!gone[index]) continue
+    if (researchBridgeProcess === child) {
+      researchBridgeProcess = null
+      researchBridgeLaunch = null
+    }
+    if (bridgeProcess === child) bridgeProcess = null
+  }
+  const verified = gone.every(Boolean) && researchBridgeProcess === null && bridgeProcess === null
+  diagnostics?.record('close:forced', { targets: targets.length, verified })
+  return verified
+}
+
+/** One lifecycle for the research waiters: no timer or pending request outlives a stop. */
+function releaseResearchWaiters(reason: string): void {
+  for (const [id, waiter] of Array.from(researchWaiters)) {
+    clearTimeout(waiter.timer)
+    researchWaiters.delete(id)
+    waiter.reject(new Error(reason))
   }
 }
 
-async function requestWindowClose(win: BrowserWindow | null): Promise<void> {
-  if (closeChoiceOpen) return
-  closeChoiceOpen = true
-  try {
-    if (researchActive) {
+function installCloseFlow(): void {
+  closeFlow = createCloseFlow({
+    sendToRenderer: closeRequestId => {
+      if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('app:request-close', { closeRequestId })
+    },
+    showNativeDialog: async request => {
       const options = {
         type: 'question' as const,
-        title: '研究仍在运行',
-        message: '如何处理当前研究？',
-        detail: '后台继续会把 Misaka Agent 留在系统托盘。',
-        buttons: ['停止研究并退出', '后台继续', '取消'],
-        cancelId: 2,
-        defaultId: 1,
+        title: 'Misaka Agent',
+        message: request.message,
+        detail: request.detail,
+        buttons: request.buttons,
+        cancelId: request.cancelId,
+        defaultId: request.defaultId,
         noLink: true,
       }
-      const result = win && !win.isDestroyed()
-        ? await dialog.showMessageBox(win, options)
+      const result = mainWindow && !mainWindow.isDestroyed()
+        ? await dialog.showMessageBox(mainWindow, options)
         : await dialog.showMessageBox(options)
-      const outcome = researchCloseOutcome(
-        result.response === 0 ? 'stop' : result.response === 1 ? 'background' : 'cancel',
-      )
-      if (outcome === 'stay-open') return
-      if (outcome === 'hide') {
-        ensureResearchTray()
-        win?.hide()
-        return
-      }
-    }
-
-    if (!(await stopResearchBridgeForQuit())) return
-    researchActive = false
-    allowClose = true
-    if (win && !win.isDestroyed()) win.close()
-    else {
+      return result.response
+    },
+    // A start with no run id yet, or a command still waiting for its ack, is work in progress:
+    // the reader must be asked before anything is dropped.
+    researchActive: () => researchActive || researchStarting || researchWaiters.size > 0,
+    stopResearch: timeoutMs => stopOwnedBridges(timeoutMs),
+    forceTerminate: () => forceTerminateOwnedProcesses(),
+    showError: (message, detail) => {
+      void dialog.showMessageBox({ type: 'error', title: 'Misaka Agent', message, detail, buttons: ['好'], noLink: true })
+    },
+    hideWindow: () => { ensureResearchTray(); mainWindow?.hide() },
+    allowWindowClose: () => { allowClose = true },
+    quit: () => {
+      researchActive = false
       allowQuit = true
+      stopBridgeProcess()
       app.quit()
-    }
-  } finally {
-    closeChoiceOpen = false
-  }
+    },
+    log: (kind, fields) => diagnostics?.record(kind, fields),
+  })
 }
 
-/** Renderer confirmation and tray exit share the existing child shutdown path. */
-async function quitApplication(): Promise<void> {
-  if (closeChoiceOpen) return
-  closeChoiceOpen = true
-  try {
-    if (!(await stopResearchBridgeForQuit())) return
-    researchActive = false
-    allowClose = true
-    allowQuit = true
-    stopBridgeProcess()
-    app.quit()
-  } finally { closeChoiceOpen = false }
-}
-
-function stopBridgeProcess() {
-  if (bridgeProcess) {
-    try {
-      bridgeProcess.stdin.write(JSON.stringify({ type: 'shutdown' }) + '\n')
-      setTimeout(() => {
-        if (bridgeProcess) {
-          bridgeProcess.kill()
-          bridgeProcess = null
-        }
-      }, 1000)
-    } catch {
-      bridgeProcess.kill()
-      bridgeProcess = null
-    }
-  }
+/** The ordinary bridge stops the same way the research host does: ask, give it a second, then clean our own tree. */
+function stopBridgeProcess(): void {
+  void stopOrdinaryBridge(1000)
 }
 
 function createWindow() {
@@ -398,8 +475,26 @@ function createWindow() {
     if (mainWindow && !mainWindow.isDestroyed()) {
       mainWindow.show()
       mainWindow.focus()
-      mainWindow.webContents.send('app:request-close')
     }
+    // The page gets the first chance; the flow falls back to native code if it cannot answer.
+    void closeFlow?.requestClose()
+  })
+
+  // The three signals that say "the page stopped answering" from outside the page.
+  mainWindow.on('unresponsive', () => {
+    diagnostics?.record('window:unresponsive', { gone: false })
+    closeFlow?.noteUnresponsive()
+  })
+  mainWindow.on('responsive', () => {
+    diagnostics?.record('window:responsive', {})
+    closeFlow?.noteResponsive()
+  })
+  mainWindow.webContents.on('render-process-gone', (_event, details) => {
+    diagnostics?.record('window:render-gone', { reason: details.reason, exitCode: details.exitCode })
+    closeFlow?.noteUnresponsive()
+  })
+  mainWindow.webContents.on('did-fail-load', (_event, errorCode, errorDescription) => {
+    diagnostics?.record('window:load-failed', { errorCode, description: errorDescription })
   })
 
   // Never let content replace the managed application document or create an unmanaged window.
@@ -417,6 +512,7 @@ function createWindow() {
 
   mainWindow.webContents.on('did-finish-load', () => {
     if (mainWindow && !mainWindow.isDestroyed()) {
+      diagnostics?.record('window:loaded', { url: mainWindow.webContents.getURL(), replayed: recentResearchMessages.length })
       mainWindow.webContents.send('theme:change', themeRuntime.current())
       for (const message of recentResearchMessages) mainWindow.webContents.send('research:event', message)
     }
@@ -439,6 +535,26 @@ function createWindow() {
 app.whenReady().then(() => {
   const isolatedUserData = process.env.MISAKA_E2E_USER_DATA
   if (isolatedUserData) app.setPath('userData', path.resolve(isolatedUserData))
+  diagnostics = createDiagnostics({ env: process.env, homedir: os.homedir() })
+  diagnostics.record('shell:start', collectBuildIdentity({
+    appVersion: app.getVersion(),
+    electron: process.versions.electron,
+    chrome: process.versions.chrome,
+    node: process.versions.node,
+    platform: `${process.platform}/${process.arch}`,
+    devServerUrl: process.env.VITE_DEV_SERVER_URL,
+    files: {
+      main: path.join(__dirname, 'main.js'),
+      preload: ['preload.cjs', 'preload.mjs', 'preload.js']
+        .map(name => path.join(__dirname, name)).find(candidate => fs.existsSync(candidate)) ?? '',
+      renderer: path.join(__dirname, '..', 'dist', 'index.html'),
+    },
+  }))
+  setInterval(flushStreamWindow, 2000).unref?.()
+  ipcMain.on('diag:renderer', (_event, records: unknown) => {
+    if (!Array.isArray(records)) return
+    diagnostics?.recordBatch(records as DiagnosticFields[])
+  })
   themeRuntime = createThemeRuntime(themeRegistry, path.join(app.getPath('userData'), 'desktop-theme.json'))
   ipcMain.on('bridge:send', (_event, cmd: any) => {
     // Pure pipe to the Python bridge. The theme used to be applied from here as well, which
@@ -473,6 +589,9 @@ app.whenReady().then(() => {
       'set_permission_mode', 'set_model', 'set_thinking',
       'send_research_message', 'abort',
       'desktop_set_team_model', 'desktop_retain_roles',
+      'get_research_sessions', 'get_research_session_history', 'get_research_session_content',
+      'watch_research_sessions', 'unwatch_research_sessions',
+      'check_research_connection',
     ])
     if (typeof value.type !== 'string' || !allowed.has(value.type)) return
     if (value.type === 'prompt' && (typeof value.text !== 'string' || !value.text.startsWith('/research '))) return
@@ -484,11 +603,25 @@ app.whenReady().then(() => {
       researchActive = state
       researchPendingCount = 0
     } else if (state && typeof state === 'object') {
-      const snapshot = state as { active?: unknown; pendingCount?: unknown }
-      researchActive = snapshot.active === true
-      researchPendingCount = Number.isSafeInteger(snapshot.pendingCount) ? Math.max(0, Number(snapshot.pendingCount)) : 0
+      const snapshot = state as { active?: unknown; pendingCount?: unknown; pendingStart?: unknown }
+      if (typeof snapshot.active === 'boolean') researchActive = snapshot.active
+      if (Number.isSafeInteger(snapshot.pendingCount)) researchPendingCount = Math.max(0, Number(snapshot.pendingCount))
+      // A submission that has no run id yet is in progress too; the page is the only place that
+      // knows it exists. Once a process is ours, its own lifecycle is the authority.
+      if (typeof snapshot.pendingStart === 'boolean') {
+        if (snapshot.pendingStart) researchStarting = true
+        else if (!researchBridgeProcess) researchStarting = false
+      }
     }
     syncResearchTray()
+  })
+  ipcMain.on('app:close-presented', (_event, closeRequestId: unknown) => {
+    const id = Number(closeRequestId)
+    if (Number.isSafeInteger(id) && id > 0) closeFlow?.rendererTookOver(id)
+  })
+  ipcMain.on('app:close-cancelled', (_event, closeRequestId: unknown) => {
+    const id = Number(closeRequestId)
+    if (Number.isSafeInteger(id) && id > 0) closeFlow?.rendererCancelled(id)
   })
 
   ipcMain.handle('app:get-version', () => app.getVersion())
@@ -536,16 +669,14 @@ app.whenReady().then(() => {
     return result.canceled ? [] : result.filePaths
   })
   ipcMain.handle('app:confirm-close', async (_event, action: 'tray' | 'quit') => {
-    if (action === 'tray') {
-      ensureResearchTray()
-      mainWindow?.hide()
-      return
-    }
-    if (action === 'quit') {
-      await quitApplication()
-    }
+    // Anything that reaches here came from the page, so the page is alive: stand the native
+    // fallback down before acting on the choice.
+    if (closeFlow) closeFlow.rendererTookOver(closeFlow.closeRequestId())
+    if (action === 'tray') { closeFlow?.rendererHide(); return }
+    if (action === 'quit') await closeFlow?.rendererQuit()
   })
 
+  installCloseFlow()
   createWindow()
 
   app.on('activate', () => {
@@ -567,10 +698,31 @@ app.on('window-all-closed', () => {
 })
 
 app.on('before-quit', event => {
-  if (!allowQuit && researchBridgeProcess) {
-    event.preventDefault()
-    void requestWindowClose(mainWindow)
+  if (allowQuit) {
+    allowClose = true
+    stopBridgeProcess()
     return
   }
+  // A run in progress, or a start that has no run id yet, belongs to the reader: the close flow
+  // asks (in native code, because a stuck page cannot be trusted to).
+  if (researchActive || researchStarting || researchWaiters.size > 0) {
+    event.preventDefault()
+    void closeFlow?.requestClose({ skipRenderer: true })
+    return
+  }
+  // Idle runtimes need no initial question, but every owned child still has to exit before we do.
+  if (researchBridgeProcess || bridgeProcess) {
+    event.preventDefault()
+    void closeFlow?.quitDirectly()
+    return
+  }
+  allowClose = true
   stopBridgeProcess()
+})
+
+app.on('quit', () => {
+  diagnostics?.record('app:quit', { allowQuit, researchActive, pending: researchWaiters.size })
+  closeFlow?.dispose()
+  releaseResearchWaiters('应用正在退出')
+  diagnostics?.dispose()
 })

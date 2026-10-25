@@ -112,7 +112,9 @@ test('fill follows a partial drag without snapping ahead and release animates it
   const x = travel * 2.8 / 6
   await page.mouse.move(box.x + 15 + x, box.y + 18, { steps: 12 })
   await expect(slider).toHaveAttribute('aria-valuenow', '3')
-  expect(await thumb.evaluate(el => new DOMMatrixReadOnly(getComputedStyle(el).transform).m41)).toBeCloseTo(x, 1)
+  // Pointer/layout coordinates are subpixel-quantized; half a CSS pixel still catches snapping
+  // to the nearest stop (several pixels away) without depending on a <0.05px rounding accident.
+  expect(Math.abs(await thumb.evaluate(el => new DOMMatrixReadOnly(getComputedStyle(el).transform).m41) - x)).toBeLessThan(0.5)
   const right = await fill.evaluate(el => {
     const clip = getComputedStyle(el).clipPath
     const pixels = clip.match(/inset\(0px ([\d.]+)px/)
@@ -120,9 +122,9 @@ test('fill follows a partial drag without snapping ahead and release animates it
     const calc = clip.match(/calc\(100% - ([\d.]+)px\)/)
     return calc ? el.getBoundingClientRect().width - Number(calc[1]) : NaN
   })
-  expect(right).toBeCloseTo(box.width - x - 15, 1)
+  expect(Math.abs(right - (box.width - x - 15))).toBeLessThan(0.5)
   await page.mouse.up()
-  await expect.poll(() => thumb.evaluate(el => new DOMMatrixReadOnly(getComputedStyle(el).transform).m41)).toBeCloseTo(travel / 2, 1)
+  await expect.poll(async () => Math.abs(await thumb.evaluate(el => new DOMMatrixReadOnly(getComputedStyle(el).transform).m41) - travel / 2)).toBeLessThan(0.5)
   const transitions = await card.evaluate(el => ({
     thumb: getComputedStyle(el.querySelector('.misaka-thinking-thumb')!).transitionDuration,
     fill: getComputedStyle(el.querySelector('.misaka-thinking-fill')!).transitionDuration,
@@ -133,7 +135,7 @@ test('fill follows a partial drag without snapping ahead and release animates it
   expect(await fill.evaluate(el => getComputedStyle(el).transitionDuration)).toBe('0s')
 })
 
-test('two-stop max, unsupported, generic preview, empty and mapped capabilities', async ({ page }) => {
+test('two-stop max, unsupported, model-default preview, empty and mapped capabilities', async ({ page }) => {
   await trigger(page).click()
   await select(page, '两档推理模型')
   await expect(dialog(page).locator('.misaka-thinking-slider')).toHaveAttribute('data-tier', 'max')
@@ -141,10 +143,10 @@ test('two-stop max, unsupported, generic preview, empty and mapped capabilities'
   await expect(dialog(page).getByText('不支持思考深度', { exact: true })).toBeVisible()
   await expect(dialog(page).getByRole('slider')).toHaveAttribute('aria-disabled', 'true')
   await models(page)
-  await expect(dialog(page).getByRole('button', { name: /能力待描述模型.*通用档位/ })).toBeVisible()
+  await expect(dialog(page).getByRole('button', { name: /能力待描述模型.*模型默认/ })).toBeVisible()
   await page.evaluate(() => (window as any).modelPickerFixture.hold(true))
   await dialog(page).getByRole('button', { name: /能力待描述模型/ }).click()
-  await expect(dialog(page).getByText(/通用档位/)).toBeVisible()
+  await expect(dialog(page).locator('.misaka-thinking-slider')).toHaveAttribute('data-default', '')
   await expect(dialog(page).getByRole('slider')).toHaveAttribute('aria-disabled', 'true')
   await page.evaluate(() => { const f = (window as any).modelPickerFixture; f.hold(false); f.pending().forEach((id: string) => f.release(id)) })
   await select(page, '空能力模型')
@@ -250,4 +252,3 @@ test('empty list configuration entry opens settings without replacing its slim s
   expect(await page.locator('.misaka-thinking-track').first().evaluate(el => getComputedStyle(el).height)).toBe('6px')
   await page.screenshot({ path: 'preview-artifacts/model-picker/picker-settings-layout.png' })
 })
-

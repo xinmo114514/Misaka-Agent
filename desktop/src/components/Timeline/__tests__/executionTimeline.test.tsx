@@ -158,6 +158,7 @@ describe('research mode', () => {
   it('gives the research transcript the same lane and keeps its reading state separate', () => {
     useSessionStore.setState({ agentMode: 'research' })
     useSessionStore.getState().bindResearchConversation(host('C:/research/research.jsonl'))
+    useSessionStore.getState().selectResearchView({kind:'conversation',sessionId:'rsess',ownerKey:'conversation:rsess'})
     const { rerender } = render(<Timeline />)
     expect(group()).toHaveAccessibleName(/已完成 · 2 次工具调用/)
     expect(document.querySelector('.conversation-group-duration')).toHaveTextContent('3.0 秒')

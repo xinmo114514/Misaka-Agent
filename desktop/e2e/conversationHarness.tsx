@@ -3,6 +3,9 @@ import App from '../src/App'
 import '../src/index.css'
 import fixture from '../../tests/fixtures/desktop_conversation.json'
 import { useSessionStore } from '../src/store/useSessionStore'
+import { useResearchStopStore } from '../src/store/useResearchStopStore'
+import { useResearchResumeStore } from '../src/store/useResearchResumeStore'
+import { resetResearchStopTimers } from '../src/lib/researchStop'
 import { useSettingsStore } from '../src/store/useSettingsStore'
 import { assistantBlocks, normalizeChatMessage } from '../src/lib/messageBlocks'
 import { applyThemeToDom } from '../src/theme/useTheme'
@@ -13,15 +16,26 @@ import { modelPickerFixture, pickerReply } from './modelPickerFixture'
 import { sessionHistoryCache } from '../src/lib/sessionHistoryCache'
 import { forgetSessionView } from '../src/lib/sessionViewState'
 import { desktopResearchTeamFixture, handleDesktopResearchTeamCommand } from './desktopResearchTeamFixture'
+import { enableResearchSessions, handleResearchSessionsCommand, handleResearchSessionsWatch, researchSessionVersion, resetResearchSessions, setResearchSessionsLive, setResearchSessionsReadError } from './desktopResearchSessionsFixture'
 
 const listeners = new Set<(message: BridgeMessage) => void>()
 const sent: any[] = []
 const histories = new Map<string, { messages: any[]; workspace: string; version: string }>()
 let readyDelay = 0
 let nextPromptFailure: string | null = null
+// Opt-in Composer acceptance controls. Defaults leave all other fixture flows unchanged.
+let composerAttachmentFailure = false
+let composerHoldSubmission = false
+let composerSubmissionFailure: string | null = null
+const composerPendingSubmissions: Array<() => void> = []
 let graphEnabled = false
 const researchListeners = new Set<(message: BridgeMessage) => void>()
-let researchPhase: 'idle' | 'plan' | 'critique' | 'branches' | 'done' | 'waiting_input' | 'stopped' | 'failed' = 'idle'
+let researchPhase: 'idle' | 'plan' | 'critique' | 'branches' | 'done' | 'waiting_input' | 'stopping' | 'stopped' | 'failed' = 'idle'
+let researchStopHold = false
+let researchStopPendingNotice = false
+let inheritedStopDriving: boolean | null = null
+let researchStopLeaseHold = false
+let researchOpenRunId: string | null = null
 let researchQuestion = ''
 let researchPlanRound = 1
 let researchPlanId = 'plan-r1'
@@ -96,14 +110,15 @@ const researchGraph = () => {
 }
 const researchRun = () => ({
   id: 'r_desktop_fixture', question: researchQuestion, workspace: 'C:/research',
-  status: ['done', 'waiting_input', 'stopped', 'failed'].includes(researchPhase) ? researchPhase : 'active',
+  status: ['done', 'waiting_input', 'stopping', 'stopped', 'failed'].includes(researchPhase) ? researchPhase : 'active',
   phase: researchPhase === 'plan' ? 'awaiting_approval' : researchPhase === 'critique' ? 'critique'
-    : researchPhase === 'branches' ? 'reconciling' : 'done',
+    : researchPhase === 'branches' ? 'reconciling' : researchPhase === 'stopping' ? 'stopping' : 'done',
   nodes: researchPhase === 'branches' || researchPhase === 'done' ? 4 : 1,
   tasks: researchPhase === 'critique' || researchPhase === 'branches' || researchPhase === 'done' ? 1 : 0,
   final_artifact: researchPhase === 'done' ? 'a_report' : null,
   rootSession: 'C:/research/.misaka/sessions/research-root.jsonl',
-  driving: researchPhase !== 'done',
+  driving: researchPhase === 'stopped' && researchStopLeaseHold ? true
+    : researchPhase === 'stopping' && inheritedStopDriving !== null ? inheritedStopDriving : !['done', 'stopped', 'failed'].includes(researchPhase)
 })
 const researchRunDetail = () => ({
   run: researchRun(), graph: researchGraph(), pending_questions: [],
@@ -148,12 +163,25 @@ function emitResearchMessage(message: any) {
   const id = `research-message-${researchSeq + 1}`
   researchTranscript.push(normalizeChatMessage({ id, ...raw, ...(raw.role === 'assistant' ? { blocks: assistantBlocks(id, raw.content) } : {}) }))
   broadcastResearch({ seq: ++researchSeq, streamId: 'fixture-research-stream', sessionId: 'research-root', event: { type: 'message_end', message: raw } })
+  // The host writes these rows into the controller's own session, so a reader of that session
+  // sees them: publish the growth the way the host does, or a transcript reading history would
+  // stay at whatever it loaded before the notice arrived.
+  // The host writes these rows into the controller's own session, so a reader of that session
+  // sees them: publish the growth the way the host does, or a transcript reading history would
+  // stay at whatever it loaded before the notice arrived. The version must be the same one the
+  // history read reports, or the reader would compare two counters that never meet.
+  broadcastResearch({ seq: ++researchSeq, streamId: 'fixture-research-stream', event: { type: 'research_session_snapshot',
+    snapshot: { runId: 'r_desktop_fixture', executorId: 'lo-root', sessionId: 'session-lo-root', nodeId: 'b_root',
+      taskId: null, generation: 0, attempt: 1, revision: researchSeq, historyVersion: researchSessionVersion('lo-root'),
+      streaming: null, telemetry: null, error: null, availability: 'available', runtimeSource: 'saved' } } })
 }
+// Only the root controller's file carries the run's own conversation; node controllers keep theirs.
+setResearchSessionsLive(executorId => executorId === 'lo-root' ? researchTranscript : [])
 function researchHostSnapshot(cwd = 'C:/research') {
   return { enabled: true, streamId: 'fixture-research-stream',
     session: { sessionId: 'research-root', file: 'C:/research/.misaka/sessions/research-root.jsonl', cwd },
     messages: [...researchTranscript], historyVersion: `research-${researchSeq}`, lastEventSeq: researchSeq,
-    run: researchPhase === 'idle' ? null : { id: 'r_desktop_fixture', status: researchRun().status, phase: researchRun().phase },
+    run: researchPhase === 'idle' && !researchOpenRunId ? null : { id: researchOpenRunId || 'r_desktop_fixture', status: researchRun().status, phase: researchRun().phase },
     stats: { totalMessages: researchTranscript.length }, contextUsage: { tokens: 6400, contextWindow: 128000, percent: 0.05 }, ...desktopResearchTeamFixture.snapshot() }
 }
 
@@ -167,7 +195,7 @@ function handleResearchDesktopCommand(command: any): boolean {
     let data: any = {}
     switch (command.type) {
       case 'get_research_options': data = researchOptions; break
-      case 'get_active_research_runs': data = { runs: researchPhase !== 'idle' && researchPhase !== 'done' ? [run] : [] }; break
+      case 'get_active_research_runs': data = { runs: !['idle', 'done', 'stopped', 'failed'].includes(researchPhase) ? [run] : [] }; break
       case 'list_research_runs': data = { runs: researchPhase === 'idle' ? [] : [run] }; break
       case 'get_research_graph': data = { graph: researchPhase === 'idle' ? null : graph, run: researchPhase === 'idle' ? null : { id: run.id } }; break
       case 'get_research_details': data = researchPhase === 'idle' ? { run: null, graph: null, pending_questions: [] } : researchRunDetail(); break
@@ -194,6 +222,17 @@ function handleResearchDesktopCommand(command: any): boolean {
 window.bridge = {
   send: (command: any) => {
     sent.push(command)
+    if (command.type === 'prepare_attachments') {
+      const failed = composerAttachmentFailure
+      composerAttachmentFailure = false
+      queueMicrotask(() => broadcast({ type: 'ack', requestId: command.requestId, ok: true,
+        data: { attachments: command.paths.map((file: string) => ({ path: file, name: file.split(/[\\/]/).pop(), size: 128,
+          kind: 'text', text: '用于多窗输入附件回归的证据文本。', images: [], error: failed ? '附件读取失败，请重试' : null })) } }))
+      return
+    }
+    // Session listing and per-executor history travel on the desktop bridge; only the live
+    // subscription is a research-bridge command.
+    if (handleResearchSessionsCommand(command, broadcast)) return
     if (handleResearchDesktopCommand(command)) return
     if (graphEnabled && (command.type === 'get_research_graph' || command.type === 'list_research_runs')) {
       queueMicrotask(() => broadcast({ type: 'ack', requestId: command.requestId, ok: true,
@@ -280,7 +319,19 @@ window.researchBridge = {
   send: (raw: unknown) => {
     const command = raw as any
     researchCommands.push(command)
-    queueMicrotask(() => {
+    const schedule = (deliver: () => void) => {
+      if (composerHoldSubmission && command.type === 'send_research_message') composerPendingSubmissions.push(deliver)
+      else queueMicrotask(deliver)
+    }
+    schedule(() => {
+      if (command.type === 'send_research_message' && composerSubmissionFailure) {
+        const error = composerSubmissionFailure
+        composerSubmissionFailure = null
+        broadcastResearch({ type: 'ack', requestId: command.requestId, ok: false, error })
+        return
+      }
+      if (handleResearchSessionsWatch(command, broadcastResearch)) return
+      if (handleResearchSessionsCommand(command, broadcastResearch, () => {})) return
       if (handleDesktopResearchTeamCommand(command, broadcastResearch, snapshot => broadcastResearch({ seq: ++researchSeq, streamId: 'fixture-research-stream', sessionId: 'research-root', event: { type: 'desktop-model-switch', details: snapshot } }))) return
       if (command.type === 'get_research_host') {
         researchAck(command, researchHostSnapshot())
@@ -293,6 +344,8 @@ window.researchBridge = {
           researchStartArgs = { ...command, question: researchQuestion, workspace: 'C:/research' }
           researchPlanRound = 1
           researchPlanId = 'plan-r1'
+          // A started run has a directory: the host answers `get_research_sessions` from here on.
+          enableResearchSessions({ question: researchQuestion })
           researchAck(command, { accepted: true, mode: 'start', runId: null })
           queueMicrotask(() => {
             emitResearchMessage({ role: 'custom', customType: 'research-question', content: `Research question | ${researchQuestion}`,
@@ -310,8 +363,15 @@ window.researchBridge = {
         return
       }
       if (command.type === 'stop_research' || command.type === 'resume_research') {
-        researchPhase = command.type === 'stop_research' ? 'stopped' : 'critique'
+        researchPhase = command.type === 'stop_research' ? (researchStopHold ? 'stopping' : 'stopped') : 'critique'
         researchAck(command, { accepted: true })
+        if (command.type === 'stop_research' && researchStopHold) researchStopPendingNotice = true
+        if (command.type === 'stop_research' && !researchStopHold) {
+          // The engine's stop publishes its final notice after the board settles: the
+          // fixture must do the same, or the shared 正在停止 wait has nothing to settle on.
+          emitResearchMessage({ role: 'custom', customType: 'research-final', content: '研究已停止。',
+            details: { run_id: 'r_desktop_fixture', result: { status: 'stopped' } } })
+        }
         return
       }
       if (command.type === 'get_stats') {
@@ -406,12 +466,21 @@ let seq = 0
 const researchCommands: Record<string, any>[] = []
 const emit = (event: Record<string, any>) => useSessionStore.getState().handleBridgeMessage({ seq: ++seq, sessionId: fixture.sessionId, event })
 const reset = () => {
+  resetResearchStopTimers()
+  useResearchStopStore.setState({ byRun: {} })
+  useResearchResumeStore.setState({ byRun: {} })
   desktopResearchTeamFixture.reset()
+  resetResearchSessions()
   researchSeq = 0
   researchTranscript.length = 0
   useSessionStore.setState({ researchBinding: null, researchTeam: null, researchModelBinding: null, researchTeamEventSeq: 0, researchConnectionError: null, researchCards: {}, researchConversation: { currentSessionId: '', messages: [], isStreaming: false, isAborting: false, streamingMessageId: null, lastEventSeq: 0 } })
   researchCommands.length = 0
   researchPhase = 'idle'
+  researchStopHold = false
+  researchStopPendingNotice = false
+  inheritedStopDriving = null
+  researchStopLeaseHold = false
+  researchOpenRunId = null
   researchQuestion = ''
   researchPlanRound = 1
   researchPlanId = 'plan-r1'
@@ -425,11 +494,38 @@ const reset = () => {
   seq = 0
   sent.length = 0
   nextPromptFailure = null
+  composerAttachmentFailure = false
+  composerHoldSubmission = false
+  composerSubmissionFailure = null
+  composerPendingSubmissions.length = 0
   tree.reset()
   useSessionStore.setState({ treeOpen: false, treePayload: null, treeFilterMode: null })
 }
 const api = {
   reset,
+  composer: {
+    restoreDraft: (text: string) => useSessionStore.getState().setDraft(text),
+    attachmentFailure: () => { composerAttachmentFailure = true },
+    holdSubmission: () => { composerHoldSubmission = true },
+    failSubmission: (error: string) => { composerSubmissionFailure = error },
+    releaseSubmission: () => {
+      composerHoldSubmission = false
+      for (const deliver of composerPendingSubmissions.splice(0)) queueMicrotask(deliver)
+    },
+    stream: (active: boolean) => {
+      researchPhase = active ? 'critique' : 'waiting_input'
+      // Opening a saved run only selects its readers. A live native event first
+      // needs the writer's authoritative session/stream snapshot, just like startup.
+      useSessionStore.getState().bindResearchConversation(researchHostSnapshot())
+      broadcastResearch({ seq: ++researchSeq, streamId: 'fixture-research-stream', sessionId: 'research-root',
+        event: { type: active ? 'agent_start' : 'agent_end', ...(active ? {} : { messages: [] }) } })
+    },
+    longModel: () => {
+      useSessionStore.setState({ researchModelBindings: null })
+      useSettingsStore.setState({ currentModel: { provider: 'misaka-fixture', modelId: 'long',
+        name: 'Misaka Academic Research Reasoning — 超长模型名称与跨供应商上下文验证', thinking: 'high' } })
+    },
+  },
   setLoading: (loading: boolean) => useSessionStore.setState({ isSessionLoading: loading }),
   sent,
   failNextPrompt: (error: string) => { nextPromptFailure = error },
@@ -490,7 +586,46 @@ const api = {
     useSessionStore.setState({ researchGraph: themeGraph, researchRunId: 'theme-run' })
   },
   research: {
+    readError: (error: string | null) => setResearchSessionsReadError(error),
+    unconfirmedResume: () => useResearchResumeStore.getState().unconfirm(researchOpenRunId || 'r_desktop_fixture', '恢复结果待确认，请刷新检查'),
+    /** Reopened persisted board stop: no local command or stop-store entry survives. */
+    inheritStop: (driving = false) => {
+      researchPhase = 'stopping'
+      inheritedStopDriving = driving
+      researchQuestion = '停止收尾验收课题'
+      researchOpenRunId = 'r_desktop_fixture'
+      useSessionStore.setState({ agentMode: 'agent', researchBinding: null,
+        researchCards: { r_desktop_fixture: { runId: 'r_desktop_fixture', question: researchQuestion,
+          workspace: 'C:/research', status: 'stopping', phase: 'active', tasks: [], updatedAt: Date.now() } },
+        researchRuns: [researchRun()] })
+    },
+    /** Open a saved run of the session fixture: the focus view reads it, nothing is executed. */
+    openRun: (runId = 'r_desktop_fixture', question = '比较 RAG 与长上下文的证据路线') => {
+      enableResearchSessions({ question })
+      // A saved, readable run is owned by its root session: the host keeps answering
+      // get_research_host with it, so no later snapshot read drops the binding's run id
+      // mid-action -- the way a terminal snapshot bound to an absent run used to.
+      researchOpenRunId = runId
+      researchPhase = 'waiting_input'
+      useSessionStore.setState({ agentMode: 'research', researchPageView: 'conversation',
+        researchBinding: { sessionId: 'research-root', sessionFile: 'C:/research/.misaka/sessions/research-root.jsonl',
+          workspace: 'C:/research', runId, streamId: 'fixture-research-stream' } })
+    },
     advanceToBranches: () => { if (researchPhase === 'critique') researchPhase = 'branches' },
+    /** Hold a stop's final notice: the UI must keep 正在停止 until the engine settles. */
+    stopHold: () => { researchStopHold = true },
+    /** A final report may precede the driver lease's finally block. */
+    holdStopLease: () => { researchStopLeaseHold = true },
+    releaseStopLease: () => { researchStopLeaseHold = false },
+    releaseStop: () => {
+      researchStopHold = false
+      if (researchPhase === 'stopping') researchPhase = 'stopped'
+      if (researchStopPendingNotice || researchPhase === 'stopped') {
+        researchStopPendingNotice = false
+        emitResearchMessage({ role: 'custom', customType: 'research-final', content: '研究已停止。',
+          details: { run_id: 'r_desktop_fixture', result: { status: 'stopped' } } })
+      }
+    },
     clarify: () => {
       researchPhase = 'waiting_input'
       emitResearchMessage({ role: 'custom', customType: 'research-clarification', content: 'Research run needs clarification:\n- 是否只使用公开文献？', details: { run_id: 'r_desktop_fixture' } })
@@ -500,7 +635,8 @@ const api = {
       emitResearchMessage({ role: 'custom', customType: 'research-error', content: '研究运行遇到连接错误', details: { run_id: 'r_desktop_fixture' } })
     },
     conversation: () => useSessionStore.getState().researchConversation,
-    state: () => ({ phase: researchPhase, question: researchQuestion, start: researchStartArgs, commands: researchCommands }),
+    state: () => ({ phase: researchPhase, question: researchQuestion, start: researchStartArgs, commands: researchCommands,
+      binding: useSessionStore.getState().researchBinding }),
     deliverFinalReport: () => {
       researchPhase = 'done'
       emitResearchMessage({

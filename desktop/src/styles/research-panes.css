@@ -1,0 +1,184 @@
+/* Multi-window readers stay opaque; only the surrounding workspace carries atmosphere. */
+.research-agent-pane.research-agent-pane--reading {
+  --research-secondary-ink: color-mix(in srgb, var(--muted) 85%, var(--text-main));
+  --research-tertiary-ink: color-mix(in srgb, var(--muted) 92%, var(--text-main));
+  --research-error-ink: color-mix(in srgb, var(--danger) 85%, var(--text-main));
+  border: 1px solid var(--border);
+  background: var(--surface-1);
+  box-shadow: none;
+  backdrop-filter: none;
+  font-size: var(--font-size-base, 13px);
+  transition: border-color 160ms;
+}
+.research-agent-pane--reading.research-agent-pane--coordinator { border-top-color: var(--research-notice-border); }
+.research-agent-pane--reading.is-focused { border-color: var(--focus-ring); box-shadow: none; }
+
+.research-agent-pane--reading .research-pane-heading {
+  height: 44px;
+  min-height: 44px;
+  gap: 8px;
+  padding: 5px 8px;
+  background: var(--surface-1);
+  cursor: default;
+}
+.research-agent-pane--reading .research-pane-heading:hover { background: var(--surface-1); }
+.research-agent-pane--reading .research-pane-focus {
+  display: flex;
+  min-width: 0;
+  height: 32px;
+  min-height: 32px;
+  flex: 1;
+  align-items: center;
+  gap: 8px;
+  border-radius: 4px;
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+}
+.research-agent-pane--reading .research-pane-focus:hover { background: var(--surface-2); }
+.research-agent-pane--reading .research-pane-role-icon { width: 24px; height: 24px; border-radius: 5px; }
+.research-agent-pane--reading .research-pane-title { gap: 0; }
+.research-agent-pane--reading .research-pane-title strong { font-size: 13px; line-height: 16px; }
+.research-agent-pane--reading .research-pane-title small { font: 12px/14px var(--font-sans, sans-serif); }
+.research-agent-pane--reading .research-status { font-size: 12px; line-height: 16px; }
+.research-agent-pane--reading .research-pane-expand {
+  position: static;
+  z-index: auto;
+  width: 32px;
+  min-width: 32px;
+  height: 32px;
+  flex: none;
+  background: var(--surface-1);
+  opacity: 1;
+  transition: background-color 160ms, color 160ms;
+}
+.research-agent-pane--reading .research-pane-expand:hover { color: var(--text-main); background: var(--surface-2); }
+.research-agent-pane--reading .research-pane-focus:focus-visible,
+.research-agent-pane--reading .research-pane-expand:focus-visible,
+.research-agent-pane--reading summary:focus-visible,
+.research-agent-pane--reading .research-tool-heading:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: -2px;
+}
+
+.research-agent-pane--reading .research-pane-body { min-height: 120px; font-size: var(--font-size-base, 13px); }
+.research-agent-pane--reading .research-message,
+.research-agent-pane--reading .research-session-error,
+.research-agent-pane--reading .conversation-markdown,
+.research-agent-pane--reading .research-phase-disclosure .conversation-markdown { font-size: var(--font-size-base, 13px); }
+.research-agent-pane--reading .conversation-markdown h1 { font-size: 1.45em; }
+.research-agent-pane--reading .conversation-markdown h2 { font-size: 1.25em; }
+.research-agent-pane--reading .conversation-markdown h3 { font-size: 1.1em; }
+.research-agent-pane--reading .research-message-label { font-size: 12px; letter-spacing: 0; }
+.research-agent-pane--reading .research-phase-disclosure summary,
+.research-agent-pane--reading .research-pane-body details > summary,
+.research-agent-pane--reading .research-pane-body > p,
+.research-agent-pane--reading .research-pane-body > button { font-size: 12px; }
+.research-agent-pane--reading .research-tool { font-size: 12px; background: var(--surface-1); }
+.research-agent-pane--reading .research-tool-heading { min-height: 32px; font: 12px/1.5 var(--font-mono, monospace); background: var(--surface-1); }
+.research-agent-pane--reading .research-tool pre { font-size: var(--font-size-base, 13px); }
+.research-agent-pane--reading .research-pane-body button.text-accent { color: var(--md-link); }
+.research-agent-pane--reading .research-tool--error .research-tool-heading,
+.research-agent-pane--reading .research-tool-error,
+.research-agent-pane--reading .research-session-error,
+.research-agent-pane--reading .research-session-error .text-danger,
+.research-agent-pane--reading .research-session-error button.text-accent { color: var(--research-error-ink); }
+
+.research-agent-pane--reading .research-card-contract {
+  min-height: 32px;
+  max-height: min(180px, 32%);
+  padding: 0;
+  background: var(--surface-1);
+}
+.research-agent-pane--reading .research-card-contract summary { min-height: 32px; padding: 6px 10px; font-size: 12px; }
+.research-agent-pane--reading .research-card-contract p { margin: 8px 10px; font-size: var(--font-size-base, 13px); }
+.research-agent-pane--reading .research-lo-overview {
+  min-height: 32px;
+  max-height: min(180px, 32%);
+  flex: 0 1 auto;
+  overflow-y: auto;
+  padding: 0;
+  background: var(--surface-1);
+  font-size: 12px;
+}
+.research-agent-pane--reading .research-plan-label { min-height: 32px; padding: 6px 10px; font-size: 12px; cursor: pointer; }
+.research-agent-pane--reading .research-plan-label > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.research-agent-pane--reading .research-plan-cards { padding: 0 10px 8px; overflow-wrap: anywhere; }
+
+.research-agent-pane--reading .research-pane-footer {
+  display: flex;
+  box-sizing: border-box;
+  height: 32px;
+  min-height: 32px;
+  max-height: 32px;
+  flex: 0 0 32px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  overflow: hidden;
+  padding: 0 8px 0 10px;
+  background: var(--surface-1);
+  font: 12px/1.4 var(--font-sans, sans-serif);
+}
+.research-agent-pane--reading .research-context-label { min-width: 0; white-space: nowrap; }
+.research-agent-pane--reading .research-telemetry-entry {
+  display: inline-flex;
+  min-width: 44px;
+  height: 28px;
+  flex: none;
+  align-items: center;
+  justify-content: center;
+  padding: 0 6px;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--research-secondary-ink);
+  font: inherit;
+  cursor: pointer;
+}
+.research-agent-pane--reading .research-telemetry-entry:hover { color: var(--text-main); background: var(--surface-2); }
+.research-agent-pane--reading .research-telemetry-entry:focus-visible,
+.research-telemetry-popover:focus-visible,
+.research-telemetry-heading button:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: -2px; }
+.research-telemetry-popover {
+  position: fixed;
+  z-index: 60;
+  box-sizing: border-box;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  border: 1px solid var(--border-strong);
+  border-radius: 11px;
+  color: var(--text-main);
+  font: 12px/1.55 var(--font-sans, sans-serif);
+  user-select: text;
+}
+.research-telemetry-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; padding: 10px 12px; }
+.research-telemetry-heading > div { min-width: 0; }
+.research-telemetry-heading strong { font-size: 13px; font-weight: 600; }
+.research-telemetry-heading p { margin: 2px 0 0; color: color-mix(in srgb, var(--muted) 85%, var(--text-main)); overflow-wrap: anywhere; }
+.research-telemetry-heading button {
+  display: grid;
+  width: 28px;
+  height: 28px;
+  flex: none;
+  place-items: center;
+  margin: -2px -4px 0 0;
+  border: 0;
+  border-radius: 4px;
+  color: var(--muted);
+  background: transparent;
+  cursor: pointer;
+}
+.research-telemetry-heading button:hover { color: var(--text-main); background: var(--surface-2); }
+.research-telemetry-popover .research-telemetry-content { display: grid; gap: 16px; padding: 0 12px 12px; }
+.research-telemetry-popover .research-telemetry-content > p { margin: 0; color: color-mix(in srgb, var(--muted) 85%, var(--text-main)); }
+.research-telemetry-popover h3 { margin: 0 0 6px; font-size: 12px; font-weight: 600; }
+.research-telemetry-popover .research-telemetry-grid { display: grid; gap: 5px; margin: 0; font-variant-numeric: tabular-nums; }
+.research-telemetry-popover .research-telemetry-grid > div { display: grid; grid-template-columns: minmax(80px, auto) minmax(0, 1fr); gap: 12px; align-items: start; }
+.research-telemetry-popover .research-telemetry-grid dt { color: color-mix(in srgb, var(--muted) 85%, var(--text-main)); }
+.research-telemetry-popover .research-telemetry-grid dd { min-width: 0; margin: 0; overflow-wrap: anywhere; white-space: pre-wrap; color: var(--text-main); }
+
+@media (prefers-reduced-motion: reduce) {
+  .research-agent-pane.research-agent-pane--reading,
+  .research-agent-pane--reading .research-pane-expand { transition: none; }
+}

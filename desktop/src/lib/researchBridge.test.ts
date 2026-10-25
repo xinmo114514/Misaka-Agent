@@ -37,6 +37,30 @@ it('publishes the reconnected control host before sending a session- and stream-
   expect(command).toMatchObject({ sessionId: 'control-root', streamId: 'new-control-stream', runId: 'r_control' })
 })
 
+it('drops a stop that settled or was superseded while its host was opening', async () => {
+  let finish!: (host: unknown) => void
+  window.app = { ...window.app, startResearchBridge: vi.fn().mockReturnValue(new Promise(resolve => { finish = resolve })) }
+  let current = true
+  const onBound = vi.fn()
+  const pending = executeResearchControl('stop_research', { runId: 'r_control', workspace: 'C:/fixture',
+    sessionFile: 'root.jsonl', isCurrent: () => current, onBound })
+  current = false
+  finish({ enabled: true, session: { sessionId: 'root', file: 'root.jsonl', cwd: 'C:/fixture' }, run: { id: 'r_control', status: 'active', phase: 'active' } })
+  await pending
+  expect(onBound).not.toHaveBeenCalled()
+  expect(window.researchBridge.send).not.toHaveBeenCalled()
+})
+
+it('checks the stop attempt again when adopting the host settles it synchronously', async () => {
+  window.app = { ...window.app, startResearchBridge: vi.fn().mockResolvedValue({ enabled: true,
+    session: { sessionId: 'root', file: 'root.jsonl', cwd: 'C:/fixture' }, run: { id: 'r_control', status: 'stopped', phase: 'active', driving: false } }) }
+  let current = true
+  const pending = executeResearchControl('stop_research', { runId: 'r_control', workspace: 'C:/fixture',
+    sessionFile: 'root.jsonl', isCurrent: () => current, onBound: () => { current = false } })
+  await pending
+  expect(window.researchBridge.send).not.toHaveBeenCalled()
+})
+
 it('classifies an ACK timeout as unconfirmed while a late ACK can still reach sinks', async () => {
   const sink = vi.fn()
   const removeSink = addResearchSink(sink)
@@ -140,6 +164,18 @@ it('preserves structured ACK failures in a ResearchRequestError', async () => {
   })
   await rejected
   expect(vi.getTimerCount()).toBe(0)
+})
+
+it('retains recruitment diagnostics and configuration requirements from a failed ACK', async () => {
+  const promise = observe(requestResearch('send_research_message', { requestId: 'recruitment-error' }))
+  const errorDetails = { role: 'last_order', provider: 'openai', modelId: 'fixture', attempt: 2,
+    category: 'connection', message: 'Connection refused', stack: 'ConnectionError: refused\n  at fixture',
+    route: { mode: 'proxy', endpoint: 'https://model.test/v1', proxy: 'http://127.0.0.1:9999' } }
+  const rejected = expect(promise).rejects.toMatchObject({ errorCode: 'RESEARCH_RECRUITMENT_MODEL_ERROR',
+    errorStage: 'recruitment', errorDetails, researchNeedsConfiguration: true })
+  deliver({ type: 'ack', requestId: 'recruitment-error', ok: false, error: '研究启动失败', retryable: true,
+    errorCode: 'RESEARCH_RECRUITMENT_MODEL_ERROR', errorStage: 'recruitment', errorDetails, researchNeedsConfiguration: true })
+  await rejected
 })
 
 it('accepts legacy ACKs with no session or stream fields', async () => {

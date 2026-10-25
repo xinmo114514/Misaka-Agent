@@ -55,6 +55,17 @@ describe('ResearchStartForm', () => {
     }))
     expect(onStarted).toHaveBeenCalledOnce()
   })
+  it('keeps optional global/model defaults absent and forwards explicit context/output choices', async () => {
+    render(<ResearchStartForm workspace="C:/project" options={options} active={false} onStarted={vi.fn()} />)
+    fireEvent.change(screen.getByLabelText('研究课题'), { target: { value: 'Evidence' } })
+    fireEvent.click(screen.getByRole('button', { name: '高级参数' }))
+    fireEvent.change(screen.getByLabelText('上下文阈值'), { target: { value: '75' } })
+    fireEvent.change(screen.getByLabelText('最大输出 token'), { target: { value: '2048' } })
+    fireEvent.click(screen.getByRole('button', { name: '开始研究' }))
+    await waitFor(() => expect(mocks.submit).toHaveBeenCalledWith('start_research', expect.objectContaining({
+      limits: expect.objectContaining({ context_threshold: .75, max_output_tokens: 2048 }),
+    })))
+  })
 
   it('leaves the form ready to retry after the bridge reports a startup error', async () => {
     mocks.submit.mockRejectedValueOnce(new Error('模型尚未配置'))

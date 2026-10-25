@@ -43,3 +43,9 @@ describe('ResearchFinalReport', () => {
     expect(screen.queryByText('研究最终报告')).not.toBeInTheDocument()
   })
 })
+it('labels a persisted incomplete delivery as a partial report even without status',()=>{
+ render(<ResearchFinalReport message={{id:'partial',role:'custom',customType:'research-final',content:'真实局部正文',details:{run_id:'r_test',incomplete:true}} as any}/>)
+ expect(screen.getByText('研究阶段性报告')).toBeInTheDocument()
+ expect(screen.getByText('不完整报告')).toBeInTheDocument()
+ expect(screen.queryByText('研究最终报告')).not.toBeInTheDocument()
+})

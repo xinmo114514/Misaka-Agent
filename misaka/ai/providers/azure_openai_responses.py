@@ -11,9 +11,10 @@ from typing import Any, Literal, TypedDict
 from urllib.parse import urlparse, urlunparse
 
 try:
-    from openai import AsyncAzureOpenAI
+    from openai import AsyncAzureOpenAI, DefaultAsyncHttpxClient
 except ImportError:  # optional extra: misaka[openai]
     AsyncAzureOpenAI = None
+    DefaultAsyncHttpxClient = None
 
 from misaka.ai.env_api_keys import get_env_api_key
 from misaka.ai.models import clamp_thinking_level
@@ -48,6 +49,7 @@ from misaka.ai.types import (
 )
 from misaka.ai.utils.event_stream import AssistantMessageEventStream, spawn_stream_task
 from misaka.ai.utils.headers import headers_to_record
+from misaka.ai.utils.network_route import httpx_client_options
 from misaka.ai.utils.provider_retry import retry_provider_request
 from misaka.ai.utils.transcript import (
     get_declared_tools,
@@ -184,6 +186,7 @@ def create_client(model: Model, api_key: str, options: Any = None) -> AsyncAzure
         api_version=config["apiVersion"],
         default_headers=headers,
         base_url=config["baseUrl"],
+        http_client=require(DefaultAsyncHttpxClient, "openai")(**httpx_client_options(config["baseUrl"], _option(options, "env"))),
     )
 
 
@@ -349,9 +352,11 @@ def stream_azure_openai_responses(
             timestamp=time.time_ns() // 1_000_000,
         )
 
+        owned_client = None
         try:
             api_key = _option(options, "apiKey") or get_env_api_key(model.provider) or ""
             client = create_client(model, api_key, options)
+            owned_client = client
             params = build_params(model, normalized_context, options, deployment_name)
             on_payload = _option(options, "onPayload")
             if callable(on_payload):
@@ -395,7 +400,10 @@ def stream_azure_openai_responses(
             output.errorMessage = format_azure_openai_error(error)
             stream.push(ErrorEvent(reason=output.stopReason, error=output), cause=error)
         finally:
-            stream.end()
+            try:
+                await _close_stream(owned_client)
+            finally:
+                stream.end()
 
     spawn_stream_task(run(), stream=stream)
     return stream

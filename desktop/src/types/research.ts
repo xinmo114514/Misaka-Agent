@@ -1,5 +1,38 @@
 import type { ChatMessage } from './session'
 
+export interface ResearchConnectionRoute {
+  mode: 'direct' | 'proxy'
+  endpoint: string
+  proxy?: string
+}
+
+export interface ResearchFailureDetails {
+  role: 'last_order'
+  provider: string
+  modelId: string
+  attempt: number
+  category: string
+  message: string
+  stack?: string
+  diagnostics?: unknown[]
+  route?: ResearchConnectionRoute
+  configurationError?: string
+}
+
+export interface ResearchFailureMetadata {
+  errorDetails?: ResearchFailureDetails
+  errorCode?: string
+  errorStage?: string
+  researchNeedsConfiguration?: boolean
+}
+
+export interface ResearchConnectionProbeResult {
+  route: ResearchConnectionRoute | null
+  reachable: boolean
+  check: 'tcp'
+  error?: string
+}
+
 export interface ResearchConversationBinding {
   sessionId: string
   sessionFile: string
@@ -43,26 +76,30 @@ export interface DesktopResearchTeam {
 export interface ResearchTeamSnapshot {
   team?: DesktopResearchTeam | null
   modelBinding?: ResearchModelBinding | null
+  modelBindings?: { last_order: ResearchModelBinding; sister: ResearchModelBinding } | null
 }
 
 /** Authoritative persisted transcript and host state, not a local run-start receipt. */
 export interface ResearchHostSnapshot {
   enabled: boolean
+  lifecycle?: { requestId?: string; stage?: string; startedAt?: number; deadlineAt?: number; canStop?: boolean } | null
+  reportDelivery?: { artifactId?: string | null; state: 'pending' | 'delivered' | 'failed'; errorCode?: string | null; error?: string | null } | null
   streamId?: string
   session: { sessionId: string; file: string; cwd: string; name?: string | null }
   messages: ChatMessage[]
   submissionReceipts?: Array<{ requestId: string; state: 'prepared' | 'accepted' | 'applied' | 'rejected' | 'unconfirmed'; runId?: string | null; mode?: string;
-    retryable?: boolean; errorStage?: string; errorCode?: string; error?: string }>
+    retryable?: boolean; errorStage?: string; errorCode?: string; error?: string; errorDetails?: ResearchFailureDetails; researchNeedsConfiguration?: boolean }>
   historyVersion: string | null
   lastEventSeq: number
   /** Native host lifecycle also covers follow-ups to a finished research run. */
   isStreaming?: boolean
   isIdle?: boolean
-  run: { id: string; status: string; phase: string } | null
+  run: { id: string; status: string; phase: string; driving?: boolean } | null
   stats: { totalMessages?: number; [key: string]: unknown }
   contextUsage: { tokens?: number; contextWindow?: number; percent?: number; [key: string]: unknown } | null
   team?: DesktopResearchTeam | null
   modelBinding?: ResearchModelBinding | null
+  modelBindings?: ResearchTeamSnapshot['modelBindings']
 }
 
 export type ResearchNodeKind = 'root' | 'alt' | 'join'
@@ -101,7 +138,30 @@ export interface ResearchRunSummary {
   final_artifact?: string | null
   last_error?: string | null
   createdAt?: number
+  /** Meaningful engine activity, Unix milliseconds; excludes polling and heartbeats. */
+  lastActivityAt?: number
+  reportDelivery?: ResearchHostSnapshot['reportDelivery']
   updatedAt?: number
+  /**
+   * Whether a live driver lease holds this run, straight from the board's own lease rule
+   * (`runs.driver_is_live`). Absent means unknown: an old protocol or an unreadable board,
+   * never "no driver" — the resume entry stays disabled until a read answers.
+   */
+  driving?: boolean
+  /**
+   * The run's root Last Order session, published by the bridge next to the lease fields
+   * (`_serialize_research_run`), so a stop entered from a listing can rebind that host.
+   */
+  rootSession?: string | null
+  /** The raw lease, published beside `driving` so a reader can explain the state. */
+  driverLock?: string | null
+  driverExpires?: number | null
+  /**
+   * A plan (or a level reconciliation) waits for the user's go-ahead. The run stays `active`
+   * while its driver has finished its turn, so this wait must be told apart from an interruption.
+   * Absent means unknown, like `driving`.
+   */
+  awaitingApproval?: boolean
 }
 
 /** One node of ``graph.snapshot``; ``[key: string]: any`` keeps it tolerant of new fields. */
@@ -115,6 +175,8 @@ export interface ResearchGraphNode {
   children: string[]
   cards?: {
     id: string
+    local_id?: string | null
+    dependencies?: string[]
     title: string
     kind?: string
     status: string
@@ -153,6 +215,8 @@ export interface ResearchRunLimits {
   max_revisions: number
   max_nodes: number
   plan_approval: boolean
+  context_threshold?: number | null
+  max_output_tokens?: number | null
 }
 
 export interface ResearchLimitConstraint {
@@ -164,6 +228,51 @@ export interface ResearchOptionsPayload {
   defaults: ResearchRunLimits
   constraints: Partial<Record<keyof ResearchRunLimits, ResearchLimitConstraint>>
   sisters: Array<{ id: string; name: string; description: string }>
+  questions?: Array<{ key: string; header: string; question: string; options: Array<{ label: string; description: string; value: number | boolean | null }> }>
+}
+
+export interface ResearchSessionTelemetry {
+  cwd: string
+  tokens: { input: number; output: number; cacheRead: number; cacheWrite: number; reasoning?: number | null }
+  cost: number | null
+  cacheHitRate: number | null
+  contextUsage: { tokens: number | null; contextWindow: number | null; percent: number | null }
+  model: ResearchModelRef | null
+  thinkingLevel: string | null
+  permissionMode: string | null
+  autoCompact: boolean | null
+  compactionCount: number
+  subscription: boolean | null
+}
+export interface ResearchSessionDescriptor {
+  executorId: string; sessionId: string | null; sessionFile: string | null; nodeId: string; taskId: string | null
+  role: 'last_order' | 'sister' | 'agent'; label: string; cardTitle?: string; workspace: string; status: string
+  generation: number; attempt: number; startedAt: number | null; endedAt: number | null; error: string | null
+  contract?: string | null; telemetry?: ResearchSessionTelemetry | null
+    /** Native execution projection; retired attempts stay available in history. */
+    isCurrent?: boolean
+}
+export interface ResearchSessionSnapshot {
+  runId: string; executorId: string; sessionId: string | null; nodeId: string; taskId: string | null
+  generation: number; attempt: number; revision: number; historyVersion: string | null
+  streaming: ChatMessage | null; telemetry: ResearchSessionTelemetry | null; error: string | null; availability: string
+  /** Provenance of runtime fields; saved usage totals may still be newer. */
+  runtimeSource?: 'live' | 'saved'
+}
+export interface ResearchSuspension {
+  id: string; runId: string; nodeId: string | null; scope: 'node' | 'run'; reason: 'all_cards_stopped'
+  hasAcceptedOutput: boolean; confirmations: Array<{ taskId: string; title: string; generation: number; status: string; error: string | null }>
+  resumeCommand: string; message: string; createdAt: number; resolvedAt: number | null
+}
+export interface ResearchSessionsPayload {
+  runId: string; run: ResearchRunSummary; graph: ResearchGraphPayload; sessions: ResearchSessionDescriptor[]
+  suspension: ResearchSuspension | null; suspensions: ResearchSuspension[]
+}
+export interface ResearchSessionHistory {
+  runId: string; executorId: string; messages: ChatMessage[]; nextCursor: string | null; hasMore: boolean
+  availability: 'available' | 'not_started' | 'missing' | 'interrupted'; historyVersion: string | null
+  telemetry?: ResearchSessionTelemetry | null; error?: string | null
+  direction?: 'older'; reset?: boolean
 }
 
 export interface ResearchArtifactDetail {
@@ -267,7 +376,59 @@ export interface ResearchRunCard {
     path?: string
     content?: string
     surveyPath?: string
+    incomplete?: boolean
   } | null
   error?: string | null
   updatedAt: number
+  startedAt?: number
+  lastActivityAt?: number
+  reportDelivery?: ResearchHostSnapshot['reportDelivery']
+  controlEpoch?: number
+  eventSeq?: number
+  noticeRevision?: number
+}
+
+/** One execution of a card: a claimed run attempt, or the card's own recorded runtime. */
+export interface ResearchExecutionInstance {
+  instanceId: string
+  taskId: string
+  generation: number
+  attempt: number
+  phase: string
+  status: string
+  startedAt: number | null
+  endedAt: number | null
+  exitCode: number | null
+  failureKind: string | null
+  summary: string | null
+  source: string
+}
+
+/** A tool call the sub-agent really made, as its transcript recorded it. */
+export interface ResearchExecutionEntry {
+  toolCallId: string
+  toolName: string
+  status: 'pending' | 'running' | 'success' | 'error' | 'cancelled'
+  arguments: string | null
+  argumentsTruncated: boolean
+  resultTruncated: boolean
+  result: string | null
+  error: string | null
+  startedAt: number | null
+  endedAt: number | null
+  recordIndex: number
+}
+
+export type ResearchExecutionAvailability = 'available' | 'not_started' | 'missing' | 'interrupted'
+
+export interface ResearchExecutionPage {
+  instances: ResearchExecutionInstance[]
+  entries: ResearchExecutionEntry[]
+  nextCursor: string | null
+  hasMore: boolean
+  availability: ResearchExecutionAvailability
+  reason?: string | null
+  runId: string
+  taskId: string
+  instanceId?: string
 }

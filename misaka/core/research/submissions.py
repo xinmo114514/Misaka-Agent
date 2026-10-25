@@ -28,9 +28,10 @@ except OSError:
     DIAGNOSTIC_BUILD = 'unknown'
 
 class ResearchInputError(ValueError):
-    def __init__(self, message, code, *, stage='validation', retryable=True):
+    def __init__(self, message, code, *, stage='validation', retryable=True, details=None):
         super().__init__(message)
         self.errorCode, self.errorStage, self.retryable = code, stage, retryable
+        self.errorDetails = details
 
 
 # A retried input that names an already used requestId must never look retryable: the

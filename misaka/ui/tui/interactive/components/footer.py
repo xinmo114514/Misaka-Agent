@@ -7,7 +7,7 @@ import re
 from typing import Any
 
 from misaka.core.experimental import are_experimental_features_enabled
-from misaka.core.usage_totals import addUsageToTotals, createUsageTotals
+from misaka.core.session_telemetry import usage_snapshot
 from misaka.ui.tui import truncateToWidth, visibleWidth
 from misaka.ui.tui.interactive.theme.theme import theme
 from misaka.utils.values import read_field
@@ -93,31 +93,8 @@ class FooterComponent:
         ):
             return cached
 
-        usage_totals = createUsageTotals()
-        latest_cache_hit_rate: float | None = None
-
-        # pi footer.ts:92-105 counts three kinds of entry, not one: assistant messages,
-        # tool results that carry their own usage (subagent/summariser tools report back
-        # this way), and compaction / branch-summary entries that carry usage.
-        for entry in self.session.sessionManager.getEntries():
-            entry_type = read_field(entry, "type")
-            if entry_type == "message":
-                message = read_field(entry, "message")
-                role = read_field(message, "role")
-                if role == "assistant":
-                    usage = read_field(message, "usage") or {}
-                    addUsageToTotals(usage_totals, usage)
-                    prompt_tokens = (
-                        int(read_field(usage, "input", 0) or 0)
-                        + int(read_field(usage, "cacheRead", 0) or 0)
-                        + int(read_field(usage, "cacheWrite", 0) or 0)
-                    )
-                    cache_read = int(read_field(usage, "cacheRead", 0) or 0)
-                    latest_cache_hit_rate = (cache_read / prompt_tokens) * 100 if prompt_tokens > 0 else None
-                elif role == "toolResult" and read_field(message, "usage"):
-                    addUsageToTotals(usage_totals, read_field(message, "usage"))
-            elif entry_type in ("branch_summary", "compaction") and read_field(entry, "usage"):
-                addUsageToTotals(usage_totals, read_field(entry, "usage"))
+        usage_totals, latest_cache_hit_rate, _compacted, _reasoning = usage_snapshot(
+            self.session.sessionManager.getEntries())
 
         self.sessionStats = {
             "session": self.session,

@@ -1,6 +1,7 @@
 import { useEffect, useRef } from 'react'
 import { Loader2, Trash2 } from 'lucide-react'
 import { useSessionStore } from '../store/useSessionStore'
+import { consumeEscape, ESCAPE_PRIORITY, useEscapeLayer } from '../lib/useEscapeLayer'
 
 export function SessionDeleteDialog() {
   const deletion = useSessionStore(state => state.sessionDeletion)
@@ -18,6 +19,10 @@ export function SessionDeleteDialog() {
   const cancelRef = useRef<HTMLButtonElement>(null)
   const previousFocus = useRef<HTMLElement | null>(null)
   const wasOpen = useRef(false)
+  useEscapeLayer(Boolean(deletion), event => {
+    consumeEscape(event)
+    if (deletion && deletion.status !== 'pending') cancelSessionDeletion()
+  }, ESCAPE_PRIORITY.dialog)
 
   useEffect(() => {
     const open = Boolean(deletion)
@@ -33,18 +38,6 @@ export function SessionDeleteDialog() {
       previousFocus.current = null
     }
   }, [Boolean(deletion), deletion?.path])
-
-  useEffect(() => {
-    if (!deletion) return
-    const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === 'Escape' && deletion.status !== 'pending') {
-        event.preventDefault()
-        cancelSessionDeletion()
-      }
-    }
-    window.addEventListener('keydown', onKeyDown)
-    return () => window.removeEventListener('keydown', onKeyDown)
-  }, [deletion, cancelSessionDeletion])
 
   if (!deletion) return null
 
@@ -105,4 +98,3 @@ export function SessionDeleteDialog() {
     </div>
   )
 }
-

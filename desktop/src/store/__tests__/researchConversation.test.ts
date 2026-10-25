@@ -13,7 +13,8 @@ beforeEach(() => {
   window.bridge = { send: vi.fn(), on: () => () => {} }
   useSessionStore.setState({ currentSessionId: 'ordinary', messages: [{ id: 'ordinary-user', role: 'user', content: 'ordinary question', timestamp: 1 }],
     isStreaming: false, isAborting: false, isSessionLoading: false, lastEventSeq: 0, researchCards: {}, researchBinding: null,
-    researchConnectionError: null, researchConversation: { currentSessionId: '', messages: [], isStreaming: false, isAborting: false, streamingMessageId: null, lastEventSeq: 0 } })
+    researchConnectionError: null, researchBindings: {}, researchConversations: {}, researchSnapshots: {},
+    researchConversation: { currentSessionId: '', messages: [], isStreaming: false, isAborting: false, streamingMessageId: null, lastEventSeq: 0 } })
 })
 
 describe('isolated continuous research conversation', () => {
@@ -188,12 +189,11 @@ describe('isolated continuous research conversation', () => {
   it('ignores old request acknowledgements after binding a different host transcript', () => {
     useSessionStore.getState().bindResearchConversation(snapshot())
     useSessionStore.getState().queueResearchMessage('old', '旧文本')
-    useSessionStore.getState().bindResearchConversation(snapshot({ session: { sessionId: 'new-research', file: '/new.jsonl', cwd: '/next' } }))
+    useSessionStore.getState().bindResearchConversation(snapshot({ session: { sessionId: 'new-research', file: '/new.jsonl', cwd: '/next' } }), true)
     useSessionStore.getState().handleResearchBridgeMessage({ type: 'ack', requestId: 'old', ok: false, error: '旧错误' })
     expect(useSessionStore.getState().researchConversation.messages).toEqual([])
     expect(useSessionStore.getState().researchConnectionError).toBeNull()
   })
-
   it('reconciles identical pending inputs by the backend requestId rather than text order', () => {
     useSessionStore.getState().bindResearchConversation(snapshot())
     const actions = useSessionStore.getState()

@@ -226,7 +226,9 @@ async def test_real_original_agent_recruits_roles_before_native_planner(prompt_h
         return out
     session.agent.streamFn = stream
     events = []
-    controller = DesktopResearchController(session, events.append).attach()
+    controller = DesktopResearchController(session, events.append,
+        config={**__import__('misaka.config.product', fromlist=['current_config']).current_config(),
+                'lo_model': f'{model.provider}/{model.id}'}).attach()
     await session.bindExtensions({'mode':'json'})
     part = next(p for p in session.moments.parts if isinstance(p,ResearchPart))
     con = controller.scope.native.module('misaka.core.research.wiring.research')._con()
@@ -323,14 +325,19 @@ async def test_a_failed_recruitment_intake_retries_the_start_without_redeliverin
         out.end(reply)
         return out
     session.agent.streamFn = stream
-    controller = DesktopResearchController(session, lambda payload: None).attach()
+    controller = DesktopResearchController(session, lambda payload: None,
+        config={**__import__('misaka.config.product', fromlist=['current_config']).current_config(),
+                'lo_model': f'{model.provider}/{model.id}'}).attach()
     await session.bindExtensions({'mode':'json'})
     con = controller.scope.native.module('misaka.core.research.wiring.research')._con()
     payload = {'sessionId':session.sessionId,'requestId':'same-start','text':'Compare the archival evidence',
                'limits':{'max_depth':0,'max_nodes':1}}
     try:
-        with pytest.raises(ValueError, match='has not recruited'):
+        from misaka.core.research import submissions
+        with pytest.raises(submissions.ResearchInputError) as caught:
             await controller.send_message(dict(payload), con)
+        assert caught.value.errorCode == 'RESEARCH_RECRUITMENT_MODEL_ERROR'
+        assert caught.value.errorDetails['message'] == 'fixture transient failure'
         ack = await controller.send_message(dict(payload), con)
         assert ack['accepted'] is True and ack['mode'] == 'start'
         intakes = [entry for entry in session.sessionManager.buildContextEntries()
@@ -359,7 +366,7 @@ from tests.test_agent_model_runtime import local_models  # noqa: F401 - fixture
 from tests.test_subagent_native_startup import isolated  # noqa: F401 - fixture
 
 
-async def test_real_native_agent_child_uses_desktop_bootstrap_and_exact_team_pair(local_models, monkeypatch):
+async def test_real_native_agent_child_uses_desktop_bootstrap_and_exact_team_pair(local_models, monkeypatch):  # noqa: F811 - pytest fixture import
     import json
 
     from misaka.config.product import current_config
@@ -400,8 +407,8 @@ async def test_real_native_agent_child_uses_desktop_bootstrap_and_exact_team_pai
             assert task.status=='completed',(task.error,list(task.stderr),failures)
             assert 'Loopback fixture answer.' in str(task.result)
             assert [(provider,payload['model']) for provider,payload in requests] == [('fixture-lo','shared')]
-            team.model_policy.snapshot()  # also reconciles ended native worker processes
-            state = json.loads(team.model_policy.path.read_text())
+            team.model_policy.snapshot(role='last_order')  # reconcile this role's ended native workers
+            state = json.loads(team.model_policy._policy('last_order').path.read_text())
             # Only root remains after the native child disposal, never a leaked worker lease.
             assert not state['requests']
             assert len(state['executors'])==1
@@ -516,6 +523,56 @@ async def test_request_binding_rebuilds_native_auth_after_model_override(tmp_pat
     assert actual[0]['headers']=={'authorization':'Bearer RIGHT'}
     assert actual[0]['env']=={'RIGHT_ENV':'right'}
     assert actual[0]['maxTokens']==321
+
+
+async def test_request_binding_diagnostics_use_stream_effective_network_env(tmp_path):
+    from misaka.desktop_research.model_policy import DesktopTeamModelPolicy
+    from misaka.desktop_research.runtime import install_model_binding
+
+    policy = DesktopTeamModelPolicy(tmp_path / 'policy.json', 'fixture', 'pinned')
+    pinned = SimpleNamespace(
+        provider='fixture', id='pinned', api='fixture', baseUrl='https://model.test/v1'
+    )
+    resolution = SimpleNamespace(
+        auth=SimpleNamespace(apiKey='KEY', headers={}, baseUrl=None),
+        env={'HTTPS_PROXY': 'http://credential.test:3128'},
+    )
+
+    expected_env = {
+        'https_proxy': 'http://application.test:43129',
+        'HTTPS_PROXY': 'http://application.test:43129',
+        'no_proxy': '',
+    }
+
+    class Stream:
+        def __init__(self):
+            self.effectiveNetworkEnv = dict(expected_env)
+
+        async def aclose(self):
+            return None
+
+    async def get_auth(_model, _overrides):
+        return resolution
+
+    session = SimpleNamespace(
+        model=pinned,
+        modelRegistry=SimpleNamespace(
+            find=lambda _provider, _model: pinned,
+            checkConfiguredAuth=lambda _model: asyncio.sleep(0, result=True),
+            getAuth=get_auth,
+        ),
+        agent=SimpleNamespace(
+            state=SimpleNamespace(model=pinned),
+            streamFn=lambda _model, _context, _options: Stream(),
+        ),
+        setModel=lambda *args, **kwargs: asyncio.sleep(0),
+    )
+    install_model_binding(session, policy, 'root')
+    stream = await session.agent.streamFn(pinned, {}, {})
+    try:
+        assert session._desktop_network_context['env'] == expected_env
+    finally:
+        await stream.aclose()
 
 async def test_provider_finalizer_drains_before_ticket_release(tmp_path):
     import json

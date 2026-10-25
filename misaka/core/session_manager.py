@@ -138,6 +138,7 @@ class SessionInfo:
     allMessagesText: str
     name: str | None = None
     parentSessionPath: str | None = None
+    desktopResearch: bool = False
 
 
 @runtime_checkable
@@ -250,7 +251,7 @@ def session_entry_to_display_messages(entry: SessionEntry) -> list[AgentMessage]
 
 def _entry_starts_transcript(entry: SessionEntry) -> bool:
     """Keep empty UI/drafts lazy, but persist actual output and adopted checkpoints."""
-    return ((entry.get('type') == 'custom' and entry.get('customType') == 'research-delivery')
+    return ((entry.get('type') == 'custom' and entry.get('customType') in {'research-delivery', 'desktop-recruitment'})
             or entry.get("type") == "custom_message"
             or (entry.get("type") == "compaction" and entry.get("contextMessages") is not None)
             or (entry.get("type") == "message" and _message_role(entry.get("message")) == "assistant"))
@@ -1510,11 +1511,33 @@ def _build_session_info_uncached(file_path: str) -> SessionInfo | None:
         first_message = ""
         all_messages: list[str] = []
         name: str | None = None
+        desktop_research = False
+        research_inputs: set[str] = set()
 
         for entry in entries:
             if entry.get("type") == "session_info":
                 raw_name = entry.get("name")
                 name = str(raw_name).strip() or None if raw_name is not None else None
+
+            # A durable desktop intake is meaningful history even before a model
+            # reply or Run exists. Expose ownership so reopening never becomes chat.
+            question, request_id = None, None
+            if entry.get('type') == 'custom' and entry.get('customType') == 'desktop-recruitment':
+                data = entry.get('data') or {}
+                if isinstance(data, dict) and data.get('version') == 1:
+                    desktop_research = True
+                    original = data.get('input') or {}
+                    if isinstance(original, dict):
+                        question, request_id = original.get('text'), data.get('requestId')
+            elif entry.get('type') == 'custom_message' and entry.get('customType') == 'desktop-intake':
+                desktop_research = True
+                question = entry.get('content')
+                request_id = (entry.get('details') or {}).get('requestId')
+            if isinstance(question, str) and question.strip() and str(request_id) not in research_inputs:
+                research_inputs.add(str(request_id))
+                all_messages.append(question)
+                if not first_message:
+                    first_message = question
 
             if entry.get("type") != "message":
                 continue
@@ -1545,9 +1568,10 @@ def _build_session_info_uncached(file_path: str) -> SessionInfo | None:
             parentSessionPath=str(parent_session_path) if isinstance(parent_session_path, str) else None,
             created=created,
             modified=modified,
-            messageCount=message_count,
+            messageCount=max(message_count, len(research_inputs)),
             firstMessage=first_message or "(no messages)",
             allMessagesText=" ".join(all_messages),
+            desktopResearch=desktop_research,
         )
     except Exception:  # noqa: BLE001 - a corrupt session file is skipped in the picker
         return None

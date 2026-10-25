@@ -15,6 +15,9 @@ import type {
   UpdateCheckResult,
   FontSizeOption,
   CloseWindowAction,
+  ProxySettings,
+  ProxySettingsSnapshot,
+  ProxyConnectionCheck,
 } from '../types/settings'
 import type { BridgeMessage, ThemeData } from '../types/global'
 import { useSessionStore } from './useSessionStore'
@@ -266,6 +269,12 @@ interface SettingsState {
   isLoading: boolean
   statusMessage: string | null
   connectivity: Record<string, ConnectivityResult | 'testing'>
+  proxySettingsSnapshot: ProxySettingsSnapshot | null
+  proxySettingsStatus: 'idle' | 'loading' | 'ready' | 'error'
+  proxySettingsError: string | null
+  proxySavePending: boolean
+  proxyCheckPending: boolean
+  proxyConnectionCheck: ProxyConnectionCheck | null
 
   // Real tools & extensions state
   tools: ToolInfo[]
@@ -293,10 +302,14 @@ interface SettingsState {
   fetchTools: () => void
   runDiagnostics: () => Promise<DiagnosticsInfo | null>
   checkUpdate: () => Promise<UpdateCheckResult | null>
+  loadProxySettings: () => Promise<ProxySettingsSnapshot | null>
+  clearProxyFeedback: () => void
+  saveProxySettings: (settings: ProxySettings) => Promise<ProxySettingsSnapshot>
+  checkProxyConnection: (settings?: ProxySettings) => Promise<ProxyConnectionCheck>
   setWorkspaceCwd: (path: string) => Promise<string>
-  setSessionModel: (provider: string, modelId: string, persist?: boolean) => void
+  setSessionModel: (provider: string, modelId: string, persist?: boolean, role?: 'last_order' | 'sister') => void
   applyResearchModelBinding: (sessionId: string, binding: ResearchModelBinding) => void
-  switchResearchTeamModel: (provider: string, modelId: string, action?: 'switch' | 'retry' | 'cancel') => void
+  switchResearchTeamModel: (provider: string, modelId: string, action?: 'switch' | 'retry' | 'cancel', role?: 'last_order' | 'sister') => void
   retryResearchModelSwitch: () => void
   cancelResearchModelSwitch: () => void
   /** Clear the popover's error line, e.g. when the picker closes. */
@@ -376,6 +389,12 @@ export const useSettingsStore = create<SettingsState>((set, get) => ({
   isLoading: false,
   statusMessage: null,
   connectivity: {},
+  proxySettingsSnapshot: null,
+  proxySettingsStatus: 'idle',
+  proxySettingsError: null,
+  proxySavePending: false,
+  proxyCheckPending: false,
+  proxyConnectionCheck: null,
 
   // New fields
   tools: [],
@@ -468,6 +487,68 @@ export const useSettingsStore = create<SettingsState>((set, get) => ({
         requestId: reqId,
       })
     })
+  },
+
+  loadProxySettings: async () => {
+    if (get().proxySettingsStatus === 'loading') return get().proxySettingsSnapshot
+    set({ proxySettingsStatus: 'loading', proxySettingsError: null, proxyConnectionCheck: null })
+    try {
+      const data = await sendSettingsCommand('get_proxy_settings')
+      if (!data?.settings) throw new Error('代理设置回执格式无效')
+      const snapshot = data as ProxySettingsSnapshot
+      set({ proxySettingsSnapshot: snapshot, proxySettingsStatus: 'ready', proxySettingsError: null })
+      return snapshot
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      set({ proxySettingsStatus: 'error', proxySettingsError: message })
+      throw error
+    }
+  },
+
+  clearProxyFeedback: () => set({ proxyConnectionCheck: null, proxySettingsError: null }),
+
+  saveProxySettings: async (settings) => {
+    if (get().proxySettingsStatus !== 'ready' || !get().proxySettingsSnapshot) {
+      throw new Error('已保存的代理设置尚未载入')
+    }
+    if (get().proxySavePending) throw new Error('代理设置正在保存')
+    set({ proxySavePending: true, proxySettingsError: null })
+    try {
+      const data = await sendSettingsCommand('set_proxy_settings', { settings })
+      if (!data?.settings) throw new Error('代理设置保存回执格式无效')
+      const snapshot = data as ProxySettingsSnapshot
+      set({ proxySettingsSnapshot: snapshot, proxyConnectionCheck: null })
+      return snapshot
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      set({ proxySettingsError: message })
+      throw error
+    } finally {
+      set({ proxySavePending: false })
+    }
+  },
+
+  checkProxyConnection: async (settings) => {
+    if (get().proxySettingsStatus !== 'ready' || !get().proxySettingsSnapshot) {
+      throw new Error('已保存的代理设置尚未载入')
+    }
+    if (get().proxyCheckPending) throw new Error('代理连接正在检查')
+    set({ proxyCheckPending: true, proxySettingsError: null, proxyConnectionCheck: null })
+    try {
+      const data = await sendSettingsCommand('check_proxy_connection', settings ? { settings } : {})
+      if (data?.check !== 'tcp' || typeof data?.reachable !== 'boolean') {
+        throw new Error('代理连接检查回执格式无效')
+      }
+      const result = data as ProxyConnectionCheck
+      set({ proxyConnectionCheck: result })
+      return result
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      set({ proxySettingsError: message })
+      throw error
+    } finally {
+      set({ proxyCheckPending: false })
+    }
   },
 
   setWorkspaceCwd: async (path: string) => {
@@ -698,12 +779,18 @@ export const useSettingsStore = create<SettingsState>((set, get) => ({
     })
   },
 
-  setSessionModel: (provider: string, modelId: string, persist = false) => {
+  setSessionModel: (provider: string, modelId: string, persist = false, role: 'last_order' | 'sister' = 'sister') => {
     const session = useSessionStore.getState()
+    if (session.agentMode === 'research' && session.researchPageView === 'new') {
+      const matched = get().models.find(model => model.provider === provider && model.id === modelId)
+      const thinkingLevel = matched ? clampThinkingLevel(resolveSupportedLevels(matched), session.researchEditors[session.researchView.ownerKey]?.thinkingLevel || get().thinkingLevel) : get().thinkingLevel
+      session.setResearchEditorConfig({ [role === 'last_order' ? 'lastOrderModel' : 'model']: { provider, modelId, name: matched?.name || modelId, thinking: thinkingLevel }, thinkingLevel })
+      return
+    }
     if (session.agentMode === 'research' && session.researchBinding) {
       // The user's pick is authoritative for the team until its binding commits it.
       pendingModelChoice = { sessionId: session.researchBinding.sessionId, provider, modelId }
-      get().switchResearchTeamModel(provider, modelId)
+      get().switchResearchTeamModel(provider, modelId, 'switch', role)
       return
     }
     if (!window.bridge?.send || !sessionReady()) return
@@ -765,6 +852,7 @@ export const useSettingsStore = create<SettingsState>((set, get) => ({
     const matched = get().models.find(model => model.provider === binding.effective.provider && model.id === binding.effective.modelId)
     const levels = matched ? resolveSupportedLevels(matched) : null
     const thinking = levels ? clampThinkingLevel(levels, get().thinkingLevel) : 'off'
+    if (caughtUp) session.setResearchEditorConfig({model:{...binding.effective,name:matched?.name || binding.effective.modelId,thinking},thinkingLevel:thinking},`conversation:${sessionId}`)
     set({ researchModelBinding: binding, researchModelSessionId: sessionId, researchModelTarget: localPending ? get().researchModelTarget : binding.target,
       modelSwitchPending: localPending || binding.state === 'switching', pickerError: localPending ? get().pickerError : binding.state === 'failed' ? binding.error || '团队模型切换失败' : null,
       ...(caughtUp ? { currentModel: { ...binding.effective, name: matched?.name || binding.effective.modelId, thinking }, thinkingLevel: thinking,
@@ -772,21 +860,23 @@ export const useSettingsStore = create<SettingsState>((set, get) => ({
         thinkingCapability: matched?.thinkingCapability ?? null, supportsThinking: matched?.supportsThinking ?? matched?.reasoning ?? false } : {}) })
   },
 
-  switchResearchTeamModel: (provider, modelId, action = 'switch') => {
+  switchResearchTeamModel: (provider, modelId, action = 'switch', role = 'sister') => {
     const session = useSessionStore.getState()
     if (session.agentMode !== 'research' || !session.researchBinding) return
     const sessionId = session.researchBinding.sessionId
     const requestId = newRequestId('desktop_team_model')
     latestResearchModelRequest = requestId
-    awaitingResearchModelRequest = { requestId, sessionId, baseEpoch: session.researchModelBinding?.epoch ?? get().researchModelBinding?.epoch ?? -1 }
+    awaitingResearchModelRequest = { requestId, sessionId, baseEpoch: session.researchModelBindings?.[role]?.epoch ?? session.researchModelBinding?.epoch ?? get().researchModelBinding?.epoch ?? -1 }
     clearPickerError(set)
     set({ modelSwitchPending: true, researchModelTarget: action === 'cancel' ? get().researchModelTarget : { provider, modelId } })
-    void requestResearch<ResearchTeamSnapshot & { snapshot?: ResearchTeamSnapshot }>('desktop_set_team_model', { sessionId, provider, modelId, action, requestId }, 180_000).then(result => {
+    void requestResearch<ResearchTeamSnapshot & { snapshot?: ResearchTeamSnapshot }>('desktop_set_team_model', { sessionId, provider, modelId, action, role, requestId }, 180_000).then(result => {
       if (latestResearchModelRequest !== requestId || useSessionStore.getState().researchBinding?.sessionId !== sessionId) return
       if (awaitingResearchModelRequest?.requestId === requestId) awaitingResearchModelRequest = null
       const snapshot = result.snapshot ?? result
       useSessionStore.getState().applyResearchTeamSnapshot(sessionId, snapshot)
-      if (snapshot.modelBinding) get().applyResearchModelBinding(sessionId, snapshot.modelBinding)
+      if (role === 'sister' && snapshot.modelBindings?.sister) get().applyResearchModelBinding(sessionId, snapshot.modelBindings.sister)
+      else if (role === 'sister' && snapshot.modelBinding) get().applyResearchModelBinding(sessionId, snapshot.modelBinding)
+      else if (role === 'last_order') set({ modelSwitchPending: false, researchModelTarget: null })
     }).catch(error => {
       if (latestResearchModelRequest !== requestId || useSessionStore.getState().researchBinding?.sessionId !== sessionId) return
       if (awaitingResearchModelRequest?.requestId === requestId) awaitingResearchModelRequest = null
@@ -854,6 +944,7 @@ export const useSettingsStore = create<SettingsState>((set, get) => ({
 
   setThinkingLevel: (level: string) => {
     const session = useSessionStore.getState()
+    if (session.agentMode === 'research' && session.researchPageView === 'new') { session.setResearchEditorConfig({ thinkingLevel: level }); return }
     if (session.agentMode === 'research' && session.researchBinding) return
     if (!window.bridge?.send) return
     if (get().modelSwitchPending || !sessionReady()) return

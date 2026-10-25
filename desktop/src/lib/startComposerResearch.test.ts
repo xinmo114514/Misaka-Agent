@@ -31,10 +31,35 @@ it('starts through unified ingress even with an empty expert directory', async (
     model: { provider: 'provider', modelId: 'model' }, thinkingLevel: 'high' })
   expect(onBound).toHaveBeenCalledWith(snapshot)
   expect(mocks.research).toHaveBeenCalledWith('send_research_message', {
-    text: 'Compare evidence', sessionId: 'research-session', requestId: 'input-1', limits: { ...defaults, plan_approval: false },
-  }, 180_000)
+    text: 'Compare evidence', sessionId: 'research-session', requestId: 'input-1', limits: defaults,
+  }, 650_000)
   expect(mocks.research).toHaveBeenCalledWith('set_permission_mode', { mode: 'bypassPermissions' })
   expect(result.runId).toBe('new-run')
+})
+it('keeps confirmed nine-field limits immutable and configures explicit role models before submission', async () => {
+  const chosen = { ...defaults, max_depth: 5, context_threshold: .8, max_output_tokens: 2048 }
+  await startComposerResearch({ question: 'Evidence', workspace: 'C:/project', requestId: 'roles-1',
+    limits: chosen, model: { provider: 'sister-provider', modelId: 'sister-model' },
+    lastOrderModel: { provider: 'lo-provider', modelId: 'lo-model' } })
+  const sent = mocks.research.mock.calls.find(call => call[0] === 'send_research_message')?.[1]
+  expect(sent.limits).toEqual(chosen)
+  expect(mocks.research).toHaveBeenCalledWith('desktop_set_team_model', expect.objectContaining({ role: 'sister', provider: 'sister-provider', modelId: 'sister-model' }))
+  expect(mocks.research).toHaveBeenCalledWith('desktop_set_team_model', expect.objectContaining({ role: 'last_order', provider: 'lo-provider', modelId: 'lo-model' }))
+  expect(mocks.research).not.toHaveBeenCalledWith('set_model', expect.anything())
+})
+it.each(['sister', 'last_order'] as const)('blocks startup submission when %s role switch reports failed', async role => {
+  mocks.research.mockImplementation(async type => {
+    if (type === 'send_research_message') throw new Error('unexpected submission')
+    if (type === 'desktop_set_team_model') return { modelBindings: { [role]: {
+      effective: { provider: 'old', modelId: 'old-model' }, target: null, epoch: 2, state: 'failed', error: 'Selected role unavailable',
+    } } }
+    return { accepted: true }
+  })
+  await expect(startComposerResearch({ question: 'Evidence', workspace: 'C:/project', requestId: `bad-${role}`,
+    ...(role === 'sister' ? { model: { provider: 'new', modelId: 'new-model' } } : {
+      lastOrderModel: { provider: 'new', modelId: 'new-model' },
+    }) })).rejects.toThrow('Selected role unavailable')
+  expect(mocks.research.mock.calls.some(call => call[0] === 'send_research_message')).toBe(false)
 })
 it('continues same owner without changing live model settings or starting another run', async () => {
   mocks.host.mockResolvedValue({ ...snapshot, run: { id: 'running', status: 'active', phase: 'plan' } })
@@ -45,13 +70,22 @@ it('continues same owner without changing live model settings or starting anothe
   expect(mocks.research).not.toHaveBeenCalledWith('set_model', expect.anything())
   expect(mocks.request).not.toHaveBeenCalledWith('get_research_options')
 })
+it('rejects fresh start when another research is active in the workspace', async () => {
+  mocks.request.mockImplementation(async type => type === 'get_active_research_runs'
+    ? { runs: [{ id: 'active-1', workspace: 'C:/project', question: '已在运行的研究' }] }
+    : { defaults, sisters: [] })
+  await expect(startComposerResearch({ question: '新的课题', workspace: 'C:/project', startNew: true }))
+    .rejects.toThrow('当前项目已有研究正在运行中')
+})
+
 it('applies the picker selection when continuing a bound run', async () => {
   mocks.host.mockResolvedValue({ ...snapshot, run: { id: 'running', status: 'active', phase: 'plan' } })
   const binding = { sessionId: 'research-session', sessionFile: 'root.jsonl', workspace: 'C:/project', runId: 'running' }
   await startComposerResearch({ question: '追问', workspace: 'C:/project', binding, requestId: 'follow-1',
     model: { provider: 'other', modelId: 'fresh' }, thinkingLevel: 'high' })
-  expect(mocks.research).toHaveBeenCalledWith('set_model', { provider: 'other', modelId: 'fresh' })
-  expect(mocks.research).toHaveBeenCalledWith('set_thinking', { level: 'high' })
+  expect(mocks.research).toHaveBeenCalledWith('desktop_set_team_model', expect.objectContaining({ provider: 'other', modelId: 'fresh', action: 'switch' }))
+  expect(mocks.research).not.toHaveBeenCalledWith('set_thinking', expect.anything())
+  expect(mocks.research).not.toHaveBeenCalledWith('set_model', expect.anything())
   expect(mocks.research).toHaveBeenCalledWith('send_research_message', { text: '追问', sessionId: 'research-session', runId: 'running', requestId: 'follow-1' })
 })
 it('opens a fresh run instead of adopting a settled one when the caller declares a new research', async () => {
@@ -59,7 +93,7 @@ it('opens a fresh run instead of adopting a settled one when the caller declares
   const result = await startComposerResearch({ question: '新的课题', workspace: 'C:/project', requestId: 'new-1', startNew: true })
   const sent = mocks.research.mock.calls.find(call => call[0] === 'send_research_message')?.[1]
   expect(sent).not.toHaveProperty('runId')
-  expect(sent).toMatchObject({ text: '新的课题', startNew: true, limits: { ...defaults, plan_approval: false } })
+  expect(sent).toMatchObject({ text: '新的课题', startNew: true, limits: defaults })
   expect(result.runId).toBe('new-run')
 })
 
@@ -85,8 +119,8 @@ it('does not confirm a fresh creation timeout from the previous settled run snap
     mocks.research.mockImplementation(async type => type === 'get_research_host' ? oldHost : { accepted: true })
     const pending = startComposerResearch({ question: 'New question', workspace: 'C:/project', startNew: true })
     const result = pending.then(() => ({ accepted: false, stage: 'unexpected-success' }), error => error)
-    await vi.waitFor(() => expect(mocks.research).toHaveBeenCalledWith('send_research_message', expect.anything(), 180_000))
-    await vi.advanceTimersByTimeAsync(180_000)
+    await vi.waitFor(() => expect(mocks.research).toHaveBeenCalledWith('send_research_message', expect.anything(), 650_000))
+    await vi.advanceTimersByTimeAsync(650_000)
     expect(await result).toMatchObject({ accepted: true, stage: 'startup', name: 'ResearchStartupConfirmationTimeoutError' })
   } finally { vi.useRealTimers() }
 })
@@ -98,7 +132,7 @@ it('keeps a retried fresh start away from the previous settled run', async () =>
   const sent = mocks.research.mock.calls.find(call => call[0] === 'send_research_message')?.[1]
   expect(sent).not.toHaveProperty('runId')
   // The startup timeout argument only exists while the run creation is still unconfirmed.
-  expect(mocks.research).toHaveBeenCalledWith('send_research_message', expect.objectContaining({ startNew: true }), 180_000)
+  expect(mocks.research).toHaveBeenCalledWith('send_research_message', expect.objectContaining({ startNew: true }), 650_000)
   expect(result.runId).toBe('new-run')
 })
 
@@ -125,7 +159,7 @@ it('waits for actual creation after acceptance', async () => {
   mocks.research.mockResolvedValue({ accepted: true, mode: 'start' })
   let completed = false
   const pending = startComposerResearch({ question: 'Question', workspace: 'C:/project' }).then(() => { completed = true })
-  await vi.waitFor(() => expect(mocks.research).toHaveBeenCalledWith('send_research_message', expect.anything(), 180_000))
+  await vi.waitFor(() => expect(mocks.research).toHaveBeenCalledWith('send_research_message', expect.anything(), 650_000))
   expect(completed).toBe(false)
   started()
   await pending
@@ -185,7 +219,7 @@ it('cancels an unconfirmed start on its own research host and releases the wait'
     return { accepted: true, mode: 'start' }
   })
   const pending = startComposerResearch({ question: 'Question', workspace: 'C:/project' })
-  await vi.waitFor(() => expect(mocks.research).toHaveBeenCalledWith('send_research_message', expect.anything(), 180_000))
+  await vi.waitFor(() => expect(mocks.research).toHaveBeenCalledWith('send_research_message', expect.anything(), 650_000))
   expect(cancelResearchStartup('research-session')).toBe(true)
   await expect(pending).rejects.toThrow('研究启动已取消')
   expect(mocks.research).toHaveBeenCalledWith('abort', { sessionId: 'research-session' })
@@ -214,7 +248,7 @@ it('fences startup cancellation with the captured host stream', async () => {
   mocks.research.mockImplementation(async type => type === 'send_research_message'
     ? new Promise(() => {}) : { accepted: true })
   const pending = startComposerResearch({ question: '研究问题', workspace: 'C:/project' })
-  await vi.waitFor(() => expect(mocks.research).toHaveBeenCalledWith('send_research_message', expect.anything(), 180_000))
+  await vi.waitFor(() => expect(mocks.research).toHaveBeenCalledWith('send_research_message', expect.anything(), 650_000))
   expect(cancelResearchStartup('research-session')).toBe(true)
   await expect(pending).rejects.toThrow('研究启动已取消')
   expect(mocks.research).toHaveBeenCalledWith('abort', { sessionId: 'research-session', streamId: 'startup-epoch' })
@@ -242,7 +276,7 @@ it('keeps the first message pending through a real multi-turn team preparation b
     await pending
     expect(failure).toBeUndefined()
     expect(complete).toBe(true)
-    expect(mocks.research.mock.calls.find(call => call[0] === 'send_research_message')?.[2]).toBe(180_000)
+    expect(mocks.research.mock.calls.find(call => call[0] === 'send_research_message')?.[2]).toBe(650_000)
   } finally { vi.useRealTimers() }
 })
 
@@ -336,9 +370,9 @@ it('captures an immutable exact submission at the first actual send', async () =
   })
   await startComposerResearch({ question: ' Question ', workspace: 'C:/project', onSubmission })
   const captured = onSubmission.mock.calls[0][0]
-  expect(captured).toEqual({ text: 'Question', sessionId: 'research-session', streamId: 'stream-1', requestId: 'input-1', limits: { ...defaults, plan_approval: false } })
+  expect(captured).toEqual({ text: 'Question', sessionId: 'research-session', streamId: 'stream-1', requestId: 'input-1', limits: defaults })
   expect(onSubmission).toHaveBeenCalledOnce()
-  expect(mocks.research).toHaveBeenCalledWith('send_research_message', captured, 180_000)
+  expect(mocks.research).toHaveBeenCalledWith('send_research_message', captured, 650_000)
 })
 
 it('retries the original submission identity after a bound run appears and the transport reconnects', async () => {
@@ -355,8 +389,8 @@ it('retries the original submission identity after a bound run appears and the t
   expect(onSubmission).not.toHaveBeenCalled()
   // The picker's live selection is applied on the retry too; only the persisted
   // submission identity (question, run, limits) is replayed verbatim.
-  expect(mocks.research).toHaveBeenCalledWith('set_model', { provider: 'new-provider', modelId: 'new-model' })
-  expect(mocks.research).toHaveBeenCalledWith('set_thinking', { level: 'high' })
+  expect(mocks.research).toHaveBeenCalledWith('desktop_set_team_model', expect.objectContaining({ provider: 'new-provider', modelId: 'new-model', action: 'switch' }))
+  expect(mocks.research).not.toHaveBeenCalledWith('set_thinking', expect.anything())
   expect(mocks.request.mock.calls.map(call => call[0])).not.toContain('get_research_options')
 })
 
@@ -503,7 +537,7 @@ it('cancels startup during permission restoration without sending an input', asy
   } finally {
     restore()
     if (!cancelledEarly) {
-      await vi.waitFor(() => expect(mocks.research).toHaveBeenCalledWith('send_research_message', expect.anything(), 180_000))
+      await vi.waitFor(() => expect(mocks.research).toHaveBeenCalledWith('send_research_message', expect.anything(), 650_000))
       cancelResearchStartup('research-session')
     }
     await rejection
@@ -520,7 +554,7 @@ it('reconciles a missing creation event from its trusted host before declaring s
     let failure: unknown
     const pending = startComposerResearch({ question: 'Question', workspace: 'C:/project' })
       .then(value => { result = value }, error => { failure = error })
-    await vi.advanceTimersByTimeAsync(180_000)
+    await vi.advanceTimersByTimeAsync(650_000)
     await pending
     expect(failure).toBeUndefined()
     expect(result?.runId).toBe('durable-run')
@@ -571,4 +605,21 @@ it('stops polling once the run is confirmed, leaving no live reconciliation time
     expect(mocks.research.mock.calls.filter(call => call[0] === 'get_research_host').length).toBe(hostCalls)
     expect(result?.runId).toBe('new-run')
   } finally { vi.useRealTimers() }
+})
+it.each(['failed','switching','mismatch'])('blocks submission when team model acknowledgement is %s', async state => {
+  mocks.host.mockResolvedValue({...snapshot,run:{id:'running',status:'active',phase:'plan'}})
+  mocks.research.mockImplementation(async type => type === 'desktop_set_team_model' ? {modelBinding:{state:state === 'mismatch' ? 'ready' : state,effective:{provider:'old',modelId:'old'},target:{provider:'wanted',modelId:'wanted'},error:'model unavailable'}} : {accepted:true})
+  const submission=vi.fn()
+  await expect(startComposerResearch({question:'Do not admit while paused',workspace:'C:/project',binding:{sessionId:'research-session',sessionFile:'root.jsonl',workspace:'C:/project',runId:'running'},model:{provider:'wanted',modelId:'wanted'},requestId:'guard-model',onSubmission:submission})).rejects.toMatchObject({retryable:true,errorCode:'RESEARCH_MODEL_NOT_READY'})
+  expect(mocks.research.mock.calls.some(([type])=>type==='send_research_message')).toBe(false)
+  expect(submission).not.toHaveBeenCalled()
+})
+it('accepted resume message opens a new metadata control epoch before hydration', async () => {
+ const {useSessionStore}=await import('../store/useSessionStore')
+ useSessionStore.setState({researchCards:{running:{runId:'running',question:'Q',status:'stopped',phase:'stopped',tasks:[],updatedAt:1}}})
+ mocks.host.mockResolvedValue({...snapshot,run:{id:'running',status:'stopped',phase:'stopped'}})
+ mocks.research.mockImplementation(async type=>type==='send_research_message'?{accepted:true,mode:'resume',runId:'running'}: type==='get_research_host'?{...snapshot,run:{id:'running',status:'active',phase:'active'}}:{accepted:true})
+ await startComposerResearch({question:'Resume',workspace:'C:/project',binding:{sessionId:'research-session',sessionFile:'root.jsonl',workspace:'C:/project',runId:'running'},requestId:'resume-message'})
+ expect(useSessionStore.getState().researchCards.running.status).toBe('active')
+ expect(useSessionStore.getState().researchCards.running.controlEpoch).toBe(1)
 })

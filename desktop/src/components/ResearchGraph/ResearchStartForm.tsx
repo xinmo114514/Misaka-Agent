@@ -1,4 +1,4 @@
-import React, { useState } from 'react'
+import React, { useEffect, useState } from 'react'
 import { Loader2, Play, Settings2 } from 'lucide-react'
 import { requestResearch } from '../../lib/researchBridge'
 import type { ResearchOptionsPayload, ResearchRunLimits } from '../../types/research'
@@ -21,7 +21,7 @@ function allowed(value: number, bounds?: { min: number; max?: number }): boolean
   return Number.isInteger(value) && (!bounds || (value >= bounds.min && (bounds.max === undefined || value <= bounds.max)))
 }
 
-function inputValue(value: number | boolean): number | '' {
+function inputValue(value: number | boolean | null | undefined): number | '' {
   const number = Number(value)
   return Number.isFinite(number) ? number : ''
 }
@@ -32,10 +32,18 @@ export const ResearchStartForm: React.FC<Props> = ({ workspace, options, active,
   const [advanced, setAdvanced] = useState(false)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
+  const [contextPercent, setContextPercent] = useState('')
+  const [outputTokens, setOutputTokens] = useState('')
+  useEffect(() => {
+    setContextPercent(options?.defaults.context_threshold == null ? '' : String(Math.round(options.defaults.context_threshold * 100)))
+    setOutputTokens(options?.defaults.max_output_tokens == null ? '' : String(options.defaults.max_output_tokens))
+  }, [options])
 
   const values = limits ?? options?.defaults ?? null
   const canSubmit = Boolean(question.trim() && workspace && values && !active && !busy &&
-    visibleLimits.every(([key]) => allowed(Number(values[key]), options?.constraints[key])))
+    visibleLimits.every(([key]) => allowed(Number(values[key]), options?.constraints[key])) &&
+    (contextPercent === '' || (Number(contextPercent) >= 10 && Number(contextPercent) <= 95)) &&
+    (outputTokens === '' || (allowed(Number(outputTokens), options?.constraints.max_output_tokens ?? { min: 1024 }))))
 
   const setNumber = (key: keyof ResearchRunLimits, value: string) => {
     setLimits(current => ({ ...(current ?? options?.defaults ?? {
@@ -51,7 +59,12 @@ export const ResearchStartForm: React.FC<Props> = ({ workspace, options, active,
     setError('')
     try {
       const host = await window.app.startResearchBridge({ cwd: workspace })
-      await requestResearch('start_research', { question: question.trim(), limits: values, workspace })
+      const chosen = { ...values }
+      if (contextPercent) chosen.context_threshold = Number(contextPercent) / 100
+      else delete chosen.context_threshold
+      if (outputTokens) chosen.max_output_tokens = Number(outputTokens)
+      else delete chosen.max_output_tokens
+      await requestResearch('start_research', { question: question.trim(), limits: chosen, workspace })
       setQuestion('')
       onStarted(host)
     } catch (failure) {
@@ -106,6 +119,14 @@ export const ResearchStartForm: React.FC<Props> = ({ workspace, options, active,
           <input type="checkbox" checked={values.plan_approval}
             onChange={event => setLimits(current => ({ ...(current ?? values), plan_approval: event.target.checked }))} />
           每份计划与分支汇总均需审批
+        </label>
+        <label className="space-y-1 text-[10.5px] text-muted">上下文阈值
+          <input aria-label="上下文阈值" type="number" min={10} max={95} placeholder="Global" value={contextPercent} onChange={event => setContextPercent(event.target.value)}
+            className="w-full rounded-md border border-border-subtle bg-surface-1 px-2.5 py-1.5 text-xs text-text-main" />
+        </label>
+        <label className="space-y-1 text-[10.5px] text-muted">最大输出 token
+          <input aria-label="最大输出 token" type="number" min={options?.constraints.max_output_tokens?.min ?? 1024} placeholder="Model default" value={outputTokens} onChange={event => setOutputTokens(event.target.value)}
+            className="w-full rounded-md border border-border-subtle bg-surface-1 px-2.5 py-1.5 text-xs text-text-main" />
         </label>
       </div>}
 

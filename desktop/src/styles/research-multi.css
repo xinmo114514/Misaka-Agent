@@ -1,0 +1,93 @@
+/* The reading canvas shares focus mode's global atmosphere; only transcript cards are opaque. */
+.research-tiling-container[data-research-view-mode="multi"] {
+  background: transparent;
+  container-name: research-workspace;
+}
+
+.research-multi-layout {
+  display: grid;
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+  /* Intrinsic tracks overflow this viewport instead of compressing seven rows into its height. */
+  grid-auto-rows: max-content;
+  align-content: start;
+  align-items: stretch;
+  gap: 12px;
+  margin: 12px;
+  /* Multi's existing Composer occupies a real flex row, reserving its measured height once. */
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
+}
+
+.research-multi-pane-slot,
+.research-multi-pane-host {
+  display: flex;
+  min-width: 0;
+  min-height: 0;
+  flex-direction: column;
+}
+
+.research-multi-pane-slot { max-height: var(--research-mosaic-row-cap, 264px); }
+.research-multi-pane-host { flex: 1; }
+
+.research-multi-pane-host > .research-agent-pane {
+  flex: 1;
+  height: auto;
+}
+
+.research-multi-pane-slot .research-pane-body { flex-basis: auto; }
+
+.research-multi-task-grid {
+  /* Keep the stable React parent/keys while all real panes share the same grid rows. */
+  display: contents;
+}
+
+.research-multi-empty-note {
+  grid-column: 1 / -1;
+  margin: 0;
+  padding: 2px 10px;
+  color: var(--research-secondary-ink);
+  font-size: 12px;
+  line-height: 20px;
+  text-align: center;
+}
+
+.research-multi-layout[data-solo-controller="true"] .research-multi-controller {
+  width: 100%;
+  max-width: var(--conversation-width, 840px);
+  justify-self: center;
+}
+
+.research-multi-layout[data-tiny-height="true"] .research-multi-pane-slot {
+  /* Physical conflicts reserve controls and the 120px body, then scroll the outer canvas. */
+  min-height: 264px;
+}
+
+/* Portalled onto body: a full-window reader never acquires a glass ancestor's containing block. */
+.research-expanded-pane {
+  --research-secondary-ink: color-mix(in srgb, var(--muted) 85%, var(--text-main));
+  --research-tertiary-ink: color-mix(in srgb, var(--muted) 92%, var(--text-main));
+  --research-error-ink: color-mix(in srgb, var(--danger) 85%, var(--text-main));
+  position: fixed;
+  inset: 0;
+  height: 100%;
+  z-index: 45;
+  box-sizing: border-box;
+  padding: 16px;
+  background: var(--surface-0);
+}
+
+.research-expanded-pane[data-foreground-open] { z-index: 40; }
+.research-expanded-pane button:focus-visible,
+.research-expanded-pane summary:focus-visible,
+.research-expanded-pane a:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: -2px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .research-expanded-pane *, .research-multi-layout * { animation: none !important; transition: none !important; scroll-behavior: auto !important; }
+}

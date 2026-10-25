@@ -8,6 +8,8 @@ import time
 from collections.abc import Mapping
 from typing import Any, Literal, TypedDict
 
+import httpx
+
 try:
     from google.genai import Client as GoogleGenAI
 except ImportError:  # optional extra: misaka[google]
@@ -69,7 +71,10 @@ from misaka.ai.types import (
 )
 from misaka.ai.utils.abort import race_with_abort_signal
 from misaka.ai.utils.event_stream import AssistantMessageEventStream, spawn_stream_task
+from misaka.ai.utils.google_endpoint import resolve_google_endpoint
 from misaka.ai.utils.headers import provider_headers_to_record
+from misaka.ai.utils.httpx_lifecycle import close_after_setup_failure
+from misaka.ai.utils.network_route import httpx_client_options
 from misaka.ai.utils.sanitize_unicode import sanitize_surrogates
 from misaka.ai.utils.text import get_system_message_text
 from misaka.ai.utils.transcript import (
@@ -168,6 +173,7 @@ def create_client(
     api_key: str | None = None,
     options_headers: Mapping[str, str] | None = None,
     timeout_ms: int | None = None,
+    env: Mapping[str, str] | None = None,
 ) -> GoogleGenAI:
     # The outer retry_google_request owns retries; disable the SDK's five-attempt default.
     http_options: dict[str, Any] = {"retryOptions": {"attempts": 1}}
@@ -186,10 +192,24 @@ def create_client(
     if timeout_ms is not None:
         http_options["timeout"] = timeout_ms
 
-    return require(GoogleGenAI, "google-genai")(
-        api_key=api_key,
-        http_options=http_options or None,
-    )
+    endpoint = resolve_google_endpoint(model.baseUrl)
+    http_options["baseUrl"] = endpoint
+    route_options = httpx_client_options(endpoint, env)
+    http_options["clientArgs"] = route_options
+    # A custom transport forces HTTPX even when google-genai has optional aiohttp.
+    # Keep transport ownership with the SDK so aio.aclose() releases its pool.
+    http_options["asyncClientArgs"] = {
+        **{key: value for key, value in route_options.items() if key != "proxy"},
+        "transport": httpx.AsyncHTTPTransport(**route_options),
+    }
+    try:
+        return require(GoogleGenAI, "google-genai")(
+            api_key=api_key,
+            http_options=http_options or None,
+        )
+    except BaseException:
+        close_after_setup_failure(http_options["asyncClientArgs"]["transport"])
+        raise
 
 
 def build_params(
@@ -279,6 +299,7 @@ def stream_google(
                 api_key,
                 _option(options, "headers"),
                 _option(options, "timeoutMs"),
+                env=_option(options, "env"),
             )
             params = build_params(model, normalized_context, options)
             on_payload = _option(options, "onPayload")
@@ -442,11 +463,15 @@ def stream_google(
         finally:
             aio_client = getattr(client, "aio", None)
             close = getattr(aio_client, "aclose", None) if aio_client is not None else None
-            if callable(close):
+            if _option(options, "client") is None and callable(close):
                 try:
                     await maybe_await(close())
                 except Exception:  # noqa: BLE001, S110 - closing the SDK client is best-effort after the stream ended
                     pass
+            if _option(options, "client") is None and client is not None:
+                close_sync = getattr(client, "close", None)
+                if callable(close_sync):
+                    close_sync()
             stream.end()
 
     spawn_stream_task(run(), stream=stream)

@@ -487,9 +487,15 @@ def create_download_file_tool_definition(
 
         directory = resolve_to_cwd(DOWNLOAD_DIR_NAME, cwd)
         try:
-            result, aborted = await run_with_abort(
-                _download(url, parsed.path.strip(), directory, signal, cwd), signal
-            )
+            for attempt in range(2):
+                try:
+                    result, aborted = await run_with_abort(
+                        _download(url, parsed.path.strip(), directory, signal, cwd), signal
+                    )
+                    break
+                except (TimeoutError, httpx.TransportError):
+                    if attempt or signal_aborted(signal):
+                        raise
             if aborted:
                 raise RuntimeError("Operation aborted")
             return result
@@ -507,7 +513,13 @@ def create_download_file_tool_definition(
             )
         except (TimeoutError, httpx.TimeoutException):
             return _result(
-                f"Download of {url} timed out. Retry once, or find a faster mirror."
+                f"Download of {url} timed out after one retry; continuing without the file.",
+                {"skipped": True, "retryAttempts": 2},
+            )
+        except httpx.TransportError as error:
+            return _result(
+                f"Download of {url} failed after one retry ({type(error).__name__}); continuing without the file.",
+                {"skipped": True, "retryAttempts": 2},
             )
         except httpx.HTTPError as error:
             return _result(

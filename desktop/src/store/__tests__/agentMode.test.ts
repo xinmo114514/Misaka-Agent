@@ -11,9 +11,7 @@ it('combines research mode with bypass permission without inventing a backend pe
   useSessionStore.getState().setAgentMode('research')
   expect(useSessionStore.getState().agentMode).toBe('research')
   expect(useSessionStore.getState().permissionMode).toBe('bypassPermissions')
-  expect(window.bridge.send).toHaveBeenCalledWith(expect.objectContaining({
-    type: 'set_permission_mode', mode: 'bypassPermissions',
-  }))
+  expect(window.bridge.send).not.toHaveBeenCalled()
 })
 
 it('leaves research mode when choosing an ordinary permission mode', () => {
@@ -23,9 +21,9 @@ it('leaves research mode when choosing an ordinary permission mode', () => {
   expect(useSessionStore.getState().permissionMode).toBe('plan')
 })
 
-it('keeps mode unchanged while the session is not ready', () => {
+it('allows an independent research entry while ordinary session is not ready', () => {
   useSessionStore.setState({ isSessionLoading: true })
   useSessionStore.getState().setAgentMode('research')
-  expect(useSessionStore.getState().agentMode).toBe('agent')
+  expect(useSessionStore.getState().agentMode).toBe('research')
   expect(window.bridge.send).not.toHaveBeenCalled()
 })

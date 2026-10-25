@@ -51,7 +51,7 @@ describe('CloseConfirmDialog', () => {
   it('dismisses when pressing Escape', () => {
     render(<CloseConfirmDialog open={true} onClose={onClose} onConfirm={onConfirm} />)
 
-    fireEvent.keyDown(window, { key: 'Escape' })
+    fireEvent.keyDown(screen.getByRole('alertdialog'), { key: 'Escape' })
     expect(onClose).toHaveBeenCalledTimes(1)
     expect(onConfirm).not.toHaveBeenCalled()
   })

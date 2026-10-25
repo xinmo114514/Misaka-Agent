@@ -25,6 +25,7 @@ from misaka.ai.utils.oauth.types import (
     OAuthLoginCallbacks,
     OAuthPrompt,
 )
+from misaka.config.proxy_settings import proxy_httpx_options
 from misaka.utils.values import signal_aborted
 
 CLIENT_ID = base64.b64decode("OWQxYzI1MGEtZTYxYi00NGQ5LTg4ZWQtNTk0NGQxOTYyZjVl").decode("utf-8")
@@ -266,7 +267,7 @@ async def _start_callback_server(expected_state: str, signal: Any = None) -> _Ca
 
 
 async def _post_json(url: str, body: dict[str, str | int]) -> str:
-    async with httpx.AsyncClient(timeout=30.0) as client:
+    async with httpx.AsyncClient(timeout=30.0, **proxy_httpx_options(url)) as client:
         response = await client.post(url, headers={"Content-Type": "application/json", "Accept": "application/json"}, json=body)
     if response.status_code >= 400:
         raise RuntimeError(f"HTTP request failed. status={response.status_code}; url={url}; body={response.text}")

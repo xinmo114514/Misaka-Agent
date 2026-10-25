@@ -6,6 +6,7 @@ export type SettingsSectionId =
   | 'appearance'
   | 'tools'
   | 'data'
+  | 'network'
   | 'shortcuts'
   | 'about'
 
@@ -182,3 +183,33 @@ export interface UpdateCheckResult {
 export type FontSizeOption = 'compact' | 'standard' | 'spacious'
 
 export type CloseWindowAction = 'ask' | 'tray' | 'quit'
+
+export type ProxyDisabledBehavior = 'direct' | 'environment'
+export type ProxyProtocol = 'http' | 'https' | 'socks5' | 'socks5h'
+
+export interface ProxySettings {
+  enabled: boolean
+  whenDisabled: ProxyDisabledBehavior
+  protocol: ProxyProtocol
+  host: string
+  port: number | null
+}
+
+export interface ProxyRoute {
+  mode: 'direct' | 'proxy'
+  endpoint: string
+  proxy?: string
+}
+
+export interface ProxySettingsSnapshot {
+  settings: ProxySettings
+  route: ProxyRoute | null
+  routeError?: string
+}
+
+export interface ProxyConnectionCheck {
+  route: ProxyRoute | null
+  reachable: boolean
+  check: 'tcp'
+  error?: string
+}

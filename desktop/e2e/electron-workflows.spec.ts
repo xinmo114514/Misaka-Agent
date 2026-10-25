@@ -176,11 +176,14 @@ test('real Electron keeps user data isolated, picks and prepares a file, and ren
         ;(globalThis as any).__electronSmokeResearchMenu = template
         return buildFromTemplate(template)
       }
-      const responses = [1, 2]
-      dialog.showMessageBox = async () => ({ response: responses.shift() ?? 2 })
+      dialog.showMessageBox = async () => ({ response: 2 })
       ipcMain.emit('app:research-state', {} as any, { active: true, pendingCount: 2 })
     })
+    // A page that can answer keeps the decision: the in-page dialog chooses 最小化到托盘, which is
+    // the same outcome the native box's 后台继续 gives. The frozen-page path is covered by
+    // electron-close-fallback.spec.ts.
     await app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].close())
+    await page.getByRole('button', { name: '最小化到托盘' }).click()
     await expect.poll(() => app!.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0]?.isVisible() ?? false)).toBe(false)
     expect(app.process().exitCode).toBeNull()
     const trayLabels = await app.evaluate(() => ((globalThis as any).__electronSmokeResearchMenu || []).map((item: any) => item.label))
@@ -190,6 +193,7 @@ test('real Electron keeps user data isolated, picks and prepares a file, and ren
     await expect.poll(() => app!.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0]?.isVisible() ?? false)).toBe(true)
     await app.evaluate(({ ipcMain }) => ipcMain.emit('app:research-state', {} as any, { active: true, pendingCount: 1 }))
     await app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].close())
+    await page.getByRole('button', { name: '取消' }).click()
     await expect.poll(() => app!.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0]?.isVisible() ?? false)).toBe(true)
     await app.evaluate(({ ipcMain }) => ipcMain.emit('app:research-state', {} as any, false))
     console.log('Electron smoke stage: tray background, reopen and cancel-close lifecycle verified')

@@ -1,0 +1,82 @@
+/* Both research layouts share the existing glass rail, palette and keyboard affordances. */
+[data-research-workspace-toolbar] {
+  min-width: 0;
+  height: 52px;
+}
+
+[data-research-workspace-toolbar] .research-focus-toolbar-actions {
+  flex: 0 1 auto;
+}
+
+[data-research-workspace-toolbar] .research-stop-entry,
+[data-research-workspace-toolbar] .research-resume-entry {
+  min-width: 0;
+  flex-shrink: 1;
+}
+
+[data-research-workspace-toolbar] .research-stop-feedback {
+  flex: 0 1 auto;
+}
+
+[data-research-workspace-toolbar] .research-view-switch {
+  box-sizing: border-box;
+  height: 32px;
+  align-items: center;
+  padding: 2px;
+}
+
+[data-research-workspace-toolbar] .research-view-option {
+  box-sizing: border-box;
+  min-width: 0;
+  height: 26px;
+  min-height: 26px;
+  padding: 0 9px;
+  line-height: 18px;
+}
+
+[data-research-workspace-toolbar] .research-view-option > svg {
+  flex: none;
+}
+
+[data-research-workspace-toolbar] button:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 2px;
+}
+
+@container (max-width: 760px) {
+  [data-research-workspace-toolbar] .research-focus-toolbar-actions { gap: 6px; }
+  [data-research-workspace-toolbar] .research-team-pill--focus { max-width: 136px; }
+  [data-research-workspace-toolbar] .research-stop-feedback { max-width: 88px; }
+}
+
+@container (max-width: 600px) {
+  [data-research-workspace-toolbar] { gap: 6px; padding-inline: 10px; }
+  [data-research-workspace-toolbar] .research-focus-toolbar-actions { gap: 4px; }
+  [data-research-workspace-toolbar] .research-team-pill--focus {
+    width: 32px;
+    max-width: 32px;
+    justify-content: center;
+    gap: 0;
+    padding: 0;
+  }
+  [data-research-workspace-toolbar] .research-team-pill--focus > svg:first-child { display: block; color: var(--text-main); }
+  [data-research-workspace-toolbar] .research-team-pill-chevron { display: none; }
+  [data-research-workspace-toolbar] .research-view-option { width: 28px; justify-content: center; gap: 0; padding: 0; }
+  [data-research-workspace-toolbar] .research-team-focus-identity,
+  [data-research-workspace-toolbar] .research-view-option > span,
+  [data-research-workspace-toolbar] .research-focus-toolbar-actions > .research-status > span,
+  [data-research-workspace-toolbar] .research-button:has(svg) > span {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+    white-space: nowrap;
+  }
+  [data-research-workspace-toolbar] .research-button:has(svg) { width: 32px; gap: 0; padding: 0; }
+  [data-research-workspace-toolbar] .research-stop-feedback { max-width: 64px; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  [data-research-workspace-toolbar] .research-view-option { transition: none; }
+}

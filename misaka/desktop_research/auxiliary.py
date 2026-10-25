@@ -34,7 +34,7 @@ def install_auxiliary_factories(owner, overrides, modules, classes):
         from misaka.utils.values import read_field
 
         from .runtime import wait_model_ready
-        binding = await wait_model_ready(owner.policy, read_field(context, 'signal'))
+        binding = await wait_model_ready(owner.policy, read_field(context, 'signal'), role=owner.role)
         registry = read_field(context, 'modelRegistry')
         selected = registry.find(binding['provider'], binding['modelId']) if registry else None
         processed = await process_image(body, 'image/png')

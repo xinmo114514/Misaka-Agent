@@ -1,6 +1,8 @@
+import { beginResearchControl } from './researchActivityStore'
 import type { BridgeMessage } from '../types/global'
 import { request } from './bridge'
-import type { ResearchHostSnapshot, ResearchRunDetail } from '../types/research'
+import { rendererDiagnostics } from './rendererDiagnostics'
+import type { ResearchHostSnapshot, ResearchRunDetail, ResearchFailureMetadata, ResearchFailureDetails } from '../types/research'
 
 type Pending = {
   resolve: (message: BridgeMessage) => void
@@ -17,7 +19,7 @@ let sequence = 0
 let installed = 0
 let unsubscribe: (() => void) | null = null
 
-type ResearchErrorDetails = {
+type ResearchErrorDetails = ResearchFailureMetadata & {
   requestId: string
   errorCode?: string
   errorStage?: string
@@ -33,6 +35,8 @@ export class ResearchRequestError extends Error {
   readonly requestId: string
   readonly sessionId?: string
   readonly streamId?: string
+  readonly errorDetails?: ResearchFailureDetails
+  readonly researchNeedsConfiguration?: boolean
 
   constructor(message: string, details: ResearchErrorDetails) {
     super(message)
@@ -43,6 +47,8 @@ export class ResearchRequestError extends Error {
     this.requestId = details.requestId
     this.sessionId = details.sessionId
     this.streamId = details.streamId
+    this.errorDetails = details.errorDetails
+    this.researchNeedsConfiguration = details.researchNeedsConfiguration
   }
 }
 
@@ -119,6 +125,8 @@ export function requestResearch<T = any>(type: string, payload: Record<string, u
           errorCode: typeof message.errorCode === 'string' ? message.errorCode : undefined,
           errorStage: typeof message.errorStage === 'string' ? message.errorStage : undefined,
           retryable: typeof message.retryable === 'boolean' ? message.retryable : undefined,
+          errorDetails: message.errorDetails,
+          researchNeedsConfiguration: typeof message.researchNeedsConfiguration === 'boolean' ? message.researchNeedsConfiguration : undefined,
           sessionId: typeof message.sessionId === 'string' ? message.sessionId : waiter.sessionId,
           streamId: typeof message.streamId === 'string' ? message.streamId : waiter.streamId,
         }))
@@ -146,7 +154,7 @@ export function addResearchSink(handler: (message: BridgeMessage) => void): () =
 export async function executeResearchControl(
   type: 'stop_research' | 'resume_research',
   input: { runId: string; workspace?: string; sessionFile?: string | null; clarification?: string;
-    onBound?: (snapshot: ResearchHostSnapshot) => void },
+    onBound?: (snapshot: ResearchHostSnapshot) => void; isCurrent?: () => boolean },
 ): Promise<void> {
   let sessionFile = input.sessionFile
   let workspace = input.workspace
@@ -156,18 +164,29 @@ export async function executeResearchControl(
     workspace = detail.run?.workspace || workspace
   }
   if (!sessionFile || !workspace) throw new Error('研究根会话尚未登记，请刷新研究状态。')
+  if (input.isCurrent && !input.isCurrent()) return
   const host = await window.app.startResearchBridge({ cwd: workspace, sessionFile })
+  if (input.isCurrent && !input.isCurrent()) return
   if (!host.enabled || !host.session?.sessionId || !host.session.file) throw new Error('研究控制宿主尚未就绪，请重新打开原研究。')
   input.onBound?.({ ...host, messages: host.messages ?? [], historyVersion: host.historyVersion ?? null,
     lastEventSeq: host.lastEventSeq ?? 0, run: host.run ?? null })
+  if (input.isCurrent && !input.isCurrent()) return
+  beginResearchControl(input.runId)
   await requestResearch(type, { runId: input.runId, clarification: input.clarification,
     sessionId: host.session.sessionId, ...(host.streamId ? { streamId: host.streamId } : {}) })
+  // An acknowledgement only means the command was received. A resume is accepted once the
+  // observation chain reports a live driver (`researchResume.confirmResearchDriving`), so a
+  // rejected or unheard resume cannot flip the card to active.
 }
 
 export function installResearchBridge(): () => void {
   installed += 1
   if (installed === 1 && typeof window !== 'undefined' && window.researchBridge?.on) {
     unsubscribe = window.researchBridge.on(message => {
+      // Arrival is timed here, before any work: the queue's own record says when it was applied.
+      const stamped = message as { mainBytes?: unknown; seq?: unknown }
+      rendererDiagnostics().noteArrival(typeof stamped.mainBytes === 'number' ? stamped.mainBytes : 0,
+        typeof stamped.seq === 'number' ? stamped.seq : undefined)
       if ('type' in message && message.type === 'ack' && typeof message.requestId === 'string') {
         const waiter = pending.get(message.requestId)
         if (waiter) {

@@ -5,6 +5,7 @@ describe('session view identity', () => {
   it('files reading state under the transcript that is actually displayed', () => {
     expect(selectSessionViewKey({ agentMode: 'agent', currentSessionPath: 'a.jsonl', researchBinding: null })).toBe('a.jsonl')
     expect(selectSessionViewKey({ agentMode: 'research', currentSessionPath: 'a.jsonl', researchBinding: { sessionFile: 'research.jsonl' } })).toBe('research.jsonl')
+    expect(selectSessionViewKey({ agentMode: 'research', currentSessionPath: 'a.jsonl', researchBinding: { sessionFile: 'research.jsonl' }, researchPageView: 'new' })).toBe('research:new')
     expect(selectSessionViewKey({ agentMode: 'research', currentSessionPath: 'a.jsonl', researchBinding: null })).toBe('a.jsonl')
   })
 })

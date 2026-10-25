@@ -2,6 +2,7 @@
 started ran the failed run again, its turns spent for a stop (0.18.10 sweep)."""
 import asyncio
 from contextlib import asynccontextmanager, closing
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -57,3 +58,35 @@ async def test_stopping_a_run_that_has_ended_drives_nothing(board, tmp_path, mon
     await part._cleanup({}, ctx)
     assert opened == [] and "already failed" in notices[0][0]
     assert runs.get(board, run["id"])["last_error"] == "earlier failure"
+
+
+async def test_resuming_a_done_run_with_final_artifact_delivers_report(board, tmp_path, monkeypatch):
+    monkeypatch.setattr(research, "_con", lambda: board)
+    monkeypatch.setattr(research, "_cfg", lambda: {"db": str(tmp_path / "board.db"), "roles_root": str(tmp_path)})
+    monkeypatch.delenv("MISAKA_NET_PANE", raising=False)
+
+    run = runs.create(board, workspace=str(tmp_path), question="Completed research question")
+    report_file = tmp_path / "report.md"
+    report_file.write_text("# Complete report content", encoding="utf-8")
+    import hashlib
+    aid, _ = runs.register_file(board, run["id"], "report", "Final Report", str(report_file),
+                             sha256=hashlib.sha256(b"# Complete report content").hexdigest())
+    runs.set_state(board, run["id"], status="done", phase="done", final_artifact=aid)
+
+    sent = []
+    part = research.ResearchPart()
+    part.attach(SimpleNamespace(moments=SimpleNamespace(
+        send_message=lambda payload, options: sent.append((payload, options)), send_user_message=lambda t: None)))
+    # Task 4: redelivery is owned by the run's saved root conversation. The window that asks
+    # must be that conversation (a foreign window is refused before anything is sent).
+    root = Path(run["root_session"]) if run["root_session"] else tmp_path / "root.jsonl"
+    ctx = SimpleNamespace(cwd=str(tmp_path), isIdle=lambda: True,
+                          sessionManager=SimpleNamespace(sessionId="s", sessionFile=str(root)),
+                          ui=SimpleNamespace(notify=lambda text, kind: None))
+
+    await part.commands[0].handler(f"resume {run['id']}", ctx)
+    assert len(sent) == 1
+    msg, opts = sent[0]
+    assert msg["customType"] == "research-final"
+    assert "Complete report content" in msg["content"]
+    assert opts["_deliveryId"] == f"research-final:{run['id']}:{aid}"

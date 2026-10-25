@@ -1,4 +1,5 @@
 import type { ResolvedThemeData } from '../theme/types'
+import type { ResearchFailureMetadata } from './research'
 
 export interface BridgeEventEnvelope {
   seq: number
@@ -10,7 +11,7 @@ export interface BridgeEventEnvelope {
   }
 }
 
-export interface BridgeAck {
+export interface BridgeAck extends ResearchFailureMetadata {
   type: 'ack'
   requestId: string | null
   ok: boolean
@@ -65,10 +66,21 @@ export interface AppAPI {
     run?: { id: string; status: string; phase: string } | null
     team?: import('./research').DesktopResearchTeam | null
     modelBinding?: import('./research').ResearchModelBinding | null
+    modelBindings?: import('./research').ResearchTeamSnapshot['modelBindings']
   }>
-  setResearchActive: (state: boolean | { active: boolean; pendingCount: number }) => void
-  onRequestClose?: (handler: () => void) => () => void
+  /** Each field updates only the part of the main process's close state it names; absent fields keep. */
+  setResearchActive: (state: boolean | { active?: boolean; pendingCount?: number; pendingStart?: boolean }) => void
+  onRequestClose?: (handler: (request: { closeRequestId: number }) => void) => () => void
+  /** Sent once the renderer's own close dialog is actually in the DOM. */
+  reportClosePresented?: (closeRequestId: number) => void
+  /** Sent when that dialog went away without a decision, so a later close is possible again. */
+  reportCloseCancelled?: (closeRequestId: number) => void
   confirmClose?: (action: 'tray' | 'quit') => Promise<void>
+}
+
+/** One-way push of bounded shell diagnostics; the renderer is sandboxed and cannot touch a file. */
+export interface DiagnosticsAPI {
+  report: (records: Record<string, unknown>[]) => void
 }
 
 export interface PathActionResult {
@@ -82,5 +94,6 @@ declare global {
     researchBridge: BridgeAPI
     theme: ThemeAPI
     app: AppAPI
+    diagnostics?: DiagnosticsAPI
   }
 }

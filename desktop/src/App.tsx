@@ -1,3 +1,5 @@
+import { retainResearchActivity } from './lib/researchActivityStore'
+import { EMPTY_RESEARCH_MESSAGES } from './lib/researchView'
 import React, { useEffect, useRef, useState } from 'react'
 import { Group, Panel, Separator } from 'react-resizable-panels'
 import type { PanelImperativeHandle } from 'react-resizable-panels'
@@ -24,8 +26,11 @@ import {
   PanelLeftOpen,
 } from 'lucide-react'
 import { useTheme } from './theme/useTheme'
-import { addSink, installBridge, onEvent, request } from './lib/bridge'
+import { addSink, installBridge, onEvent } from './lib/bridge'
 import { addResearchSink, installResearchBridge } from './lib/researchBridge'
+import { researchSessionsBridge } from './lib/researchSessionsBridge'
+import { observeResearchDriving } from './lib/researchResumeObservation'
+import { observeResearchStop } from './lib/researchStopObservation'
 import { normalizeWorkspacePath, projectNameForCwd, useSessionStore } from './store/useSessionStore'
 import { useSettingsStore } from './store/useSettingsStore'
 import { clipboardErrorMessage, copyTextToClipboard } from './lib/clipboard'
@@ -35,6 +40,12 @@ import { Timeline } from './components/Timeline/Timeline'
 import { Composer } from './components/Composer/Composer'
 import { PermissionDialog } from './components/Permission/PermissionDialog'
 import { ResearchGraphCanvas } from './components/ResearchGraph/ResearchGraphCanvas'
+import { ResearchTilingWorkspace } from './components/ResearchWorkspace/ResearchTilingWorkspace'
+import { ResearchTeamNavigator } from './components/ResearchWorkspace/ResearchTeamNavigator'
+import { resolveMainSession, rootControllerId } from './components/ResearchWorkspace/researchTeam'
+import { useResearchRunStore } from './store/useResearchRunStore'
+import { useResearchWorkspaceStore } from './store/useResearchWorkspaceStore'
+import { readResearchViewMode, saveResearchViewMode, type ResearchViewMode } from './lib/researchViewMode'
 import { ResearchTaskDrawer } from './components/Timeline/ResearchTaskDrawer'
 import { ResearchGraphModal } from './components/Timeline/ResearchGraphModal'
 import { ResearchHistoryDialog } from './components/Timeline/ResearchHistoryDialog'
@@ -48,7 +59,8 @@ import { CloseConfirmDialog } from './components/CloseConfirmDialog'
 export default function App() {
   useTheme()
   const [viewMode, setViewMode] = useState<'timeline' | 'graph' | 'settings'>('timeline')
-  const [closeConfirmOpen, setCloseConfirmOpen] = useState(false)
+  /** The close request the in-page dialog is answering; its id fences a late main-process reply. */
+  const [closeRequest, setCloseRequest] = useState<{ closeRequestId: number } | null>(null)
   const [copyNotice, setCopyNotice] = useState<{ kind: 'pending' | 'success' | 'error'; text: string } | null>(null)
   const [exportNotice, setExportNotice] = useState<{ kind: 'pending' | 'success' | 'error'; text: string; path?: string } | null>(null)
   const [isExporting, setIsExporting] = useState(false)
@@ -61,16 +73,19 @@ export default function App() {
     saveSidebarVisible(next)
     return next
   })
-  const currentTitle = useSessionStore(s => s.agentMode === 'research' && s.researchBinding ? s.researchCards[s.researchBinding.runId || '']?.question || '研究对话' : s.currentTitle)
+  const currentTitle = useSessionStore(s => s.agentMode === 'research' ? (s.researchPageView === 'new' ? '新研究' : (s.researchBinding ? s.researchCards[s.researchBinding.runId || '']?.question || '研究对话' : '新研究')) : s.currentTitle)
   const currentWorkspace = useSessionStore((s) => s.currentWorkspace)
   const recentWorkspaces = useSessionStore((s) => s.recentWorkspaces)
   const switchWorkspace = useSessionStore((s) => s.switchWorkspace)
   const openWorkspaceDialog = useSessionStore((s) => s.openWorkspaceDialog)
   const handleBridgeMessage = useSessionStore((s) => s.handleBridgeMessage)
-  const handleResearchBridgeMessage = useSessionStore(s => s.handleResearchBridgeMessage)
+  const handleResearchBridgeMessage = useSessionStore(s => s.ingestResearchBridgeMessage)
   const researchTeamModelBinding = useSessionStore(s => s.researchModelBinding)
   const researchTeamSessionId = useSessionStore(s => s.researchBinding?.sessionId)
-  const researchScene = useSessionStore(s => s.agentMode === 'research')
+  const researchObservationRunId = useSessionStore(s => s.researchBinding?.runId)
+  const researchObservationWorkspace = useSessionStore(s => s.researchBinding?.workspace)
+  const researchObservationStream = useSessionStore(s => s.researchBinding?.streamId)
+  const researchScene = useSessionStore(s => s.agentMode === 'research' && s.researchPageView !== 'new')
   const applyResearchModelBinding = useSettingsStore(s => s.applyResearchModelBinding)
   const fetchSessions = useSessionStore((s) => s.fetchSessions)
   const fetchSettingsData = useSettingsStore((s) => s.fetchInitialData)
@@ -80,15 +95,25 @@ export default function App() {
 
   // Native window close events must reach the renderer even during a research run.
   useEffect(() => {
-    return window.app?.onRequestClose?.(() => {
+    return window.app?.onRequestClose?.((request) => {
       const action = useSettingsStore.getState().closeWindowAction
       if (action === 'tray' || action === 'quit') {
+        // No dialog of our own, but the page is answering: say so before the main process
+        // escalates to its native box.
+        window.app?.reportClosePresented?.(request.closeRequestId)
         void window.app?.confirmClose?.(action)
-      } else {
-        setCloseConfirmOpen(true)
+        return
       }
+      setCloseRequest(request)
     })
   }, [])
+
+  // Only after the dialog is in the DOM -- "the page will handle it" must not be said about a
+  // dialog that failed to paint.
+  useEffect(() => {
+    if (!closeRequest) return
+    window.app?.reportClosePresented?.(closeRequest.closeRequestId)
+  }, [closeRequest])
 
   useEffect(() => {
     if (researchScene && researchTeamSessionId && researchTeamModelBinding) {
@@ -158,6 +183,7 @@ export default function App() {
     const stopSession = addSink(handleBridgeMessage)
     const stopSettings = addSink(handleSettingsBridgeMessage)
     const stopResearch = addResearchSink(handleResearchBridgeMessage)
+    const stopResearchSessions = researchSessionsBridge.listen()
     // The engine clamps a requested level to what the model supports and can change the
     // level on its own (a model switch, the TUI, /think). Mirror what it settled on.
     const stopThinking = onEvent('thinking_level_changed', (ev: { level?: unknown }) => {
@@ -169,30 +195,22 @@ export default function App() {
       stopSession()
       stopSettings()
       stopResearch()
+      stopResearchSessions()
       stopThinking()
       dispose()
       disposeResearch()
     }
   }, [handleBridgeMessage, handleResearchBridgeMessage, handleSettingsBridgeMessage, fetchSettingsData, fetchSessions])
 
-  // Research can outlive the current chat or workspace, so its close state is board-wide.
+  // One board-wide refresh owner is shared by history, pills and the workbench.
+  useEffect(() => retainResearchActivity(), [])
+  // A resume is only accepted once the existing observation chain sees a live driver.
+  useEffect(() => observeResearchDriving(), [])
+  // A stop is only finished once the same chain sees the run at rest (stopped + no lease, or any terminal).
+  useEffect(() => observeResearchStop(), [])
   useEffect(() => {
-    let live = true
-    const refreshResearchActivity = async () => {
-      try {
-        const result = await request<{ runs?: Array<{ status?: string; phase?: string; pending_options?: number }> }>('get_active_research_runs')
-        if (live) {
-          const activeRuns = result.runs || []
-          const pendingCount = activeRuns.reduce((total, run) => total +
-            Number(run.pending_options || 0) + Number(run.status === 'waiting_input' || run.phase === 'awaiting_approval'), 0)
-          window.app?.setResearchActive({ active: Boolean(activeRuns.length), pendingCount })
-        }
-      } catch { /* retain the last known close state through a brief bridge interruption */ }
-    }
-    void refreshResearchActivity()
-    const timer = window.setInterval(() => void refreshResearchActivity(), 4000)
-    return () => { live = false; window.clearInterval(timer) }
-  }, [])
+    if (researchObservationRunId) return researchSessionsBridge.retain(researchObservationRunId, researchObservationWorkspace)
+  }, [researchObservationRunId, researchObservationWorkspace, researchObservationStream])
 
   const currentSessionId = useSessionStore((s) => s.currentSessionId)
   const activeSessionId = useSessionStore(s => s.activeSessionId)
@@ -415,14 +433,28 @@ export default function App() {
     setViewMode('settings')
   }
 
-  const messages = useSessionStore(s => s.agentMode === 'research' && s.researchBinding ? s.researchConversation.messages : s.messages)
+  const messages = useSessionStore(s => s.agentMode === 'research' ? (s.researchPageView === 'new' ? EMPTY_RESEARCH_MESSAGES : s.researchConversation.messages) : s.messages)
   const isStreaming = useSessionStore(s => s.agentMode === 'research' && s.researchBinding ? s.researchConversation.isStreaming : s.isStreaming)
   // A research conversation is never the empty welcome state: once its own host is bound -- or a
   // start is still being created there -- the surface belongs to that host, whose run may exist
   // while its first transcript row has not landed yet. Falling back to the welcome page hid a
   // live research conversation behind the composer.
   const researchSurface = useSessionStore(s => s.agentMode === 'research' && (Boolean(s.researchBinding) || Boolean(s.researchPendingCreationRequestId)))
+  const tilingBinding = useSessionStore(s => s.agentMode === 'research' && s.researchPageView !== 'new' && s.researchBinding?.runId ? s.researchBinding : null)
+  // The research layout is a page-level fact: the header pill, the workspace and the composer all
+  // read the same choice, so the composer can only go compact when the tile grid is on screen.
+  const researchRun = useResearchRunStore(s => tilingBinding?.runId ? s.runs[tilingBinding.runId] : undefined)
+  const researchView = useResearchWorkspaceStore(s => tilingBinding?.runId ? s.byRun[tilingBinding.runId] : undefined)
+  // Resolve the active run during render: a passive adoption effect exposes the old run's chrome
+  // for one commit. New runs use the current preference rather than the previous run's layout.
+  const researchViewMode = researchView?.viewMode ?? readResearchViewMode()
+  const switchResearchViewMode = (next: ResearchViewMode) => {
+    saveResearchViewMode(next)
+    if (tilingBinding?.runId) useResearchWorkspaceStore.getState().setViewMode(tilingBinding.runId, next)
+  }
+  const researchCurrentId = researchRun ? resolveMainSession(researchRun, researchView?.selectedNodeId ?? researchRun.graph.nodes[0]?.id ?? null, researchView?.mainExecutorId)?.executorId ?? null : null
   const isWelcome = viewMode === 'timeline' && !researchSurface && messages.length === 0 && !isSessionLoading && !isStreaming && !sessionLoadError
+  const isResearchWorkspace = viewMode === 'timeline' && Boolean(tilingBinding?.runId)
   // Render the existing switcher in exactly one place so its ref and menu stay shared.
   const workspaceSwitcher = (
     <div className="relative" ref={workspaceMenuRef}>
@@ -669,8 +701,10 @@ export default function App() {
               <SettingsPage onClose={() => setViewMode('timeline')} />
             ) : (
               <>
+                {/* Background research now lives in the sidebar, where it stays reachable from
+                    any session or research page instead of only above the conversation. */}
                 {/* Top Workspace Header */}
-                <div className="misaka-glass-chrome relative z-40 flex items-center justify-between px-4 h-11 select-none shrink-0">
+                {!isResearchWorkspace && <div data-workspace-header className="misaka-glass-chrome relative z-40 flex items-center justify-between px-4 h-11 select-none shrink-0">
                   {/* Task & Workspace Interactive Breadcrumb */}
                   <div className="flex items-center gap-1.5 font-medium text-text-main text-[13px] truncate min-w-0">
                     {/* Workspace Dropdown Button */}
@@ -687,6 +721,25 @@ export default function App() {
                           DAG 拓扑
                         </span>
                       )}
+                      {/* The run's team, where an ordinary chat exposes its sub-agents: a count
+                          that opens the directory. The transcript itself never moves in here. */}
+                      {tilingBinding?.runId && researchRun && <ResearchTeamNavigator
+                        listing={researchRun}
+                        currentId={researchCurrentId}
+                        onOpenMain={descriptor => {
+                          useResearchWorkspaceStore.getState().setMainExecutor(tilingBinding!.runId!, descriptor.executorId)
+                          // "Open in the main area" needs the main-area layout: the tile grid has no
+                          // single reading column to put the choice in.
+                          switchResearchViewMode('focus')
+                        }}
+                        onOpenSide={descriptor => {
+                          useResearchWorkspaceStore.getState().setSideExecutor(tilingBinding!.runId!, descriptor.executorId)
+                          switchResearchViewMode('focus')
+                        }}
+                        onReturnToMain={() => {
+                          useResearchWorkspaceStore.getState().setMainExecutor(tilingBinding!.runId!, rootControllerId(researchRun))
+                          useResearchWorkspaceStore.getState().setSideExecutor(tilingBinding!.runId!, null)
+                        }} />}
                     </div>
                   </div>
 
@@ -775,7 +828,7 @@ export default function App() {
                       )}
                     </div>
                   </div>
-                </div>
+                </div>}
 
                 {(copyNotice || exportNotice) && <div role={(copyNotice?.kind === 'error' || exportNotice?.kind === 'error') ? 'alert' : 'status'} className={`mx-4 mb-2 flex items-center justify-between gap-3 rounded-lg border px-3 py-2 text-xs ${(copyNotice?.kind === 'error' || exportNotice?.kind === 'error') ? 'bg-danger-surface text-danger border-danger-border' : (copyNotice?.kind === 'success' || exportNotice?.kind === 'success') ? 'bg-success-surface text-success border-success-border' : 'bg-surface-2 text-muted border-border-subtle'}`}>
                   <span className="min-w-0 truncate">{copyNotice?.text || exportNotice?.text}</span>
@@ -797,13 +850,16 @@ export default function App() {
 
                 {/* Main Content Area: conversation, with the session tree as a right column */}
                 <div className="flex min-h-0 flex-1">
-                  <div data-conversation-viewport data-welcome={isWelcome || undefined} className="relative flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
+                  <div data-conversation-viewport data-welcome={isWelcome || undefined} data-research-workspace={tilingBinding?.runId || undefined} data-research-view-mode={tilingBinding?.runId ? researchViewMode : undefined} className="relative flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
                     {viewMode === 'graph' ? (
                       <ResearchGraphCanvas />
                     ) : (
                       <>
-                        <Timeline />
-                        <Composer welcome={isWelcome} workspaceControl={workspaceSwitcher} onOpenModelSettings={openModelSettings} onResearchStarted={() => setViewMode('timeline')} />
+                        {tilingBinding?.runId ? <ResearchTilingWorkspace runId={tilingBinding.runId} workspace={tilingBinding.workspace}
+                          mode={researchViewMode} onModeChange={switchResearchViewMode}
+                          chromeActions={{ currentWorkspace, recentWorkspaces, onSwitchWorkspace: switchWorkspace,
+                            onOpenWorkspaceDialog: openWorkspaceDialog, onOpenSettings: openModelSettings }} /> : <Timeline />}
+                        <Composer welcome={isWelcome} presentation={tilingBinding?.runId && researchViewMode === 'multi' ? 'multi' : 'default'} workspaceControl={workspaceSwitcher} onOpenModelSettings={openModelSettings} onResearchStarted={() => setViewMode('timeline')} />
                       </>
                     )}
                   </div>
@@ -859,7 +915,15 @@ export default function App() {
       <PermissionDialog />
       <ResearchGraphModal />
       <ResearchHistoryDialog />
-      <CloseConfirmDialog open={closeConfirmOpen} onClose={() => setCloseConfirmOpen(false)} />
+      <CloseConfirmDialog
+        open={closeRequest !== null}
+        onClose={() => {
+          const requestId = closeRequest?.closeRequestId
+          setCloseRequest(null)
+          // The window close is available again: hand the decision back to the main process.
+          if (requestId !== undefined) window.app?.reportCloseCancelled?.(requestId)
+        }}
+      />
     </div>
   )
 }

@@ -215,9 +215,11 @@ def create(con, workspace, title, body, assignee, *, reviewer=None, model=None,
 def _rewrite(workspace, task_id, mutate):
     """Read-modify-write under a per-card lock: two processes (a pane and Last Order) editing
     one card never lose each other's change."""
-    from filelock import FileLock
+    from misaka.core.platform.card_publication import lock_cards
     path = card_path(workspace, task_id)
-    with FileLock(os.path.join(tasks.task_state_dir(task_id), "card.lock")):   # outside the tracked tree
+    with lock_cards([task_id]):  # reuse a lifecycle's already-held lock
+        from misaka.core.platform.card_publication import invalidate_preparation
+        invalidate_preparation(task_id)  # append-log/body edits still use their native serialization
         card = read(path)
         fields, body = mutate(card["fields"], card["body"])
         _write_file(path, _dump(fields, body))
@@ -462,6 +464,11 @@ def reconcile_one(con, workspace, task_id):
     """
     workspace = tasks.canonical_workspace(workspace)
     path = _card_path(workspace, task_id)
+    from misaka.core.platform import card_publication
+    if card_publication.journal_path(path).exists():
+        outcome = card_publication.settle(con, workspace, task_id)
+        if outcome in {"pending", "conflict"}:
+            return None
     try:
         info = os.stat(path, follow_symlinks=False)     # lstat: a symlinked card is not a card
     except OSError:
@@ -575,6 +582,10 @@ def reconcile(con, workspace):
     satisfied dependency.
     """
     workspace = tasks.canonical_workspace(workspace)
+    # A crashed card projection must be settled before the index is derived, or the stale
+    # at-rest status would be read back into the board (Task 3).
+    from misaka.core.platform import card_publication
+    card_publication.recover_pending(con, workspace)
     contracts = {}
     for task_id, _path in iter_cards(workspace):
         card = reconcile_one(con, workspace, task_id)

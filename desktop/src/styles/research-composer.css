@@ -1,0 +1,149 @@
+/* The multi research dock is in flow, while all default/focus composers retain their
+   original floating treatment. The card itself supplies the query width. */
+[data-research-view-mode="multi"] > .conversation-composer-dock {
+  position: relative;
+  inset: auto;
+  width: 100%;
+  flex: none;
+  min-width: 0;
+  padding: 8px 12px;
+  border-top: 0;
+  background: transparent;
+}
+[data-research-view-mode="multi"] > .conversation-composer-dock::before { display: none; }
+[data-research-view-mode="multi"] .conversation-composer-shell {
+  width: 100%;
+  max-width: 1120px;
+  min-width: 0;
+  margin-inline: auto;
+  container: research-composer / inline-size;
+}
+
+.conversation-composer[data-composer-presentation="multi"] {
+  max-width: none;
+  min-width: 0;
+  padding: 8px 12px;
+  border-radius: 16px;
+  gap: 6px;
+  box-shadow: 0 3px 12px -6px color-mix(in srgb, var(--shadow-ink) 20%, transparent);
+}
+.conversation-composer.misaka-glass-panel[data-composer-presentation="multi"]:focus-within {
+  border-color: var(--border-accent);
+  box-shadow: 0 3px 12px -6px color-mix(in srgb, var(--shadow-ink) 20%, transparent),
+    0 0 0 2px color-mix(in srgb, var(--focus-ring) 45%, transparent);
+}
+.conversation-composer[data-composer-presentation="multi"] textarea {
+  max-height: 88px;
+  min-height: 28px;
+}
+.conversation-composer[data-composer-presentation="multi"] textarea::placeholder {
+  color: color-mix(in srgb, var(--text-main) 75%, var(--surface-1));
+}
+.conversation-composer[data-composer-presentation="multi"] .conversation-composer-toolbar {
+  border-top: 0;
+  padding-top: 0;
+  gap: 6px;
+  flex-wrap: nowrap;
+  min-width: 0;
+  justify-content: flex-start;
+}
+.conversation-composer[data-composer-presentation="multi"] .conversation-composer-context-controls,
+.conversation-composer[data-composer-presentation="multi"] .conversation-composer-operation-controls {
+  gap: 6px;
+  min-width: 0;
+  flex-wrap: nowrap;
+}
+.conversation-composer[data-composer-presentation="multi"] .conversation-composer-operation-controls {
+  margin-left: auto;
+}
+.conversation-composer[data-composer-presentation="multi"] .conversation-composer-context-controls > button:first-child {
+  width: 32px;
+  height: 32px;
+  flex: none;
+}
+.conversation-composer[data-composer-presentation="multi"] .conversation-permission-trigger,
+.conversation-composer[data-composer-presentation="multi"] .conversation-model-trigger,
+.conversation-composer[data-composer-presentation="multi"] .conversation-new-research-trigger {
+  height: 32px;
+  min-width: 0;
+  padding: 0 8px;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text-main);
+  font-size: 12px;
+  font-weight: 400;
+  box-shadow: none;
+  white-space: nowrap;
+}
+.conversation-composer[data-composer-presentation="multi"] .conversation-permission-trigger > span,
+.conversation-composer[data-composer-presentation="multi"] .conversation-permission-trigger > svg:first-child {
+  color: inherit;
+}
+.conversation-composer[data-composer-presentation="multi"] .conversation-permission-trigger:hover,
+.conversation-composer[data-composer-presentation="multi"] .conversation-model-trigger:hover,
+.conversation-composer[data-composer-presentation="multi"] .conversation-new-research-trigger:hover,
+.conversation-composer[data-composer-presentation="multi"] .conversation-permission-trigger:focus-visible,
+.conversation-composer[data-composer-presentation="multi"] .conversation-model-trigger:focus-visible,
+.conversation-composer[data-composer-presentation="multi"] .conversation-new-research-trigger:focus-visible,
+.conversation-composer[data-composer-presentation="multi"] .conversation-permission-trigger[aria-expanded="true"],
+.conversation-composer[data-composer-presentation="multi"] .conversation-model-trigger[aria-expanded="true"] {
+  background: var(--surface-hover);
+  color: var(--text-main);
+}
+.conversation-composer[data-composer-presentation="multi"] .conversation-model-trigger {
+  justify-content: flex-start;
+}
+.conversation-composer[data-composer-presentation="multi"] .conversation-model-trigger > span:first-child {
+  max-width: 140px;
+}
+.conversation-composer[data-composer-presentation="multi"] .conversation-send-button,
+.conversation-composer[data-composer-presentation="multi"] .conversation-stop-button {
+  box-shadow: none;
+}
+
+@container research-composer (width < 600px) {
+  .conversation-composer[data-composer-presentation="multi"] .conversation-model-trigger > span:first-child { max-width: 100px; }
+  /* Streaming adds send options, and pending feedback can widen the right group.
+     Split before the two flex groups collide at intermediate card widths. */
+  .conversation-composer[data-composer-dense-operations="true"] .conversation-composer-toolbar {
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr);
+    gap: 4px;
+  }
+  .conversation-composer[data-composer-dense-operations="true"] .conversation-composer-context-controls {
+    grid-row: 1;
+    grid-column: 1;
+  }
+  .conversation-composer[data-composer-dense-operations="true"] .conversation-new-research-trigger {
+    grid-row: 1;
+    grid-column: 2;
+    justify-self: start;
+  }
+  .conversation-composer[data-composer-dense-operations="true"] .conversation-composer-operation-controls {
+    grid-row: 2;
+    grid-column: 1 / -1;
+    margin-left: 0;
+    justify-content: flex-end;
+  }
+}
+@container research-composer (width < 420px) {
+  .conversation-composer[data-composer-presentation="multi"] .conversation-model-trigger {
+    width: 32px;
+    padding: 0;
+    justify-content: center;
+  }
+  .conversation-composer[data-composer-presentation="multi"] .conversation-model-trigger > span:first-child,
+  .conversation-composer[data-composer-presentation="multi"] .conversation-model-trigger > svg:last-child { display: none; }
+  .conversation-composer[data-composer-presentation="multi"] .conversation-model-trigger > .conversation-model-compact-icon { display: block; }
+}
+@container research-composer (width < 360px) {
+  .conversation-composer[data-composer-presentation="multi"] .conversation-composer-toolbar {
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr);
+    gap: 4px;
+  }
+  .conversation-composer[data-composer-presentation="multi"] .conversation-composer-context-controls { grid-row: 1; grid-column: 1; }
+  .conversation-composer[data-composer-presentation="multi"] .conversation-new-research-trigger { grid-row: 1; grid-column: 2; justify-self: start; }
+  .conversation-composer[data-composer-presentation="multi"] .conversation-composer-operation-controls { grid-row: 2; grid-column: 1 / -1; margin-left: 0; justify-content: flex-end; }
+}

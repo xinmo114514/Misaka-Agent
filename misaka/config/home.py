@@ -111,6 +111,11 @@ LAYOUT: dict[str, Entry] = {
     "warnings_log": Entry("logs/misaka-warnings.log", "logs"),
     "panel_crash_log": Entry("logs/panel-crash.log", "logs"),
     "stall_logs": Entry("logs/stalls", "logs"),
+    # What the Electron shell writes about its own processes: main-process event timing, the
+    # renderer's long tasks, and unresponsive/gone signals. The shell has no Python in its startup
+    # path, so it resolves this row by name (`desktop/electron/diagnostics.ts`) rather than asking
+    # the bridge -- which is the very thing being diagnosed.
+    "desktop_diagnostics": Entry("logs/desktop-diagnostics", "logs"),
     "mcp_logs": Entry("logs/mcp", "logs"),
     "web_logs": Entry("logs/web", "logs"),
     "moa_traces": Entry("logs/moa-traces", "logs"),

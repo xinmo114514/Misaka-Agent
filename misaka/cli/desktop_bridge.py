@@ -6,17 +6,15 @@ import asyncio
 import json
 import os
 import signal
-import socket
 import sys
 import time
-import urllib.parse
 import uuid
 from collections import deque
 from typing import Any
 
 from misaka.ai.models import get_supported_thinking_levels
 from misaka.cli.desktop_attachments import prepare_attachments
-from misaka.config import get_agent_dir, get_auth_path, get_sessions_dir
+from misaka.config import get_agent_dir, get_auth_path, get_sessions_dir, home
 from misaka.config.product import current_config
 from misaka.core.custom_providers import (
     delete_custom_provider as remove_custom_provider,
@@ -82,28 +80,47 @@ def research_start_prompt(question: str, limits: dict[str, Any] | None = None) -
         ("--revisions", "max_revisions"), ("--max-nodes", "max_nodes"),
     )
     options = " ".join(f"{flag} {chosen[key]}" for flag, key in flags)
-    policy = "required" if approval is not False else "automatic"
+    for flag, key in (("--context-threshold", "context_threshold"), ("--max-output-tokens", "max_output_tokens")):
+        if key in chosen:
+            options += f" {flag} {chosen[key]}"
+    if approval is None:
+        from misaka.core.research import planner
+        approval = planner.plan_waits_for_user(current_config())
+    policy = "required" if approval else "automatic"
     return f"/research {options} --plan-approval {policy} -- {question.strip()}"
 
 
 def research_options_payload(config: dict[str, Any] | None = None) -> dict[str, Any]:
     """Expose the research engine's own limits/defaults to the workbench form."""
+    from misaka.core.research import options as research_options
     from misaka.core.research import planner, runs
 
     cfg = config if config is not None else current_config()
     sisters = planner.sister_catalog(cfg.get("profiles_root"))
     return {
-        "defaults": {**runs.DEFAULT_LIMITS,
+        "questions": research_options.questions(cfg),
+        "defaults": {**runs.DEFAULT_LIMITS, "context_threshold": None, "max_output_tokens": None,
                      "plan_approval": planner.plan_waits_for_user(cfg)},
         "constraints": {"max_depth": {"min": 0, "max": 12},
                         "max_nodes": {"min": 1, "max": runs.MAX_NODES_CEILING},
                         "parallel": {"min": 1}, "sister_parallel": {"min": 1},
                         "max_followups": {"min": 0, "max": 6},
-                        "max_revisions": {"min": 0, "max": 6}},
+                        "max_revisions": {"min": 0, "max": 6},
+                        "context_threshold": {"min": runs.MIN_CONTEXT_THRESHOLD, "max": runs.MAX_CONTEXT_THRESHOLD},
+                        "max_output_tokens": {"min": 1024}},
         "sisters": [{"id": str(item["id"]), "name": str(item.get("name") or item["id"]),
                      "description": str(item.get("description") or "")}
                     for item in sisters],
     }
+
+
+async def recover_research_report(session: Any, con: Any = None) -> str | None:
+    """The get_host/reconnect lane asks its owning native part to settle the report outbox."""
+    for part in getattr(getattr(session, 'moments', None), 'parts', ()):
+        recover = getattr(part, 'recover_final_report', None)
+        if recover is not None and getattr(part, 'session', None) is session:
+            return await recover(con)
+    return None
 
 
 def research_host_payload(session: Any, con: Any = None, *, last_event_seq: int = 0,
@@ -117,7 +134,9 @@ def research_host_payload(session: Any, con: Any = None, *, last_event_seq: int 
     version = (_history_version(path) if path and os.path.isfile(path)
                else f"{session.sessionId}:{getattr(manager, 'getLeafId', lambda: None)()}:{len(entries)}")
     run = session_run(session, con)
-    return {"enabled": any(isinstance(part, ResearchPart) for part in session.moments.parts),
+    from misaka.core.research.delivery import snapshot as delivery_snapshot
+    report_delivery = delivery_snapshot(con, run['id']) if con is not None and run is not None else None
+    return {"reportDelivery": report_delivery, "enabled": any(isinstance(part, ResearchPart) for part in session.moments.parts),
             "session": _session_started_payload(session),
             "stats": to_jsonable(session.getSessionStats()),
             "contextUsage": to_jsonable(session.getContextUsage()),
@@ -158,20 +177,6 @@ SESSION_COMMAND_ALIASES = {
     "forksession": "fork_session",
 }
 
-def _clean_broken_local_proxies() -> None:
-    for var in ("ALL_PROXY", "all_proxy", "HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy"):
-        val = os.environ.get(var)
-        if val and ("127.0.0.1" in val or "localhost" in val):
-            try:
-                parsed = urllib.parse.urlparse(val)
-                port = parsed.port or (7890 if "7890" in val else 8080)
-                host = parsed.hostname or "127.0.0.1"
-                with socket.create_connection((host, port), timeout=0.1):
-                    pass
-            except Exception:  # noqa: BLE001
-                os.environ.pop(var, None)
-
-
 def _serialize_session_info(s: SessionInfo) -> dict[str, Any]:
     created_str = (
         s.created.isoformat()
@@ -194,6 +199,7 @@ def _serialize_session_info(s: SessionInfo) -> dict[str, Any]:
         "allMessagesText": s.allMessagesText,
         "name": s.name,
         "parentSessionPath": s.parentSessionPath,
+        **({'desktopResearch': True} if getattr(s, 'desktopResearch', False) else {}),
         "fileRevision": _history_version(s.path) if os.path.isfile(s.path) else None,
     }
 
@@ -417,8 +423,9 @@ def _serialize_session_entries(entries: list[Any], *, submission_entries: list[A
         if original is not None and (message.get('role') == 'user'
                                     or message.get('customType') in {'research-question', 'research-input'}):
             message['researchSubmission'] = {key: original[key] for key in
-                ('text', 'sessionId', 'requestId', 'runId', 'limits') if key in original}
-    return messages
+                ('text', 'sessionId', 'requestId', 'runId', 'limits', 'startNew') if key in original}
+    from misaka.desktop_research.recruitment import project_history
+    return project_history(messages, entries if submission_entries is None else submission_entries)
 
 def _session_started_payload(session: Any) -> dict[str, Any]:
     manager = getattr(session, "sessionManager", None)
@@ -597,6 +604,30 @@ def _open_research_readonly() -> Any:
         con.close()
         return None
     return con
+
+
+def _read_research_session_query(obj: dict[str, Any], workspace: str | None) -> Any:
+    """Open/read/close on the I/O worker; large histories never block the model event loop."""
+    from misaka.core.research import desktop_view, runs
+    con = _open_research_readonly()
+    try:
+        run_id = str(obj.get("runId") or "")
+        run = runs.get(con, run_id) if con is not None else None
+        if run is None or os.path.normcase(os.path.realpath(run["workspace"])) != os.path.normcase(os.path.realpath(workspace or "")):
+            raise ValueError("No research run matches this project.")
+        if obj["type"] == "get_research_sessions":
+            result = desktop_view.sessions_payload(con, run_id)
+        elif obj["type"] == "get_research_session_history":
+            result = desktop_view.session_history(con, run_id, str(obj.get("executorId") or ""), cursor=obj.get("cursor"), limit=obj.get("limit") or 50)
+        else:
+            result = desktop_view.session_content(con, run_id, str(obj.get("executorId") or ""), str(obj.get("entryId") or ""),
+                field=obj.get("field") or "content", offset=obj.get("offset") or 0, limit=obj.get("limit") or desktop_view.EXECUTION_PREVIEW_BYTES)
+        if result is None:
+            raise ValueError("No execution instance belongs to this research run.")
+        return result
+    finally:
+        if con is not None:
+            con.close()
 
 
 def _open_research_write() -> Any:
@@ -864,6 +895,92 @@ def _serialize_custom_provider(provider_id: str, config: Any) -> dict[str, Any]:
     }
 
 
+def _ordinary_model_network_context(session: Any) -> tuple[str, dict[str, str] | None]:
+    """Current chat model endpoint and already-loaded env, with no auth operation."""
+    model = getattr(session, "model", None)
+    endpoint = str(getattr(model, "baseUrl", None) or "")
+    env = None
+    registry = _model_registry_of(session)
+    storage = getattr(registry, "authStorage", None)
+    provider = getattr(model, "provider", None)
+    runtime_overrides = getattr(storage, "runtimeOverrides", {}) if storage is not None else {}
+    loaded_api_key = runtime_overrides.get(provider)
+    stored = None
+    if storage is not None and provider and not runtime_overrides.get(provider):
+        stored = storage.get(provider)
+        if isinstance(stored, dict):
+            if stored.get("type") == "api_key":
+                loaded_api_key = stored.get("key")
+            candidate = stored.get("env")
+            if isinstance(candidate, dict):
+                env = {str(key): str(value) for key, value in candidate.items()}
+            if stored.get("type") == "oauth":
+                from misaka.ai.utils.oauth import getOAuthProvider
+                from misaka.ai.utils.oauth.types import OAuthCredentials
+
+                flow = getOAuthProvider(provider)
+                get_base = getattr(flow, "getBaseUrl", None)
+                if callable(get_base):
+                    endpoint = str(get_base(OAuthCredentials.model_validate(
+                        {key: value for key, value in stored.items() if key != "type"}
+                    )) or endpoint)
+    if not endpoint and getattr(model, "api", None) == "openai-codex-responses":
+        from misaka.ai.providers.openai_codex_responses import resolve_codex_url
+
+        endpoint = resolve_codex_url()
+    api = getattr(model, "api", None)
+    if api in {"google-generative-ai", "google-vertex"}:
+        from misaka.ai.utils.google_endpoint import resolve_google_endpoint
+
+        # Match the adapter's actual constructor branch, without resolving auth:
+        # express API keys use global; ADC uses the process location, not env
+        # stored on a credential (resolve_location currently does not read it).
+        location = os.environ.get("GOOGLE_CLOUD_LOCATION") or "global"
+        if api == "google-vertex":
+            from misaka.ai.providers.google_vertex import resolve_api_key
+            from misaka.core.resolve_config_value import (
+                is_command_config_value,
+                resolve_config_value,
+            )
+
+            # Registry auth gives a configured key priority over ambient auth only
+            # when neither a runtime override nor a stored credential owns it.
+            # Expand non-command templates in memory to apply the stream's
+            # placeholder/marker filtering; never execute a configured command.
+            if not loaded_api_key and stored is None:
+                configs = getattr(registry, "_providerRequestConfigs", {})
+                config = configs.get(provider) if provider else None
+                raw_key = getattr(config, "apiKey", None)
+                if isinstance(raw_key, str):
+                    loaded_api_key = raw_key if is_command_config_value(raw_key) else resolve_config_value(raw_key)
+
+            if resolve_api_key({"apiKey": loaded_api_key}):
+                location = "global"
+        endpoint = resolve_google_endpoint(endpoint, vertexai=api == "google-vertex", location=location)
+    return endpoint, env
+
+
+def _proxy_settings_snapshot(session: Any, settings: Any = None) -> dict[str, Any]:
+    from misaka.ai.utils.network_route import resolve_network_route
+    from misaka.config.proxy_settings import (
+        get_proxy_settings,
+        proxy_request_env,
+        validate_proxy_settings,
+    )
+
+    policy = validate_proxy_settings(settings) if settings is not None else get_proxy_settings()
+    endpoint, provider_env = _ordinary_model_network_context(session)
+    result: dict[str, Any] = {"settings": policy, "route": None}
+    if not endpoint:
+        return result
+    try:
+        effective_env = proxy_request_env(provider_env, settings=policy)
+        result["route"] = resolve_network_route(endpoint, effective_env).public_details()
+    except ValueError as error:
+        result["routeError"] = str(error)
+    return result
+
+
 async def _test_model_connectivity(session: Any, provider_id: str, model_id: str | None) -> dict[str, Any]:
     """Send one tiny real request through the registry's own auth and stream path.
 
@@ -871,8 +988,9 @@ async def _test_model_connectivity(session: Any, provider_id: str, model_id: str
     provider for a couple of tokens. The error text separates an unreachable endpoint (a
     transport error) from a rejected credential (the provider answered with an auth error).
     """
-    from misaka.ai.stream import complete_simple
+    from misaka.ai.auth.resolve import AuthResolutionOverrides
     from misaka.ai.types import Context, SimpleStreamOptions, UserMessage
+    from misaka.ai.utils.headers import provider_headers_to_record
 
     registry = _model_registry_of(session)
     if registry is None:
@@ -887,18 +1005,21 @@ async def _test_model_connectivity(session: Any, provider_id: str, model_id: str
 
     started = time.monotonic()
     try:
-        auth = await registry.getApiKeyAndHeaders(model)
-    except Exception as error:  # noqa: BLE001 - reported verbatim to the page
-        return {"ok": False, "error": f"{type(error).__name__}: {error}"}
-    if not auth.get("ok"):
-        return {"ok": False, "error": str(auth.get("error") or "no credential resolved")}
-
-    try:
-        reply = await complete_simple(
+        resolution = await registry.getAuth(model, AuthResolutionOverrides())
+        if resolution is None:
+            return {"ok": False, "error": "no credential resolved"}
+        if resolution.auth.baseUrl and hasattr(model, "model_copy"):
+            model = model.model_copy(update={"baseUrl": resolution.auth.baseUrl})
+        reply = await registry.streamSimple(
             model,
             Context(messages=[UserMessage(content="Reply with the single word OK.", timestamp=0)]),
-            SimpleStreamOptions(apiKey=auth.get("apiKey"), headers=auth.get("headers"), maxTokens=8),
-        )
+            SimpleStreamOptions(
+                apiKey=resolution.auth.apiKey,
+                headers=provider_headers_to_record(resolution.auth.headers),
+                env=resolution.env,
+                maxTokens=8,
+            ),
+        ).result()
     except Exception as error:  # noqa: BLE001 - transport failure, not a provider reply
         return {"ok": False, "error": f"{type(error).__name__}: {error}"}
     latency_ms = int((time.monotonic() - started) * 1000)
@@ -995,7 +1116,6 @@ def _serialize_ack(
     return json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
 async def run_desktop_bridge(runtime_host: Any, options: Any = None) -> int:
     """Run the desktop bridge loop transferring stdio commands and JSONL events."""
-    _clean_broken_local_proxies()
     session = runtime_host.session
     unsubscribe = None
     unsubscribe_backpressure = None
@@ -1010,6 +1130,7 @@ async def run_desktop_bridge(runtime_host: Any, options: Any = None) -> int:
     prompt_preflight_lock = asyncio.Lock()
     research_ingress = ResearchMessageIngress(session)
     research_controller = None
+    research_observers = {}
     desktop_research = bool(read_field(options, "desktop_research") or getattr(session, "research_host", False))
     desktop_tasks: set[asyncio.Task[None]] = set()
     research_input_tasks: set[asyncio.Task[None]] = set()
@@ -1135,6 +1256,9 @@ async def run_desktop_bridge(runtime_host: Any, options: Any = None) -> int:
         if callable(unsubscribe_backpressure):
             unsubscribe_backpressure()
             unsubscribe_backpressure = None
+        for observer in tuple(research_observers.values()):
+            await observer.close()
+        research_observers.clear()
         for task in tuple(desktop_tasks):
             task.cancel()
         if desktop_tasks:
@@ -1296,7 +1420,7 @@ async def run_desktop_bridge(runtime_host: Any, options: Any = None) -> int:
                 try:
                     if cmd == "desktop_set_team_model":
                         result = await research_controller.set_team_model(
-                            obj.get("provider"), obj.get("modelId"), obj.get("action", "switch"))
+                            obj.get("provider"), obj.get("modelId"), obj.get("action", "switch"), role=obj.get("role", "all"))
                     else:
                         if not isinstance(obj.get("selections"), list):
                             raise ValueError("Role retention requires an explicit selections list.")
@@ -1514,6 +1638,7 @@ async def run_desktop_bridge(runtime_host: Any, options: Any = None) -> int:
                 # A run may have been created just before the renderer received its
                 # discipline notice. Cancel that owned startup via the native stop door.
                 if research_controller is not None:
+                    await research_controller.cancel_startup()
                     con = _open_research_readonly()
                     try:
                         owned = session_run(abort_session, con)
@@ -1616,8 +1741,11 @@ async def run_desktop_bridge(runtime_host: Any, options: Any = None) -> int:
                 write_ack(req_id, ok=False, error="set_thinking requires 'level'")
                 return
             try:
-                session.setThinkingLevel(level)
-                payload = _thinking_state(session)
+                if research_controller is not None and obj.get("role"):
+                    payload = await research_controller.set_team_thinking(level, role=obj["role"])
+                else:
+                    session.setThinkingLevel(level)
+                    payload = _thinking_state(session)
                 write_ack(req_id, ok=True, data=payload, **payload)
             except Exception as error:  # noqa: BLE001
                 write_ack(req_id, ok=False, error=str(error))
@@ -1821,8 +1949,10 @@ async def run_desktop_bridge(runtime_host: Any, options: Any = None) -> int:
             write_ack(req_id, ok=True, data={"runs": active})
 
         elif cmd in ("get_research_host", "getresearchhost"):
-            con = _open_research_readonly()
+            con = None
             try:
+                await recover_research_report(session)
+                con = _open_research_readonly()
                 payload = research_host_payload(session, con, last_event_seq=seq, stream_id=stream_id)
                 if research_controller is not None:
                     payload.update(research_controller.snapshot())
@@ -1832,6 +1962,26 @@ async def run_desktop_bridge(runtime_host: Any, options: Any = None) -> int:
             finally:
                 if con is not None:
                     con.close()
+
+        elif cmd == 'check_research_connection':
+            if obj.get('sessionId') != session.sessionId or (obj.get('streamId') is not None and obj['streamId'] != stream_id):
+                write_ack(req_id, ok=False, error='研究连接已变更，请重新打开原研究会话。',
+                          errorCode='RESEARCH_STREAM_CHANGED', errorStage='validation', retryable=False,
+                          sessionId=session.sessionId, streamId=stream_id)
+                return
+            try:
+                from misaka.ai.utils.network_route import diagnose_connection
+                from misaka.desktop_research.recruitment import latest_network_context
+                endpoint, environment = latest_network_context(session)
+                if not endpoint:
+                    raise ValueError('当前模型尚无可检查的连接地址，请先检查模型配置。')
+                result = await diagnose_connection(endpoint, environment)
+                write_ack(req_id, ok=True, data=result, sessionId=session.sessionId, streamId=stream_id)
+            except Exception as error:  # noqa: BLE001 - a diagnostic failure stays on its correlated ACK
+                from misaka.desktop_research.recruitment import _clean
+                write_ack(req_id, ok=False, error=_clean(session, error),
+                          errorCode='RESEARCH_CONNECTION_CHECK_FAILED', errorStage='connection', retryable=True,
+                          sessionId=session.sessionId, streamId=stream_id)
 
         elif cmd in ("send_research_message", "sendresearchmessage"):
             submissions.trace_input(obj, stage='bridge', session_id=session.sessionId, stream_id=stream_id,
@@ -1850,6 +2000,7 @@ async def run_desktop_bridge(runtime_host: Any, options: Any = None) -> int:
                         'errorCode': error.errorCode if known else 'RESEARCH_SUBMISSION_FAILED',
                         'errorStage': error.errorStage if known else 'submission',
                         'retryable': error.retryable if known else True,
+                        **({'errorDetails': error.errorDetails} if known and error.errorDetails is not None else {}),
                         'sessionId': session.sessionId, 'streamId': stream_id}
 
             if research_controller is not None:
@@ -1937,6 +2088,67 @@ async def run_desktop_bridge(runtime_host: Any, options: Any = None) -> int:
             except Exception as error:  # noqa: BLE001
                 write_ack(req_id, ok=False, error=str(error))
 
+        elif cmd in ("get_research_sessions", "get_research_session_history", "get_research_session_content",
+                     "watch_research_sessions", "unwatch_research_sessions"):
+            from misaka.core.research import desktop_view, runs
+            from misaka.desktop_research.session_observer import ResearchSessionObserver
+            if cmd == "unwatch_research_sessions":
+                observer = research_observers.pop(str(obj.get("subscriptionId") or ""), None)
+                if observer is not None:
+                    await observer.close()
+                write_ack(req_id, ok=True, data={"stopped": True})
+                return
+            if cmd != "watch_research_sessions":
+                try:
+                    payload = await asyncio.to_thread(_read_research_session_query, obj, _research_workspace(obj, session))
+                    write_ack(req_id, ok=True, data=payload)
+                except Exception as error:  # noqa: BLE001 - send correlated read failure without affecting live agents
+                    write_ack(req_id, ok=False, error=str(error))
+                return
+            con = _open_research_readonly()
+            try:
+                run_id = str(obj.get("runId") or "")
+                run = runs.get(con, run_id) if con is not None else None
+                if run is None or os.path.normcase(os.path.realpath(run["workspace"])) != os.path.normcase(
+                        os.path.realpath(_research_workspace(obj, session) or "")):
+                    raise ValueError("No research run matches this project.")
+                if cmd == "watch_research_sessions":
+                    root_path = getattr(session.sessionManager, "sessionFile", None)
+                    owned = (run["root_session"] and root_path and
+                        os.path.normcase(os.path.realpath(str(home.from_stored(run["root_session"])))) ==
+                        os.path.normcase(os.path.realpath(root_path)))
+                    pending_owner = not run["root_session"] and run["origin_session"] == session.sessionId
+                    if not desktop_research or not (owned or pending_owner):
+                        raise ValueError("Open the run's original research coordinator before watching live sessions.")
+                    visible = obj.get("visibleExecutorIds") or []
+                    if not isinstance(visible, list) or len(visible) > 64 or not all(isinstance(v, str) for v in visible):
+                        raise ValueError("Invalid visible session identifiers")
+                    for old in tuple(research_observers.values()):
+                        await old.close()
+                    research_observers.clear()
+                    observer = ResearchSessionObserver(run_id, _open_research_readonly, handle_event,
+                        visible_executor_ids=visible)
+                    research_observers[observer.subscription_id] = observer
+                    observer.start()
+                    payload = {"subscriptionId": observer.subscription_id, "runId": run_id}
+                elif cmd == "get_research_sessions":
+                    payload = desktop_view.sessions_payload(con, run_id)
+                elif cmd == "get_research_session_history":
+                    payload = desktop_view.session_history(con, run_id, str(obj.get("executorId") or ""),
+                        cursor=obj.get("cursor"), limit=obj.get("limit") or 50)
+                else:
+                    payload = desktop_view.session_content(con, run_id, str(obj.get("executorId") or ""),
+                        str(obj.get("entryId") or ""), field=obj.get("field") or "content",
+                        offset=obj.get("offset") or 0, limit=obj.get("limit") or desktop_view.EXECUTION_PREVIEW_BYTES)
+                if payload is None:
+                    raise ValueError("No execution instance belongs to this research run.")
+                write_ack(req_id, ok=True, data=payload)
+            except Exception as error:  # noqa: BLE001 - correlated read/control errors cross IPC as acknowledgements
+                write_ack(req_id, ok=False, error=str(error))
+            finally:
+                if con is not None:
+                    con.close()
+
         elif cmd in ("get_research_details", "getresearchdetails"):
             from misaka.core.research import desktop_intervene, desktop_view, runs
 
@@ -1998,6 +2210,34 @@ async def run_desktop_bridge(runtime_host: Any, options: Any = None) -> int:
                 else:
                     detail = desktop_view.artifact_detail(con, run_id, str(obj.get("artifactId") or ""))
                 write_ack(req_id, ok=True, data={"detail": detail})
+            except Exception as error:  # noqa: BLE001
+                write_ack(req_id, ok=False, error=str(error))
+            finally:
+                con.close()
+
+        elif cmd in ("get_research_execution", "getresearchexecution"):
+            from misaka.core.research import desktop_view, runs
+
+            con = _open_research_readonly()
+            if con is None:
+                write_ack(req_id, ok=True, data={"execution": {
+                    "instances": [], "entries": [], "nextCursor": None, "hasMore": False,
+                    "availability": "missing", "reason": "研究板尚未建立，没有可读取的执行记录。"}})
+                return
+            try:
+                run_id = str(obj.get("runId") or "")
+                run = runs.get(con, run_id)
+                # Same ownership gate as the card itself: an identifier from another research, or
+                # from another workspace, reads nothing.
+                if run is None or os.path.realpath(str(run["workspace"])) != _research_workspace(obj, session):
+                    write_ack(req_id, ok=True, data={"execution": None})
+                    return
+                execution = desktop_view.execution_detail(
+                    con, run_id, str(obj.get("taskId") or ""),
+                    instance_id=str(obj["instanceId"]) if obj.get("instanceId") else None,
+                    cursor=obj.get("cursor"),
+                    limit=obj.get("limit") or desktop_view.EXECUTION_MAX_LIMIT)
+                write_ack(req_id, ok=True, data={"execution": execution})
             except Exception as error:  # noqa: BLE001
                 write_ack(req_id, ok=False, error=str(error))
             finally:
@@ -2704,6 +2944,61 @@ async def run_desktop_bridge(runtime_host: Any, options: Any = None) -> int:
             except Exception as error:  # noqa: BLE001
                 write_ack(req_id, ok=False, error=str(error))
 
+        elif cmd in ("get_proxy_settings", "getproxysettings"):
+            try:
+                snapshot = _proxy_settings_snapshot(session)
+                write_ack(req_id, ok=True, data=snapshot, **snapshot)
+            except Exception as error:  # noqa: BLE001 - correlated configuration failure
+                write_ack(req_id, ok=False, error=str(error))
+
+        elif cmd in ("set_proxy_settings", "setproxysettings"):
+            try:
+                from misaka.config.proxy_settings import validate_proxy_settings
+
+                settings = validate_proxy_settings(obj.get("settings"))
+                sm = getattr(session, "settingsManager", None)
+                if sm is None:
+                    raise RuntimeError("Session has no settings manager")
+
+                def _replace_proxy(target: dict) -> None:
+                    target["proxy"] = settings
+
+                sm.updateSection("network", _replace_proxy)
+                snapshot = _proxy_settings_snapshot(session)
+                write_ack(req_id, ok=True, data=snapshot, **snapshot)
+            except Exception as error:  # noqa: BLE001 - failed saves keep the prior object
+                write_ack(req_id, ok=False, error=str(error))
+
+        elif cmd in ("check_proxy_connection", "checkproxyconnection"):
+            try:
+                from misaka.ai.utils.network_route import diagnose_connection
+                from misaka.config.proxy_settings import (
+                    get_proxy_settings,
+                    proxy_request_env,
+                    validate_proxy_settings,
+                )
+
+                policy = (
+                    validate_proxy_settings(obj["settings"])
+                    if obj.get("settings") is not None
+                    else get_proxy_settings()
+                )
+                endpoint, provider_env = _ordinary_model_network_context(session)
+                if endpoint:
+                    result = await diagnose_connection(
+                        endpoint, proxy_request_env(provider_env, settings=policy)
+                    )
+                else:
+                    result = {
+                        "route": None,
+                        "reachable": False,
+                        "check": "tcp",
+                        "error": "Current model has no connection endpoint",
+                    }
+                write_ack(req_id, ok=True, data=result, **result)
+            except Exception as error:  # noqa: BLE001 - correlated validation/check failure
+                write_ack(req_id, ok=False, error=str(error))
+
         elif cmd in ("get_config", "getconfig"):
             try:
                 sm = getattr(session, "settingsManager", None)
@@ -2810,6 +3105,10 @@ async def run_desktop_bridge(runtime_host: Any, options: Any = None) -> int:
                 write_ack(req_id, ok=False, error="section and key required")
                 return
             try:
+                if section == "network" and key == "proxy":
+                    from misaka.config.proxy_settings import validate_proxy_settings
+
+                    val = validate_proxy_settings(val)
                 sm = getattr(session, "settingsManager", None)
                 if sm:
                     def _mutate(target: dict) -> None:
@@ -2989,8 +3288,6 @@ def main(args: Any = None) -> int:
     apply_windows_utf8_bootstrap()
     from misaka.cli import bootstrap
     bootstrap.install()
-    _clean_broken_local_proxies()
-
     cwd = getattr(args, "cwd", None) or os.getcwd()
     flags: list[str] = ["--mode", "json"]
     if getattr(args, "no_session", False):

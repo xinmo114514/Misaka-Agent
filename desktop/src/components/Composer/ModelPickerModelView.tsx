@@ -1,3 +1,4 @@
+import { useResearchEditorModel } from '../../lib/useResearchEditorModel'
 import { useEffect, useRef } from 'react'
 import { ArrowLeft, Check, Search, Settings, Star } from 'lucide-react'
 import type { ModelDetail } from '../../types/settings'
@@ -16,11 +17,11 @@ interface Props {
 const iconButton = 'flex h-7 w-7 shrink-0 items-center justify-center rounded-md text-muted transition-colors hover:bg-surface-hover hover:text-text-main focus-visible:ring-2 focus-visible:ring-focus-ring/40 cursor-pointer'
 
 export function ModelPickerModelView({ models, search, onSearch, onBack, onConfigure, onSelect }: Props) {
-  const currentModel = useSettingsStore(s => s.currentModel)
+  const { currentModel, local } = useResearchEditorModel()
   const modelSwitchPending = useSettingsStore(s => s.modelSwitchPending)
-  const unready = useSessionStore(s => s.agentMode === 'research' && s.researchBinding
+  const unready = useSessionStore(s => s.agentMode === 'research'
     ? false : s.isSessionLoading || Boolean(s.sessionLoadError) || s.currentSessionId !== s.activeSessionId)
-  const blocked = unready || (modelSwitchPending && !currentModel)
+  const blocked = unready || (!local && modelSwitchPending && !currentModel)
   const defaultProvider = useSettingsStore(s => s.defaultProvider)
   const defaultModel = useSettingsStore(s => s.defaultModel)
   const backRef = useRef<HTMLButtonElement>(null)

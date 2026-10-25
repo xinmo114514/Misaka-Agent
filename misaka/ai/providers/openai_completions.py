@@ -10,9 +10,10 @@ from collections.abc import AsyncIterator, Mapping
 from typing import Any, Literal, TypedDict
 
 try:
-    from openai import AsyncOpenAI
+    from openai import AsyncOpenAI, DefaultAsyncHttpxClient
 except ImportError:  # optional extra: misaka[openai]
     AsyncOpenAI = None
+    DefaultAsyncHttpxClient = None
 
 from misaka.ai.env_api_keys import get_env_api_key
 from misaka.ai.models import calculate_cost, clamp_thinking_level
@@ -83,6 +84,7 @@ from misaka.ai.utils.headers import (
     provider_headers_to_record,
 )
 from misaka.ai.utils.json_parse import StreamingArgs
+from misaka.ai.utils.network_route import httpx_client_options
 from misaka.ai.utils.provider_retry import retry_provider_request
 from misaka.ai.utils.sanitize_unicode import sanitize_surrogates
 from misaka.ai.utils.text import get_system_message_text, render_system_message_update
@@ -255,6 +257,7 @@ def stream_openai_completions(
         )
 
         chunks = None
+        owned_client = None
         try:
             compat = get_compat(model)
             client = _option(options, "client")
@@ -269,7 +272,9 @@ def stream_openai_completions(
                     _option(options, "headers"),
                     cache_session_id,
                     compat,
+                    env=_option(options, "env"),
                 )
+                owned_client = client
 
             params = build_params(model, normalized_context, options, compat)
             on_payload = _option(options, "onPayload")
@@ -539,10 +544,15 @@ def stream_openai_completions(
                 output.errorMessage = f"{output.errorMessage}\n{raw_metadata['raw']}"
             stream.push(ErrorEvent(reason=output.stopReason, error=output), cause=error)
         finally:
-            if chunks is not None:          # closed now, its abort task with it, not when GC finds it
-                with contextlib.suppress(Exception):
-                    await chunks.aclose()
-            stream.end()
+            try:
+                if chunks is not None:      # close the response while its event loop is alive
+                    with contextlib.suppress(Exception):
+                        await chunks.aclose()
+            finally:
+                try:
+                    await _close_stream(owned_client)
+                finally:
+                    stream.end()
 
     spawn_stream_task(run(), stream=stream)
     return stream
@@ -618,6 +628,7 @@ def create_client(
     options_headers: Mapping[str, str] | None = None,
     session_id: str | None = None,
     compat: Mapping[str, Any] | None = None,
+    env: Mapping[str, str] | None = None,
 ) -> AsyncOpenAI:
     if not api_key:
         env_key = os.environ.get("OPENAI_API_KEY")
@@ -646,10 +657,12 @@ def create_client(
     else:
         default_headers = headers
 
+    endpoint = resolve_cloudflare_base_url(model) if is_cloudflare_provider(model.provider) else model.baseUrl
     return require(AsyncOpenAI, "openai")(
         api_key=api_key,
-        base_url=resolve_cloudflare_base_url(model) if is_cloudflare_provider(model.provider) else model.baseUrl,
+        base_url=endpoint,
         default_headers=default_headers,
+        http_client=require(DefaultAsyncHttpxClient, "openai")(**httpx_client_options(endpoint, env)),
     )
 
 

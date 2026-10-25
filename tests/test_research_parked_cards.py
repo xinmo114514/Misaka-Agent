@@ -23,16 +23,19 @@ class BlockingRunner:
                                  generation=row["generation"])
 
 
-async def test_a_parked_card_is_put_to_last_order_and_reopened(lab):  # noqa: F811
+async def test_a_zero_output_parked_card_waits_for_explicit_resume(lab):  # noqa: F811
     con, run, root = lab.con, lab.run, lab.root
     asked = []
     lab.monkeypatch.setattr(planner, "cards_failed", lambda *a, **k: asked.append(k["lost"]) or (
         {"decision": "retry", "reason": "log in first"} if len(asked) == 1 else {"decision": "fail", "reason": "still"}))
     assert await asyncio.wait_for(_expand(lab, BlockingRunner(con)), 10) == "failed"
     [card] = runs.tasks(con, run["id"], kind="research", node_id=root["id"])
-    assert len(asked) == 2 and card["generation"] == 2, "Last Order was asked, and her retry reopened the card"
+    assert asked == [] and card["generation"] == 1, "zero-output all-stop is confirmed without model judgment"
+    from misaka.core.research.suspension import active_suspensions
+    assert active_suspensions(con, run["id"])[0]["confirmations"][0]["taskId"] == card["id"]
     runs.resume(con, run["id"], driver_lock="driver:test")
     assert tasks.get(con, card["id"])["status"] in ("ready", "todo"), "a resume reopens it too"
+    assert tasks.get(con, card["id"])["generation"] == 2
 
 
 async def test_a_card_waiting_on_a_parked_one_is_no_dependency_cycle(lab):  # noqa: F811
