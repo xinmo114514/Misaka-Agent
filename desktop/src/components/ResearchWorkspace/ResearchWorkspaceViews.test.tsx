@@ -12,6 +12,13 @@ import { request } from '../../lib/bridge'
 import type { ResearchSessionDescriptor, ResearchSessionsPayload } from '../../types/research'
 
 vi.mock('../../lib/researchSessionsBridge', () => ({ researchSessionsBridge: {
+  retainVisible: vi.fn((runId: string, ids: string[], workspace?: string, status?: (error: unknown | null) => void) => {
+    let live = true
+    void researchSessionsBridge.watch(runId, ids, workspace).then(
+      () => { if (live) status?.(null) }, error => { if (live) status?.(error) },
+    )
+    return () => { live = false }
+  }),
   load: vi.fn().mockResolvedValue(null), history: vi.fn().mockResolvedValue(null), watch: vi.fn().mockResolvedValue(null),
   unwatch: vi.fn().mockResolvedValue(null), listen: vi.fn(() => () => {}), content: vi.fn(),
 } }))
@@ -55,7 +62,7 @@ describe('research workspace views', () => {
     await waitFor(() => expect(screen.queryByRole('button', { name: '重试读取' })).not.toBeInTheDocument())
     act(() => { publish({ sessions: [] }) })
     expect(view.container.querySelectorAll('[data-research-focus-toolbar]')).toHaveLength(1)
-    expect(screen.getByText('当前节点还没有可查看的会话。')).toBeInTheDocument()
+    expect(screen.getByText('节点“Q”正在等待可查看的会话。')).toBeInTheDocument()
   })
 
   it('keeps run status, a complete accessible question and one team entry while reading a completed member', () => {

@@ -67,7 +67,7 @@ it('keeps process controls reachable before a readable session has been created'
   fireEvent.click(screen.getByRole('button', { name: '更多研究选项' }))
   fireEvent.click(screen.getByRole('button', { name: '研究过程' }))
   expect(screen.getByRole('region', { name: '研究运行过程' })).toBeInTheDocument()
-  expect(screen.getByRole('status')).toHaveTextContent('当前节点还没有可查看的会话')
+  expect(screen.getByRole('status')).toHaveTextContent('正在等待可查看的会话')
 })
 it('routes actual Composer Escape through menu, side and process before stopping, and ignores IME', () => {
   open(); process(); side(); const input = screen.getByRole('textbox'); expect(input).toHaveValue('unsubmitted draft')

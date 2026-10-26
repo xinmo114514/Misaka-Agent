@@ -16,6 +16,7 @@ import { ResearchSessionTree } from '../ResearchWorkspace/ResearchSessionTree'
 import { ResearchBackgroundEntry } from './ResearchBackgroundEntry'
 import { openResearchConversation } from '../../lib/startComposerResearch'
 import type { ResearchSessionDescriptor } from '../../types/research'
+import { readResearchViewMode } from '../../lib/researchViewMode'
 
 interface SidebarProps {
   onOpenSettings?: () => void
@@ -64,8 +65,6 @@ export const Sidebar: React.FC<SidebarProps> = ({ onOpenSettings, isSettingsActi
   const renameSession = useSessionStore(state => state.renameSession)
   const setResearchHistoryOpen = useSessionStore(state => state.setResearchHistoryOpen)
   const researchListings = useResearchRunStore(state => state.runs)
-  const focusResearchExecutor = useResearchWorkspaceStore(state => state.focusExecutor)
-  const selectResearchNode = useResearchWorkspaceStore(state => state.selectNode)
   const [researchOpenError, setResearchOpenError] = useState('')
   const researchGroups = useMemo(() => Object.values(researchListings).reduce<Record<string, typeof researchListings[string][]>>((groups, listing) => {
     const key = listing.run.workspace
@@ -85,7 +84,17 @@ export const Sidebar: React.FC<SidebarProps> = ({ onOpenSettings, isSettingsActi
   }
   const focusResearch = async (runId: string, item: ResearchSessionDescriptor) => {
     await openResearchRun(runId, item.workspace)
-    focusResearchExecutor(runId, item)
+    const store = useResearchWorkspaceStore.getState()
+    const mode = store.byRun[runId]?.viewMode ?? readResearchViewMode()
+    if (mode === 'focus') store.setMainExecutor(runId, item.executorId)
+    else store.focusExecutor(runId, item)
+  }
+  const selectResearchNode = async (runId: string, workspace: string, nodeId: string) => {
+    await openResearchRun(runId, workspace)
+    const store = useResearchWorkspaceStore.getState()
+    const mode = store.byRun[runId]?.viewMode ?? readResearchViewMode()
+    if (mode === 'focus') store.selectFocusNode(runId, nodeId)
+    else store.selectNode(runId, nodeId)
   }
 
   const scrollRef = useRef<HTMLDivElement>(null)
@@ -338,7 +347,7 @@ export const Sidebar: React.FC<SidebarProps> = ({ onOpenSettings, isSettingsActi
             {runs.map(listing => <div key={listing.runId} className="mt-1">
               <div className="truncate px-2 text-[11px] text-muted" title={listing.run.question}>{listing.run.question} · {listing.run.status}</div>
               <ResearchSessionTree listing={listing} selectedNodeId={null}
-                onSelectNode={nodeId => { void openResearchRun(listing.runId, listing.run.workspace).then(() => selectResearchNode(listing.runId, nodeId)) }}
+                onSelectNode={nodeId => { void selectResearchNode(listing.runId, listing.run.workspace, nodeId) }}
                 onFocus={item => { void focusResearch(listing.runId, item) }} />
             </div>)}
           </div>)}

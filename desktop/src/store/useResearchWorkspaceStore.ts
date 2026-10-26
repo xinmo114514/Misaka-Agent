@@ -28,6 +28,7 @@ export interface WorkspaceState {
 interface State {
   byRun: Record<string, WorkspaceState>
   selectNode: (runId: string, nodeId: string) => void
+  selectFocusNode: (runId: string, nodeId: string) => void
   focusExecutor: (runId: string, descriptor: ResearchSessionDescriptor) => void
   setReading: (runId: string, executorId: string, reading: ReadingState) => void
   setViewMode: (runId: string, mode: ResearchViewMode) => void
@@ -41,6 +42,9 @@ const empty = (): WorkspaceState => ({ selectedNodeId: null, focusedExecutorId: 
 export const useResearchWorkspaceStore = create<State>(set => ({
   byRun: {},
   selectNode: (runId, nodeId) => set(state => ({ byRun: { ...state.byRun, [runId]: { ...(state.byRun[runId] ?? empty()), selectedNodeId: nodeId } } })),
+  selectFocusNode: (runId, nodeId) => set(state => ({ byRun: { ...state.byRun, [runId]: {
+    ...(state.byRun[runId] ?? empty()), selectedNodeId: nodeId, mainExecutorId: null,
+  } } })),
   focusExecutor: (runId, descriptor) => set(state => {
     const old = state.byRun[runId] ?? empty()
     return { byRun: { ...state.byRun, [runId]: { ...old, selectedNodeId: descriptor.nodeId,

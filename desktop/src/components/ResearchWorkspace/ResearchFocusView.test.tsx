@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { act, fireEvent, render, screen, within } from '@testing-library/react'
 import { ResearchFocusView } from './ResearchFocusView'
 import { ResearchFocusToolbar } from './ResearchFocusToolbar'
@@ -39,6 +39,7 @@ beforeEach(() => {
   useResearchWorkspaceStore.setState({ byRun: {} })
   useResearchSessionsStore.setState({ byExecutor: {} })
 })
+afterEach(() => vi.restoreAllMocks())
 
 describe('research view mode preference', () => {
   it('defaults to the focus view and remembers the multi-pane choice', () => {
@@ -63,6 +64,65 @@ describe('ResearchViewSwitch', () => {
 })
 
 describe('ResearchFocusView', () => {
+  it('keeps a retained side reader in the narrow drawer while the selected node waits for a coordinator', () => {
+    vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockReturnValue({ width: 700 } as DOMRect)
+    const root = card('lo', 'last_order', 'running', { nodeId: 'root' })
+    const side = card('a', 'sister', 'running', { nodeId: 'root' })
+    const branchMember = card('branch-member', 'sister', 'running', { nodeId: 'branch' })
+    const payload = listing([root, side, branchMember])
+    payload.graph.nodes = [
+      { ...payload.graph.nodes[0], id: 'root', question: 'Root question' },
+      { ...payload.graph.nodes[0], id: 'branch', question: 'Waiting branch', kind: 'alt', depth: 1 },
+    ]
+    useResearchSessionsStore.getState().upsertDescriptors('r', [root, side, branchMember])
+    history('a', 'Retained side evidence')
+    useResearchWorkspaceStore.getState().setSideExecutor('r', 'a')
+
+    const result = render(<div data-conversation-viewport>
+      <ResearchFocusView runId="r" workspace="C:/fixture" listing={payload} nodeId="branch" />
+    </div>)
+    const viewport = result.container.querySelector<HTMLElement>('[data-conversation-viewport]')!
+
+    expect(screen.getByRole('status')).toHaveTextContent('Waiting branch')
+    expect(screen.getByRole('status').closest('.research-focus-main')).not.toBeNull()
+    expect(screen.getByRole('dialog', { name: 'a 侧栏' })).toHaveTextContent('Retained side evidence')
+    expect(viewport).toHaveAttribute('data-research-side-layout', 'drawer')
+  })
+
+  it('names a selected node that is waiting for its own coordinator instead of showing the root conversation', () => {
+    const root = card('lo', 'last_order', 'running', { nodeId: 'root' })
+    const branchMember = card('branch-member', 'sister', 'running', { nodeId: 'branch' })
+    const payload = listing([root, branchMember])
+    payload.graph.nodes = [
+      { ...payload.graph.nodes[0], id: 'root', question: 'Root question' },
+      { ...payload.graph.nodes[0], id: 'branch', question: 'Branch evidence question', kind: 'alt', depth: 1 },
+    ]
+    useResearchSessionsStore.getState().upsertDescriptors('r', [root, branchMember])
+    history('lo', 'Unrelated root reasoning')
+
+    render(<ResearchFocusView runId="r" workspace="C:/fixture" listing={payload} nodeId="branch" />)
+
+    expect(screen.getByRole('status')).toHaveTextContent('Branch evidence question')
+    expect(screen.getByRole('status')).toHaveTextContent('等待')
+    expect(screen.queryByText('Unrelated root reasoning')).not.toBeInTheDocument()
+  })
+
+  it('keeps a branch coordinator read-only when the root controller session is absent', () => {
+    const branchCoordinator = card('branch-lo', 'last_order', 'running', { nodeId: 'branch' })
+    const payload = listing([branchCoordinator])
+    payload.graph.nodes = [
+      { ...payload.graph.nodes[0], id: 'root', question: 'Root question' },
+      { ...payload.graph.nodes[0], id: 'branch', question: 'Branch question', kind: 'alt', depth: 1 },
+    ]
+    useResearchSessionsStore.getState().upsertDescriptors('r', [branchCoordinator])
+    history('branch-lo', 'Branch coordination')
+
+    render(<ResearchFocusView runId="r" workspace="C:/fixture" listing={payload} nodeId="branch" />)
+
+    expect(screen.getByText('Branch coordination')).toBeInTheDocument()
+    expect(screen.getByRole('note')).toHaveTextContent('子代理会话只读')
+  })
+
   it('reads the controller as an ordinary conversation, without a run banner or a team column', () => {
     const sessions = [card('lo', 'last_order'), card('a', 'sister')]
     useResearchSessionsStore.getState().upsertDescriptors('r', sessions)

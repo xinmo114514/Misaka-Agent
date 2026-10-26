@@ -1,7 +1,6 @@
 import { useEffect, useMemo, useRef, useState, type CSSProperties } from 'react'
 import { researchSessionsBridge } from '../../lib/researchSessionsBridge'
 import { useResearchRunStore } from '../../store/useResearchRunStore'
-import { useResearchSessionsStore } from '../../store/useResearchSessionsStore'
 import { useResearchWorkspaceStore } from '../../store/useResearchWorkspaceStore'
 import { readResearchViewMode, saveResearchViewMode, type ResearchViewMode } from '../../lib/researchViewMode'
 import type { ResearchSessionDescriptor } from '../../types/research'
@@ -15,13 +14,12 @@ import { ResearchFocusToolbar } from './ResearchFocusToolbar'
 import { ResearchRunPanel } from './ResearchRunPanel'
 import { MultiPaneFrame } from './MultiPaneFrame'
 import type { FocusChromeActions } from './ResearchFocusMenu'
-import { resolveMainSession } from './researchTeam'
+import { resolveMainSession, resolveResearchNodeId } from './researchTeam'
 import { selectResearchMultiSessions } from '../../lib/researchMultiLayout'
 import { useResearchMosaicSizing } from './useResearchMosaicSizing'
-import { useSessionStore } from '../../store/useSessionStore'
+import { normalizeWorkspacePath, useSessionStore } from '../../store/useSessionStore'
 import { useResearchActivityStore } from '../../lib/researchActivityStore'
-
-const TERMINAL = ['done', 'completed', 'stopped', 'failed', 'error']
+import { useMultiHistory } from './useMultiHistory'
 
 /**
  * The research workspace.
@@ -30,28 +28,37 @@ const TERMINAL = ['done', 'completed', 'stopped', 'failed', 'error']
  * page, because the header pill, the transcript and the composer must agree on it: focus is the
  * ordinary chat reading surface, multi is the tile grid with its compact composer.
  */
-export function ResearchTilingWorkspace({ runId, workspace, mode: controlledMode, onModeChange, chromeActions }: {
+interface ResearchTilingWorkspaceProps {
   runId: string
   workspace: string
   /** Lifted so the page header and the composer can share the choice; standalone renders read it. */
   mode?: ResearchViewMode
   onModeChange?: (mode: ResearchViewMode) => void
   chromeActions?: FocusChromeActions
-}) {
-  const listing = useResearchRunStore(s => s.runs[runId])
+}
+
+export function ResearchTilingWorkspace(props: ResearchTilingWorkspaceProps) {
+  return <OwnedResearchTilingWorkspace key={JSON.stringify([props.runId, normalizeWorkspacePath(props.workspace)])} {...props} />
+}
+
+function OwnedResearchTilingWorkspace({ runId, workspace, mode: controlledMode, onModeChange, chromeActions }: ResearchTilingWorkspaceProps) {
+  const cachedListing = useResearchRunStore(s => s.runs[runId])
+  const listing = cachedListing && normalizeWorkspacePath(cachedListing.run.workspace) === normalizeWorkspacePath(workspace) ? cachedListing : undefined
   const view = useResearchWorkspaceStore(s => s.byRun[runId])
   const focus = useResearchWorkspaceStore(s => s.focusExecutor)
   const selectNode = useResearchWorkspaceStore(s => s.selectNode)
   const setViewMode = useResearchWorkspaceStore(s => s.setViewMode)
   const setExpanded = useResearchWorkspaceStore(s => s.setExpandedExecutor)
-  const activeRunId = useRef(runId)
-  activeRunId.current = runId
-  const [loadFailure, setLoadFailure] = useState<{ runId: string; message: string } | null>(null)
-  const loadError = loadFailure?.runId === runId ? loadFailure.message : ''
-  const setLoadError = (message: string) => {
-    if (activeRunId.current === runId) setLoadFailure({ runId, message })
-  }
-  const [watchError, setWatchError] = useState('')
+  const live = useRef(true)
+  const loadEpoch = useRef(0)
+  const watchEpoch = useRef(0)
+  const retryEpoch = useRef(0)
+  const [loadError, setLoadError] = useState('')
+  const [watchFailure, setWatchFailure] = useState<{ key: string; message: string } | null>(null)
+  useEffect(() => {
+    live.current = true
+    return () => { live.current = false; ++loadEpoch.current; ++watchEpoch.current; ++retryEpoch.current }
+  }, [])
   // Default is the focus view; the user's last choice is remembered across sessions.
   const mode = controlledMode ?? view?.viewMode ?? readResearchViewMode()
   const switchMode = (next: ResearchViewMode) => {
@@ -60,15 +67,20 @@ export function ResearchTilingWorkspace({ runId, workspace, mode: controlledMode
     onModeChange?.(next)
   }
   const refresh = async (propagateError = false) => {
-    try { await researchSessionsBridge.load(runId, workspace); setLoadError('') }
-    catch (error) { setLoadError(String(error)); if (propagateError) throw error }
+    if (!live.current) return
+    const epoch = ++loadEpoch.current
+    try {
+      await researchSessionsBridge.load(runId, workspace)
+      if (live.current && loadEpoch.current === epoch) setLoadError('')
+    } catch (error) {
+      if (live.current && loadEpoch.current === epoch) setLoadError(String(error))
+      if (propagateError) throw error
+    }
   }
   useEffect(() => {
-    let live = true
-    void researchSessionsBridge.load(runId, workspace).catch(error => { if (live) setLoadError(String(error)) })
-    return () => { live = false }
+    void refresh()
   }, [runId, workspace])
-  const nodeId = view?.selectedNodeId || listing?.graph.nodes[0]?.id || null
+  const nodeId = resolveResearchNodeId(listing, view?.selectedNodeId)
   const visible = useMemo(() => selectResearchMultiSessions(listing, nodeId, view?.focusedExecutorId, view?.pinnedExecutorIds ?? []),
     [listing, nodeId, view?.focusedExecutorId, view?.pinnedExecutorIds])
   const lo = visible.find(item => item.role === 'last_order')
@@ -87,31 +99,42 @@ export function ResearchTilingWorkspace({ runId, workspace, mode: controlledMode
     return visible
   }, [listing, mode, nodeId, view?.mainExecutorId, view?.sideExecutorId, visible])
   const visibleIds = useMemo(() => shown.map(item => item.executorId), [shown])
-  const ids = visibleIds.join('|')
-  const historyRefreshKey = useResearchSessionsStore(s => visibleIds.map(id => `${id}:${s.byExecutor[id]?.descriptor.sessionId ?? ''}:${s.byExecutor[id]?.historyVersion ?? ''}:${s.byExecutor[id]?.loadedHistoryVersion ?? ''}`).join('|'))
+  const ids = JSON.stringify(visibleIds)
+  const currentIds = useRef(ids)
+  currentIds.current = ids
+  const watchError = watchFailure?.key === ids ? watchFailure.message : ''
+  const history = useMultiHistory(runId, workspace, shown, Boolean(listing) && mode === 'multi')
+  const historyError = history.error
   useEffect(() => {
+    const epoch = ++watchEpoch.current
     if (!listing) return
-    if (TERMINAL.includes(listing.run.status)) return
-    if (!visibleIds.length) return
-    void researchSessionsBridge.watch(runId, visibleIds, workspace).then(() => setWatchError('')).catch(error => setWatchError(String(error)))
-  }, [runId, workspace, ids, listing?.runId, listing?.run.status])
-  useEffect(() => {
-    if (!listing) return
-    const states = useResearchSessionsStore.getState().byExecutor
-    for (const id of visibleIds) {
-      const item = states[id]
-      if (item?.descriptor.sessionId && (item.loadedHistoryVersion !== item.historyVersion || (!item.messages.length && !item.loadedHistoryVersion))) {
-        void researchSessionsBridge.history(runId, id, workspace).catch(error => setLoadError(String(error)))
+    return researchSessionsBridge.retainVisible(runId, visibleIds, workspace, error => {
+      if (live.current && watchEpoch.current === epoch && currentIds.current === ids) {
+        setWatchFailure(error == null ? null : { key: ids, message: String(error) })
       }
+    })
+  }, [runId, workspace, ids, listing?.runId])
+  const retryWatch = async () => {
+    const epoch = ++retryEpoch.current
+    try {
+      await researchSessionsBridge.watch(runId, visibleIds, workspace)
+      if (live.current && retryEpoch.current === epoch && currentIds.current === ids) setWatchFailure(null)
+    } catch (error) {
+      if (live.current && retryEpoch.current === epoch && currentIds.current === ids) setWatchFailure({ key: ids, message: String(error) })
     }
-  }, [runId, workspace, ids, historyRefreshKey, listing?.runId])
+  }
   const toolbar = <ResearchFocusToolbar runId={runId} workspace={workspace} listing={listing}
     node={listing?.graph.nodes.find(item => item.id === nodeId)} nodeId={nodeId}
-    mode={mode} onModeChange={switchMode} onSelectNode={id => selectNode(runId, id)}
+    mode={mode} onModeChange={switchMode} onSelectNode={id => {
+      if (mode === 'focus') useResearchWorkspaceStore.getState().selectFocusNode(runId, id)
+      else selectNode(runId, id)
+    }}
     onGraph={() => useSessionStore.getState().setActiveResearchGraphRunId(runId)}
     onRefresh={async () => {
       await useSessionStore.getState().fetchResearchCardDetails(runId)
+      if (!live.current) return
       await refresh(true)
+      if (!live.current) return
       // The shared activity service settles polling failures into state rather than rejecting.
       const detailError = useResearchActivityStore.getState().errors[`run:${runId}`]
       if (detailError) throw new Error(detailError)
@@ -125,8 +148,13 @@ export function ResearchTilingWorkspace({ runId, workspace, mode: controlledMode
   const reconciliation = listing.graph.reconciles?.find(item => !item.applied)
   const suspension = listing.suspension ?? listing.suspensions.find(item => item.scope === 'node' && item.nodeId === nodeId && !item.resolvedAt)
   const expandedId = view?.expandedExecutorId
-  const alert = (loadError || watchError) && <div role="alert" className="research-load-alert">{loadError || watchError}
-    <button type="button" onClick={() => { void refresh(); void researchSessionsBridge.watch(runId, visibleIds, workspace).catch(error => setWatchError(String(error))) }}>重试</button></div>
+  const alert = (loadError || watchError || historyError) && <div role="alert" className="research-load-alert">
+    {loadError && <p>{loadError}</p>}{watchError && <p>{watchError}</p>}{historyError && <p>{historyError}</p>}
+    <button type="button" onClick={() => {
+      if (loadError) void refresh()
+      if (watchError) void retryWatch()
+      if (historyError) history.retry()
+    }}>重试</button></div>
   return <div ref={sizing.workspaceRef} className="research-tiling-container flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden" data-research-tiling-workspace={runId} data-research-view-mode={mode}>
       {toolbar}
       {alert}

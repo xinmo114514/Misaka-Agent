@@ -71,11 +71,18 @@ export function teamTotals(groups: TeamGroup[]): { current: number; live: number
   }
 }
 
+/** Keep a live selection, otherwise enter the graph at its real root (or its first node). */
+export function resolveResearchNodeId(listing: ResearchSessionsPayload | undefined, selectedNodeId?: string | null): string | null {
+  const nodes = listing?.graph.nodes ?? []
+  if (selectedNodeId && nodes.some(node => node.id === selectedNodeId)) return selectedNodeId
+  return (nodes.find(node => node.kind === 'root') ?? nodes[0])?.id ?? null
+}
+
 /** The run's own main controller, which is the root node's Last Order session. */
 export function rootControllerId(listing: ResearchSessionsPayload): string | null {
-  const root = listing.graph.nodes.find(node => node.kind === 'root') ?? listing.graph.nodes[0]
-  const controllers = listing.sessions.filter(item => item.role === 'last_order')
-  return (controllers.find(item => item.nodeId === root?.id) ?? controllers[0])?.executorId ?? null
+  const rootId = resolveResearchNodeId(listing)
+  if (!rootId) return null
+  return listing.sessions.find(item => item.role === 'last_order' && item.nodeId === rootId)?.executorId ?? null
 }
 
 /**
@@ -96,13 +103,11 @@ export function sessionLabel(descriptor: ResearchSessionDescriptor, controllerId
  *
  * Absent means "the node's controller", so a reader who never browsed gets the controller without
  * any state having to be written. A remembered executor that no longer exists in this listing is
- * ignored rather than left as a blank pane.
+ * ignored; a selected node that has not started its own controller remains an intentional wait.
  */
 export function resolveMainSession(listing: ResearchSessionsPayload, nodeId: string | null, mainExecutorId?: string | null): ResearchSessionDescriptor | null {
   const chosen = mainExecutorId ? listing.sessions.find(item => item.executorId === mainExecutorId) : undefined
   if (chosen) return chosen
-  const local = listing.sessions.find(item => item.role === 'last_order' && (!nodeId || item.nodeId === nodeId))
-  if (local) return local
-  const rootId = rootControllerId(listing)
-  return listing.sessions.find(item => item.executorId === rootId) ?? listing.sessions[0] ?? null
+  const selectedNodeId = resolveResearchNodeId(listing, nodeId)
+  return listing.sessions.find(item => item.role === 'last_order' && item.nodeId === selectedNodeId) ?? null
 }

@@ -14,6 +14,13 @@ import { request } from '../../lib/bridge'
 import type { ResearchOptionsPayload, ResearchSessionDescriptor, ResearchSessionsPayload, ResearchSuspension } from '../../types/research'
 
 vi.mock('../../lib/researchSessionsBridge', () => ({ researchSessionsBridge: {
+  retainVisible: vi.fn((runId: string, ids: string[], workspace?: string, status?: (error: unknown | null) => void) => {
+    let live = true
+    void researchSessionsBridge.watch(runId, ids, workspace).then(
+      () => { if (live) status?.(null) }, error => { if (live) status?.(error) },
+    )
+    return () => { live = false }
+  }),
   load: vi.fn().mockResolvedValue(null), watch: vi.fn().mockResolvedValue(null), history: vi.fn().mockResolvedValue(null),
 } }))
 vi.mock('../../lib/bridge', () => ({ request: vi.fn().mockResolvedValue({ detail: { plan: null } }) }))

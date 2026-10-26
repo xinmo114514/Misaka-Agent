@@ -2,7 +2,9 @@ import { _electron as electron, expect, type Page, type ElectronApplication } fr
 import fs from 'node:fs'
 import path from 'node:path'
 
-export const evidence = path.resolve(process.cwd(), '../docs/superpowers/evidence/2026-10-13-desktop-research/task7-electron')
+export const evidence = process.env.MISAKA_VISUAL_EVIDENCE
+  ? path.resolve(process.env.MISAKA_VISUAL_EVIDENCE, 'lifecycle')
+  : path.resolve(process.cwd(), '../docs/superpowers/evidence/2026-10-13-desktop-research/task7-electron')
 export async function requestHost(page: Page, type = 'get_research_host', fields: Record<string, unknown> = {}, channel: 'researchBridge' | 'bridge' = 'researchBridge', timeout = 60_000): Promise<any> {
   return page.evaluate(async ({type, fields, channel, timeout}) => {
     const transport = window[channel]

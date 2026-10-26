@@ -42,7 +42,7 @@ import { PermissionDialog } from './components/Permission/PermissionDialog'
 import { ResearchGraphCanvas } from './components/ResearchGraph/ResearchGraphCanvas'
 import { ResearchTilingWorkspace } from './components/ResearchWorkspace/ResearchTilingWorkspace'
 import { ResearchTeamNavigator } from './components/ResearchWorkspace/ResearchTeamNavigator'
-import { resolveMainSession, rootControllerId } from './components/ResearchWorkspace/researchTeam'
+import { resolveMainSession, resolveResearchNodeId, rootControllerId } from './components/ResearchWorkspace/researchTeam'
 import { useResearchRunStore } from './store/useResearchRunStore'
 import { useResearchWorkspaceStore } from './store/useResearchWorkspaceStore'
 import { readResearchViewMode, saveResearchViewMode, type ResearchViewMode } from './lib/researchViewMode'
@@ -452,7 +452,7 @@ export default function App() {
     saveResearchViewMode(next)
     if (tilingBinding?.runId) useResearchWorkspaceStore.getState().setViewMode(tilingBinding.runId, next)
   }
-  const researchCurrentId = researchRun ? resolveMainSession(researchRun, researchView?.selectedNodeId ?? researchRun.graph.nodes[0]?.id ?? null, researchView?.mainExecutorId)?.executorId ?? null : null
+  const researchCurrentId = researchRun ? resolveMainSession(researchRun, resolveResearchNodeId(researchRun, researchView?.selectedNodeId), researchView?.mainExecutorId)?.executorId ?? null : null
   const isWelcome = viewMode === 'timeline' && !researchSurface && messages.length === 0 && !isSessionLoading && !isStreaming && !sessionLoadError
   const isResearchWorkspace = viewMode === 'timeline' && Boolean(tilingBinding?.runId)
   // Render the existing switcher in exactly one place so its ref and menu stay shared.

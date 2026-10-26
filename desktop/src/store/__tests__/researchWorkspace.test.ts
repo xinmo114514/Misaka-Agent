@@ -77,6 +77,33 @@ describe('research tile state', () => {
     expect(run.pinnedExecutorIds).toContain('b')
     expect(run.reading.a.scrollTop).toBe(270)
   })
+  it('selects a focus node and clears only the main reader in one workspace update', () => {
+    useResearchWorkspaceStore.setState({ byRun: { r1: {
+      selectedNodeId: 'n1', focusedExecutorId: 'a', pinnedExecutorIds: ['a', 'b'],
+      reading: { a: { scrollTop: 270, following: false } }, viewMode: 'multi',
+      expandedExecutorId: 'b', detailsOpen: true, processOpen: true,
+      mainExecutorId: 'a', sideExecutorId: 'b',
+    } } })
+    const updates: Array<{ selectedNodeId: string | null; mainExecutorId?: string | null }> = []
+    const unsubscribe = useResearchWorkspaceStore.subscribe(state => updates.push({
+      selectedNodeId: state.byRun.r1.selectedNodeId,
+      mainExecutorId: state.byRun.r1.mainExecutorId,
+    }))
+
+    try {
+      useResearchWorkspaceStore.getState().selectFocusNode('r1', 'n2')
+    } finally {
+      unsubscribe()
+    }
+
+    expect(updates).toEqual([{ selectedNodeId: 'n2', mainExecutorId: null }])
+    expect(useResearchWorkspaceStore.getState().byRun.r1).toEqual({
+      selectedNodeId: 'n2', focusedExecutorId: 'a', pinnedExecutorIds: ['a', 'b'],
+      reading: { a: { scrollTop: 270, following: false } }, viewMode: 'multi',
+      expandedExecutorId: 'b', detailsOpen: true, processOpen: true,
+      mainExecutorId: null, sideExecutorId: 'b',
+    })
+  })
   it('keeps six MRU card pins and never spends a card pin on Last Order', () => {
     const store = useResearchWorkspaceStore.getState()
     for (const id of ['a', 'b', 'c', 'd', 'e', 'f', 'g']) store.focusExecutor('r1', descriptor(id))

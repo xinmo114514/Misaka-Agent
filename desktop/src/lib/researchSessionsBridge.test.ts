@@ -72,7 +72,7 @@ describe('session bridge', () => {
     const reading=researchSessionsBridge.history('r','e','C:/work')
     useResearchSessionsStore.getState().upsertDescriptors('r',[{...descriptor,sessionId:'new',generation:2}])
     finish({runId:'r',executorId:'e',messages:[{id:'old-row',role:'assistant',content:'old generation',timestamp:1}],historyVersion:'v1',nextCursor:null,hasMore:false,availability:'available'})
-    await reading
+    await expect(reading).rejects.toMatchObject({ name: 'ResearchHistoryInvalidatedError', retryable: false })
     expect(useResearchSessionsStore.getState().byExecutor.e.messages).toEqual([])
   })
   it('rejects packets from a retired host stream after reconnect', () => {
