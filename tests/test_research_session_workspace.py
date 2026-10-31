@@ -32,7 +32,7 @@ def test_completed_coordinator_does_not_project_a_previous_stops_error_as_curren
     run, _, _ = card_with_instance(board, tmp_path, [
         {"id": "c", "name": "read", "arguments": {}, "output": "source"}])
     root = runs.root(board, run['id'])
-    board.execute("UPDATE research_branches SET status='closed',last_error='previous quota stop' WHERE id=?", (root['id'],))
+    board.execute("UPDATE research_execution SET status='closed',last_error='previous quota stop' WHERE id=?", (root['id'],))
     runs.set_state(board, run['id'], status='done')
     coordinator = desktop_view.session_descriptors(board, run['id'])[0]
     assert coordinator['status'] == 'done'

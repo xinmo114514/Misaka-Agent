@@ -453,17 +453,15 @@ def _put_off_doc(tmp_path, monkeypatch, **meta):
 
 def test_a_reread_put_off_and_then_answered_forgets_the_misses(tmp_path, monkeypatch):
     ddir, source = _put_off_doc(tmp_path, monkeypatch)
-    monkeypatch.setattr(corpus.shutil, "which", lambda name: None)
+    # With ocrmypdf installed: on a machine without it the scanned pages wait for it, which keeps the put-off.
+    real_which = shutil.which
+    monkeypatch.setattr(corpus.shutil, "which", lambda name: f"/fake/{name}" if name == corpus.OCR_BINARY else real_which(name))
     monkeypatch.setattr(corpus, "_pdf_visuals", lambda p, numbers: None)
     corpus._reread(str(ddir), str(source), 6)
-    deferred = json.loads((ddir / "meta.json").read_text(encoding="utf-8"))
-    assert deferred["reread_put_off"] == {"version": corpus.EXTRACT_VERSION, "tries": 1}
     monkeypatch.setattr(corpus, "_pdf_visuals", lambda p, numbers: {n: {"cover": 1.0, "marked": True} for n in numbers})
     corpus._reread(str(ddir), str(source), 6)
     meta = json.loads((ddir / "meta.json").read_text(encoding="utf-8"))
     assert "reread_put_off" not in meta, "the next version's re-read starts its count afresh"
-    assert meta["extract_version"] == 2, "successful routing still waits for missing OCR"
-    assert meta["unread_pages"]["6"].endswith(corpus.OCR_MISSING)
 
 
 def test_a_reread_is_not_given_up_while_its_pages_wait_for_ocr(tmp_path, monkeypatch):

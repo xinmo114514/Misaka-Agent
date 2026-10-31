@@ -31,7 +31,7 @@ def coordinator(tmp_path, monkeypatch, outcomes, *, members=None):
     session.sendCustomMessage = send
     session.waitForIdle = AsyncMock()
     session.abort = AsyncMock()
-    session._find_last_assistant_message = lambda: next((m for m in reversed(messages) if m['role'] == 'assistant'), None)
+    session._findLastAssistantMessage = lambda: next((m for m in reversed(messages) if m['role'] == 'assistant'), None)
     controller = object.__new__(runtime.DesktopResearchController)
     controller.lock = asyncio.Lock()
     controller.session = session
@@ -267,7 +267,7 @@ async def test_committed_coordinator_switch_drops_previous_request_network_conte
         session.model = new_model
         return {'state': 'ready', 'effective': {'provider': provider, 'modelId': model_id}}
 
-    session.modelRegistry = SimpleNamespace(find=lambda *_: new_model, checkConfiguredAuth=AsyncMock(return_value=True))
+    session.modelRegistry = SimpleNamespace(find=lambda *_: new_model, checkAuth=AsyncMock(return_value=True))
     controller = object.__new__(runtime.DesktopResearchController)
     controller.session = session
     controller.team = SimpleNamespace(model_policy=SimpleNamespace(switch=switch,
@@ -279,18 +279,18 @@ async def test_committed_coordinator_switch_drops_previous_request_network_conte
 
 
 def test_reopened_diagnostic_reads_stored_env_and_pure_oauth_endpoint_without_refresh(monkeypatch):
-    from misaka.ai.utils import oauth
     from misaka.core.auth_storage import AuthStorage
     from misaka.desktop_research.recruitment import network_context
     storage = AuthStorage.inMemory()
-    storage.set('fixture', {'type': 'oauth', 'access': 'fixture-access', 'refresh': 'fixture-refresh', 'expires': 0,
-                            'enterpriseUrl': 'http://enterprise.invalid:31271/v1',
-                            'env': {'https_proxy': 'http://proxy.invalid:38129'}})
-    flow = SimpleNamespace(getBaseUrl=lambda credentials: credentials.enterpriseUrl)
-    monkeypatch.setattr(oauth, 'getOAuthProvider', lambda provider: flow)
-    session = SimpleNamespace(model=SimpleNamespace(provider='fixture', id='fixture', baseUrl='https://placeholder.invalid'),
-        modelRegistry=SimpleNamespace(authStorage=storage))
-    assert network_context(session) == ('http://enterprise.invalid:31271/v1', {'https_proxy': 'http://proxy.invalid:38129'})
+    storage.readState.data['github-copilot'] = {
+        'type': 'oauth', 'access': 'tid=fixture;proxy-ep=proxy.enterprise.invalid:31271;',
+        'refresh': 'fixture-refresh', 'expires': 0,
+        'env': {'https_proxy': 'http://proxy.invalid:38129'}}
+    session = SimpleNamespace(model=SimpleNamespace(provider='github-copilot', id='fixture',
+        baseUrl='https://placeholder.invalid'), modelRegistry=SimpleNamespace(authStorage=storage))
+    assert network_context(session) == ('https://api.enterprise.invalid:31271',
+                                       {'https_proxy': 'http://proxy.invalid:38129'})
+
 
 
 @pytest.mark.parametrize('legacy', [False, True])

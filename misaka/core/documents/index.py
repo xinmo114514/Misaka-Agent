@@ -125,7 +125,7 @@ def _pdf_text_layer(p):
     # -- her session, her card -- down with SIGABRT.
     try:
         out = subprocess.run([sys.executable, "-c", _PDFIUM_TEXT_CHILD, p], capture_output=True,
-                             text=True, encoding="utf-8", timeout=300, check=False)
+                             text=True, encoding="utf-8", errors="replace", timeout=300, check=False)
         if out.returncode == 0 and out.stdout.strip():
             pages = json.loads(out.stdout)
             if isinstance(pages, list) and all(isinstance(page, str) for page in pages):
@@ -332,7 +332,8 @@ def _pdf_visuals(p, numbers):
     (the box round the drawing), with the page's ``size`` and ``rotation``."""
     try:
         out = subprocess.run([sys.executable, "-c", _PDFIUM_VISUALS_CHILD, p, json.dumps(numbers)],
-                             capture_output=True, text=True, encoding="utf-8", timeout=300, check=False)
+                             capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=300,
+                             check=False)
         if out.returncode == 0:
             return {int(number): signals for number, signals in json.loads(out.stdout).items()}
     except (OSError, subprocess.SubprocessError, ValueError, TypeError):
@@ -578,7 +579,7 @@ def _pdf_page_labels(p):
     """A PDF's own page labels, one per page (``""`` for an unlabelled one), or None."""
     try:
         out = subprocess.run([sys.executable, "-c", _PDFIUM_LABELS_CHILD, p], capture_output=True,
-                             text=True, encoding="utf-8", timeout=120, check=False)
+                             text=True, encoding="utf-8", errors="replace", timeout=120, check=False)
         labels = json.loads(out.stdout) if out.returncode == 0 else None
     except (OSError, subprocess.SubprocessError, ValueError):
         return None
@@ -2173,18 +2174,23 @@ def scan(directory, task_id=None, with_tree=True, workspace=None):
     return ingested, skipped
 
 
+def doc_row(doc_id, workspace=None):
+    """One document's ``docs`` row, or None when ``doc_id`` is no document of ``workspace``.
+    A tool after one document reads it here: finding it in ``docs`` read every document's
+    metadata, 17 s on a 33,308-document project (2026-10-27)."""
+    ddir = resolve_doc(doc_id, workspace=workspace)
+    if not ddir:
+        return None
+    m = dict(_read_meta_at(ddir))
+    m["has_tree"] = _real_file(os.path.join(ddir, "tree.json"), ddir)
+    return m
+
+
 def docs(workspace=None):
     """List indexed documents oldest first; ``workspace`` keeps only those whose source file lives under that folder."""
-    root, out = corpus_root(workspace), []
-    for name in (os.listdir(root) if os.path.isdir(root) else []):
-        ddir = resolve_doc(name, workspace=workspace)
-        if not ddir:
-            continue
-        m = _read_meta_at(ddir)
-        m = dict(m)
-        m["has_tree"] = _real_file(os.path.join(ddir, "tree.json"), ddir)
-        out.append(m)
-    return sorted(out, key=lambda m: m.get("added_at", 0))
+    root = corpus_root(workspace)
+    rows = (doc_row(name, workspace=workspace) for name in (os.listdir(root) if os.path.isdir(root) else []))
+    return sorted((m for m in rows if m is not None), key=lambda m: m.get("added_at", 0))
 
 
 def _iter_pages(doc_id, lo=None, hi=None, workspace=None):

@@ -107,7 +107,7 @@ def prepare_cards(con, task_ids, *, field_updates=None, targets=None):
         yield
         return
     from misaka.core.platform import cards, tasks
-    from misaka.utils.frontmatter import parse_frontmatter
+    from misaka.utils.frontmatter import parseFrontmatter as parse_frontmatter
     cache = {}
     files = []
     token = None
@@ -279,7 +279,7 @@ class PreparedCard:
 
 def stage(workspace, task_id, mutate, *, generation, new_status, con=None):
     from misaka.core.platform import cards, tasks
-    from misaka.utils.frontmatter import parse_frontmatter
+    from misaka.utils.frontmatter import parseFrontmatter as parse_frontmatter
     path = Path(cards.card_path(workspace, task_id))
     if con is not None and con.in_transaction:
         prepared = _use_prepared(con, task_id, mutate)

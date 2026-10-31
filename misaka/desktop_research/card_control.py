@@ -13,6 +13,7 @@ from starting a process; the worker re-checks the generation before reopening an
 from __future__ import annotations
 
 import json
+import logging
 import os
 import subprocess
 import sys
@@ -22,7 +23,14 @@ from pathlib import Path
 
 from filelock import FileLock
 
+from misaka.utils.prompt_file import removePromptFile, writePromptToTempFile
+
 from .model_policy import atomic_json
+
+
+_LOG = logging.getLogger(__name__)
+REAP_INTERVAL_SECONDS = 3.0
+MAX_AUTOMATIC_RETRIES = 2
 
 
 class DesktopCardControl:
@@ -30,6 +38,7 @@ class DesktopCardControl:
 
     def __init__(self, scope):
         self.scope = scope
+        self.prompt_files = {}
         self.continuations = {}          # task_id -> subprocess.Popen
         self._pending = {}
         self.registry_path = Path(scope.team.directory) / "continuation-registry.json"
@@ -37,6 +46,11 @@ class DesktopCardControl:
         if not hasattr(scope, "pending_launches"):
             scope.pending_launches = set()
         self.launches = {}               # task_id -> launch id recorded for admission
+        self._monitor_lock = threading.Lock()
+        self._monitor_stop = threading.Event()
+        self._monitor_thread = None
+        if self.registry_path.exists():
+            self._ensure_monitor()
 
     # -- identity ---------------------------------------------------------------
 
@@ -58,7 +72,7 @@ class DesktopCardControl:
             return None, 'This card does not belong to a desktop research team.'
         con = task_store.connect(os.path.expanduser(self.scope.current_config()['db']))
         try:
-            link = con.execute('SELECT run_id FROM research_run_tasks WHERE task_id=?', (task_id,)).fetchone()
+            link = con.execute('SELECT run_id FROM research_cards WHERE task_id=?', (task_id,)).fetchone()
             if link is None:
                 return None, f'Card {task_id} is not a research card of this desktop team.'
             run = runs.get(con, link['run_id'])
@@ -155,7 +169,7 @@ class DesktopCardControl:
                 return existing['executionId'], duplicate
             execution_id = uuid.uuid4().hex
             records[task_id] = {'executionId': execution_id, 'state': 'pending',
-                                'generation': generation,
+                                'generation': generation, 'consult': True, 'automaticRetries': 0,
                                 'requests': list(dict.fromkeys([*(existing or {}).get('requests', []), request_id])),
                                 'workspace': workspace, 'ownerPid': os.getpid(),
                                 'ownerIdentity': self._owner_identity()}
@@ -163,7 +177,7 @@ class DesktopCardControl:
         self._queue(task_id, message, generation, execution_id, workspace)
         return execution_id, False
 
-    def claiming(self, task_id, generation, claim_lock, identity):
+    def claiming(self, task_id, generation, claim_lock, identity, *, consult=False):
         """Journal the exact prospective CAS owner, including the pre-release crash window."""
         execution_id = (os.environ.get('MISAKA_DESKTOP_CONTINUATION_EXECUTION_ID')
                         if os.environ.get('MISAKA_DESKTOP_CONTINUATION') == task_id else None)
@@ -176,11 +190,12 @@ class DesktopCardControl:
                     or record.get('state') not in {'pending', 'running'}
                     or record.get('generation') != generation):
                 raise ValueError('Desktop continuation execution ownership changed before claim')
-            record['claimIntent'] = {'generation': generation + 1, 'claimLock': claim_lock,
+            record['consult'] = consult
+            record['claimIntent'] = {'generation': generation if consult else generation + 1, 'consult': consult, 'claimLock': claim_lock,
                                      'pid': os.getpid(), 'identity': identity}
             atomic_json(self.registry_path, records)
 
-    def claimed(self, task_id, generation, claim_lock):
+    def claimed(self, task_id, generation, claim_lock, *, consult=False):
         """Release inbox input only for this execution's successful board CAS.
 
         The registry precedes the mailbox write: either crash window is replayable.
@@ -213,6 +228,19 @@ class DesktopCardControl:
                     if intent.get('generation') != generation or prior is None:
                         return
                 row = tasks.get(con, task_id)
+                if consult:
+                    live = tasks.live_consultation(con, task_id)
+                    intent = record.get('claimIntent', {})
+                    if (row is None or int(row['generation']) != generation
+                            or generation != int(record['generation']) or live is None
+                            or live['claim_lock'] != claim_lock or live['pid'] != os.getpid()
+                            or live['process_identity'] != intent.get('identity')):
+                        raise ValueError('Desktop consultation ownership changed before inbox release')
+                    record.update(claimedGeneration=generation, claimLock=claim_lock,
+                                  consultationId=live['id'])
+                    atomic_json(self.registry_path, records)
+                    self._release_mail(task_id, record)
+                    return
                 if (row is None or row['status'] != 'running' or int(row['generation']) != generation
                         or row['claim_lock'] != claim_lock or row['worker_pid'] != os.getpid()
                         or generation != int(record['generation']) + 1):
@@ -233,9 +261,14 @@ class DesktopCardControl:
             # Fence the independent mailbox write against another board generation.
             with tasks.write_txn(con):
                 row = tasks.get(con, task_id)
-                if (row is None or row['status'] != 'running'
-                        or row['generation'] != record.get('claimedGeneration')
-                        or row['claim_lock'] != record.get('claimLock')):
+                if row is None or row['generation'] != record.get('claimedGeneration'):
+                    return
+                if record.get('consultationId'):
+                    live = tasks.live_consultation(con, task_id)
+                    if (live is None or live['id'] != record['consultationId']
+                            or live['claim_lock'] != record.get('claimLock')):
+                        return
+                elif row['status'] != 'running' or row['claim_lock'] != record.get('claimLock'):
                     return
                 mail = messages.connect(config.get('messages_db'))
                 try:
@@ -278,6 +311,7 @@ class DesktopCardControl:
         self._pending[execution_id] = pending
         self.scope.pending_launches.add(pending)
         pending.start()
+        self._ensure_monitor()
 
     def _launch(self, pending):
         from .model_policy import ModelPolicyPaused
@@ -318,12 +352,14 @@ class DesktopCardControl:
                 launch_id = self.scope.record_launch(binding)
                 log_dir = Path(self.scope.team.directory) / 'continuations'
                 log_dir.mkdir(parents=True, exist_ok=True)
+                written = writePromptToTempFile(task_id, pending.message)
+                self.prompt_files[task_id] = written
                 argv = [sys.executable, '-m', 'misaka.desktop_research.worker_entry',
                         '--policy', str(self.scope.team.model_policy.path),
                         '--epoch', str(binding['epoch']), '--provider', binding['provider'],
                         '--model', binding['modelId'], '--launch-id', launch_id, '--lane', 'card',
                         '--role', 'sister',
-                        '--', '--run-card', task_id, '--say', pending.message,
+                        '--', '--run-card', task_id, '--say-file', written[1],
                         '--expected-generation', str(pending.generation), '--consult']
                 with open(log_dir / f'{task_id}-{launch_id}.log', 'a', encoding='utf-8') as log:
                     process = subprocess.Popen(argv, cwd=workspace_path(run),
@@ -336,6 +372,7 @@ class DesktopCardControl:
                 record.update(state='running', pid=process.pid, identity=processes.identity(process.pid))
                 atomic_json(self.registry_path, records)
         except Exception as error:  # noqa: BLE001 - pending launch failure is persisted for retry
+            removePromptFile(self.prompt_files.pop(task_id, None))
             with self.registry_lock:
                 records = self._registry()
                 record = records.get(task_id, {})
@@ -346,17 +383,92 @@ class DesktopCardControl:
             self.scope.pending_launches.discard(pending)
             self._pending.pop(pending.execution_id, None)
 
+    def _ensure_monitor(self):
+        with self._monitor_lock:
+            if self._monitor_stop.is_set() or (self._monitor_thread is not None and self._monitor_thread.is_alive()):
+                return
+            self._monitor_thread = threading.Thread(target=self._monitor, daemon=True,
+                                                    name="desktop-consultation-recovery")
+            self._monitor_thread.start()
+
+    def _monitor(self):
+        while not self._monitor_stop.wait(REAP_INTERVAL_SECONDS):
+            try:
+                self._reap()
+            except Exception:  # A failed poll must not lose the persisted recovery intent.
+                _LOG.exception("Desktop consultation recovery needs another poll")
+
+    def _retry_consultation(self, task_id, record):
+        """Requeue only this dead execution's undelivered inbox, within a persisted retry limit."""
+        if not record.get('consult', record.get('claimIntent', {}).get('consult', False)):
+            return None
+        from misaka.core.network import messages
+        from misaka.core.platform import tasks
+        config = self.scope.current_config()
+        con = tasks.connect(config['db'])
+        try:
+            row = tasks.get(con, task_id)
+            generation = int(record['generation'])
+            if row is None or int(row['generation']) != generation or row['status'] not in tasks.CONSULTABLE:
+                return None
+            live = tasks.live_consultation(con, task_id)
+            if live is not None:
+                intent = record.get('claimIntent', {})
+                if (live['claim_lock'] != record.get('claimLock', intent.get('claimLock'))
+                        or live['pid'] != intent.get('pid')
+                        or live['process_identity'] != intent.get('identity')):
+                    return None  # Another process's consultation cannot be interrupted.
+                tasks.end_consultation(con, live['id'], live['claim_lock'], 'failed',
+                                       reason='Desktop consultation worker exited before delivery')
+            mail = messages.connect(config.get('messages_db'))
+            try:
+                ids = {str(value) for value in record.get('requests', []) if str(value).isdigit()}
+                pending = [str(item['id']) for item in mail.execute(
+                    "SELECT id,lease_token FROM messages WHERE to_task=? AND generation=? AND delivered_at IS NULL",
+                    (task_id, generation))
+                    if str(item['id']) in ids or str(item['lease_token'] or '').startswith(messages.CONTINUATION_TOKEN)]
+            finally:
+                mail.close()
+            if not pending:
+                return None
+            retries = int(record.get('automaticRetries', 0))
+            if retries >= MAX_AUTOMATIC_RETRIES:
+                record.update(state='failed', errorCode='DESKTOP_CONTINUATION_RETRY_LIMIT')
+                return None
+            execution_id = uuid.uuid4().hex
+            record.update(state='pending', executionId=execution_id, requests=pending,
+                          automaticRetries=retries + 1, ownerPid=os.getpid(),
+                          ownerIdentity=self._owner_identity())
+            for field in ('claimIntent', 'claimLock', 'claimedGeneration', 'consultationId', 'pid', 'identity'):
+                record.pop(field, None)
+            return (task_id, "Read the newly queued task inbox messages and answer their questions.",
+                    generation, execution_id, record['workspace'])
+        finally:
+            con.close()
+
     def _reap(self):
         from misaka.core.platform import processes
+        launches = []
         with self.registry_lock:
             records = self._registry()
             changed = False
             for task_id, record in records.items():
                 if record.get('state') == 'pending':
                     pid, birth = record.get('ownerPid'), record.get('ownerIdentity')
-                    # Missing identity/permission-unknown liveness is not proof of death.
                     if pid and birth and not processes.identity_is_alive(pid, birth):
                         record.update(state='failed', errorCode='DESKTOP_LAUNCH_OWNER_LOST')
+                        changed = True
+                        launch = self._retry_consultation(task_id, record)
+                        if launch is not None:
+                            launches.append(launch)
+                    continue
+                if record.get('state') == 'settled':
+                    # A previous host may have reaped the process before it could queue recovery.
+                    launch = self._retry_consultation(task_id, record)
+                    if launch is not None:
+                        launches.append(launch)
+                        changed = True
+                    elif record.get('state') == 'failed':
                         changed = True
                     continue
                 if record.get('state') != 'running':
@@ -368,15 +480,23 @@ class DesktopCardControl:
                 if dead:
                     record['state'] = 'settled'
                     changed = True
+                    removePromptFile(self.prompt_files.pop(task_id, None))
                     self.continuations.pop(task_id, None)
                     self.launches.pop(task_id, None)
+                    launch = self._retry_consultation(task_id, record)
+                    if launch is not None:
+                        launches.append(launch)
             if changed:
                 atomic_json(self.registry_path, records)
+        for launch in launches:
+            if not self._monitor_stop.is_set():
+                self._queue(*launch)
 
     def stop_all(self):
         """Every continued card of this scope dies with it; the claim is left to reconcile."""
         from misaka.core.platform import processes
 
+        self._monitor_stop.set()
         pending = list(self._pending.values())
         for launch in pending:
             launch.cancelled.set()
@@ -405,6 +525,7 @@ class DesktopCardControl:
                 except subprocess.TimeoutExpired:
                     process.kill()
                     process.wait(5)
+            removePromptFile(self.prompt_files.pop(task_id, None))
             self.continuations.pop(task_id, None)
             self.launches.pop(task_id, None)
         return stopped

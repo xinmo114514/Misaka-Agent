@@ -58,23 +58,20 @@ class SessionSpec:
     mcp_role: str | None = None
     receive_messages: bool = False
     # Whether this session also collects the workspace's card notifications; None = as
-    # ``receive_messages``. A research node's window reads its own mail but leaves the card
+    # ``receive_messages``. A workflow node's window reads its own mail but leaves the card
     # notifications to the root's window (B123).
     receive_notifications: bool | None = None
     task_id: str | None = None
     tool_ceiling: tuple[str, ...] | None = None
-    # Where this session's skills come from, as ``(layer, root)`` pairs. None = the role's
-    # three layers (project, role, shared); a card passes its read-only sandbox instead.
-    skill_roots: tuple[tuple[str, str], ...] | None = None
     startup_skills: tuple[str, ...] = ()
-    # Optional one-call catalog snapshot shared with Research's assignment validator.
+    # Optional one-call catalog snapshot shared with a workflow's assignment validator.
     sister_catalog: tuple[dict[str, Any], ...] | None = None
-    research_context: bool = False
-    # The desktop's independent root is research-scoped but still owns /research.
-    # Workflow-internal node sessions remain controller-free.
+    # Whether this session works inside a workflow that owns cards (``platform.owners``): its
+    # driver holds the board tools, and the owner's context joins the system prompt.
+    workflow_context: bool = False
     research_host: bool = False
     # Settings this session runs with instead of the global ones, as ``(key, value)`` pairs
-    # (``misaka.core.session_overrides``): a research run's compaction threshold and output limit.
+    # (``misaka.core.session_overrides``): a workflow run's compaction threshold and output limit.
     overrides: tuple[tuple[str, Any], ...] = ()
 
 
@@ -116,7 +113,6 @@ class ToolCollector:
 PART_MODULES: tuple[str, ...] = (
     "misaka.core.session_catalog",
     "misaka.core.moa",
-    "misaka.core.mcp",
     "misaka.core.web",
     "misaka.core.network.wiring.messages",
     "misaka.core.network.wiring.roster",
@@ -136,29 +132,17 @@ PART_MODULES: tuple[str, ...] = (
 )
 
 
-# Core modules that are providers (``provider_config(configured, find) -> (name, config) | None``,
-# with the registry's own credential check and model lookup): part of every model registry,
-# recomputed on each reload, as pi's built-in providers are.
+# Core modules that are providers (``provider_config(runtime) -> (name, config)``): part of every
+# model runtime, registered when it is created, as pi's built-in providers are. A config's
+# ``refreshModels`` keeps what it publishes in step with the credentials of the moment.
 PROVIDER_MODULES: tuple[str, ...] = (
     "misaka.core.moa",
 )
 
 
-def core_providers(
-    configured: Callable[[str], bool],
-    find: Callable[[str, str], Any] | None = None,
-) -> list[tuple[str, dict[str, Any]]]:
-    """``(name, config)`` for each core provider that has something to publish right now.
-
-    ``configured`` is the registry's credential check and ``find`` its model lookup; a
-    provider that composes other models needs the second to size itself.
-    """
-    out: list[tuple[str, dict[str, Any]]] = []
-    for path in PROVIDER_MODULES:
-        entry = importlib.import_module(path).provider_config(configured, find)
-        if entry is not None:
-            out.append(entry)
-    return out
+def core_providers(runtime: Any) -> list[tuple[str, dict[str, Any]]]:
+    """``(name, config)`` for each core provider, bound to the runtime it serves."""
+    return [importlib.import_module(path).provider_config(runtime) for path in PROVIDER_MODULES]
 
 
 def _qualifies(mod: Any, role: str, kind: str) -> bool:
@@ -264,10 +248,10 @@ def spec_overrides(overrides) -> tuple[tuple[str, Any], ...]:
 
 
 def role_session_setup(profile_dir, workspace, *, model=None, receive_messages=False,
-                       receive_notifications=None, research_context=False, research_host=False, startup_skills=(), overrides=None):
+                       receive_notifications=None, workflow_context=False, research_host=False, startup_skills=(), overrides=None):
     """One role session entry, independent of terminal, root/fork and lifetime.
 
-    Callers add only their transport/session-selection flags. Research changes the
+    Callers add only their transport/session-selection flags. A workflow changes the
     mode overlay and per-phase tool scope, never the base capability registry.
     """
     from misaka.config import identity
@@ -283,8 +267,7 @@ def role_session_setup(profile_dir, workspace, *, model=None, receive_messages=F
     assembly = assemble(SessionSpec(
         profile_dir=profile_dir, role=role, workspace=workspace, kind="foreground",
         sender=sender, mcp_role=sender, receive_messages=receive_messages,
-        receive_notifications=receive_notifications, research_context=research_context, research_host=research_host,
-        startup_skills=tuple(startup_skills),
+        receive_notifications=receive_notifications, workflow_context=workflow_context, research_host=research_host, startup_skills=tuple(startup_skills),
         overrides=spec_overrides(overrides)))
     from misaka.config import env as env_file
 
@@ -300,10 +283,16 @@ def assemble(spec: SessionSpec) -> Assembly:
 
 
 def inline(
-    name: str, factory: Callable[[Any], Any], *, hidden: bool = False
+    name: str,
+    factory: Callable[[Any], Any],
+    *,
+    hidden: bool = False,
+    replaceable: bool = False,
+    builtin: bool = False,
 ) -> dict[str, Any]:
-    """Build the named inline-extension descriptor used by Pi's resource loader."""
-    return {"name": name, "factory": factory, "hidden": hidden}
+    """Build the named inline-extension descriptor used by Pi's resource loader. ``builtin``
+    makes it the code of the ``builtin:<name>`` extension resource (see ``InlineExtension``)."""
+    return {"name": name, "factory": factory, "hidden": hidden, "replaceable": replaceable, "builtin": builtin}
 
 
 def delegates(spec: SessionSpec) -> bool:

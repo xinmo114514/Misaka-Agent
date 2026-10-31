@@ -12,14 +12,16 @@ from tests.test_prompt_assembly_integration import prompt_home  # noqa: F401 - f
 
 
 async def test_recruitment_that_never_settles_fails_with_a_retryable_error(prompt_home, monkeypatch):  # noqa: F811
-    from misaka.ai.models import get_models
+    from misaka.ai.auth.types import ApiKeyCredential
+    from misaka.ai.providers.openai_models import OPENAI_MODELS
     from misaka.ai.types import AssistantMessage, DoneEvent
     from misaka.ai.utils.event_stream import AssistantMessageEventStream
     from misaka.core import wiring
     from misaka.core.auth_storage import AuthStorage
+    from misaka.core.model_runtime import ModelRuntime
     from misaka.core.research import submissions
     from misaka.core.resource_loader import DefaultResourceLoader
-    from misaka.core.sdk import create_agent_session
+    from misaka.core.sdk import createAgentSession as create_agent_session
     from misaka.core.session_manager import SessionManager
     from misaka.core.settings_manager import SettingsManager
     from misaka.desktop_research import runtime
@@ -31,15 +33,17 @@ async def test_recruitment_that_never_settles_fails_with_a_retryable_error(promp
     workspace = prompt_home / 'workspace_recruit_timeout'
     workspace.mkdir()
     _, assembly, _ = wiring.role_session_setup(str(prompt_home / 'profiles/last_order'), str(workspace),
-                                               research_context=True, research_host=True)
+                                               workflow_context=True, research_host=True)
     loader = DefaultResourceLoader({'cwd': str(workspace), 'agentDir': str(prompt_home / 'agent'),
                                     'noExtensions': True, 'noPromptTemplates': True, 'noThemes': True})
     await loader.reload()
-    model = next(iter(get_models('openai')))
+    model = next(iter(OPENAI_MODELS.values()))
     auth = AuthStorage.inMemory()
-    auth.setRuntimeApiKey(model.provider, 'deterministic-fixture')
+    async def credential(_current):
+        return ApiKeyCredential(key="deterministic-fixture")
+    await auth.modify(model.provider, credential)
     result = await create_agent_session({
-        'cwd': str(workspace), 'agentDir': str(prompt_home / 'agent'), 'model': model, 'authStorage': auth,
+        'cwd': str(workspace), 'agentDir': str(prompt_home / 'agent'), 'model': model, 'modelRuntime': await ModelRuntime.create({'authStorage': auth, 'modelsPath': None}),
         'resourceLoader': loader,
         'settingsManager': SettingsManager.inMemory({'compaction': {'enabled': False}, 'retry': {'enabled': False}}),
         'sessionManager': SessionManager.create(str(workspace), str(prompt_home / 'sessions')),
@@ -61,7 +65,7 @@ async def test_recruitment_that_never_settles_fails_with_a_retryable_error(promp
         out.end(reply)
         return out
 
-    session.agent.streamFn = stream
+    session.agent.streamFunction = stream
     controller = DesktopResearchController(session, lambda payload: None).attach()
     await controller.set_team_model(model.provider, model.id, role='last_order')
     await session.bindExtensions({'mode': 'json'})
@@ -103,13 +107,15 @@ async def test_recruitment_timeout_is_reported_as_a_structured_bridge_ack(prompt
 
 async def test_recruitment_stream_call_that_never_completes_times_out(prompt_home, monkeypatch):  # noqa: F811
     """When the provider stream stalls during sendCustomMessage, recruitment timeout must fire."""
-    from misaka.ai.models import get_models
+    from misaka.ai.auth.types import ApiKeyCredential
+    from misaka.ai.providers.openai_models import OPENAI_MODELS
     from misaka.ai.utils.event_stream import AssistantMessageEventStream
     from misaka.core import wiring
     from misaka.core.auth_storage import AuthStorage
+    from misaka.core.model_runtime import ModelRuntime
     from misaka.core.research import submissions
     from misaka.core.resource_loader import DefaultResourceLoader
-    from misaka.core.sdk import create_agent_session
+    from misaka.core.sdk import createAgentSession as create_agent_session
     from misaka.core.session_manager import SessionManager
     from misaka.core.settings_manager import SettingsManager
     from misaka.desktop_research import runtime
@@ -120,15 +126,18 @@ async def test_recruitment_stream_call_that_never_completes_times_out(prompt_hom
     workspace = prompt_home / "workspace_recruit_stream_timeout"
     workspace.mkdir()
     _, assembly, _ = wiring.role_session_setup(str(prompt_home / "profiles/last_order"), str(workspace),
-                                               research_context=True, research_host=True)
+                                               workflow_context=True, research_host=True)
     loader = DefaultResourceLoader({"cwd": str(workspace), "agentDir": str(prompt_home / "agent"),
                                     "noExtensions": True, "noPromptTemplates": True, "noThemes": True})
     await loader.reload()
-    model = next(iter(get_models("openai")))
+    model = next(iter(OPENAI_MODELS.values()))
     auth = AuthStorage.inMemory()
-    auth.setRuntimeApiKey(model.provider, "deterministic-fixture")
+    async def credential(_current):
+        return ApiKeyCredential(key="deterministic-fixture")
+    await auth.modify(model.provider, credential)
     result = await create_agent_session({
-        "cwd": str(workspace), "agentDir": str(prompt_home / "agent"), "model": model, "authStorage": auth,
+        "cwd": str(workspace), "agentDir": str(prompt_home / "agent"), "model": model,
+        "modelRuntime": await ModelRuntime.create({"authStorage": auth, "modelsPath": None}),
         "resourceLoader": loader,
         "settingsManager": SettingsManager.inMemory({"compaction": {"enabled": False}, "retry": {"enabled": False}}),
         "sessionManager": SessionManager.create(str(workspace), str(prompt_home / "sessions")),
@@ -140,7 +149,7 @@ async def test_recruitment_stream_call_that_never_completes_times_out(prompt_hom
     def hanging_stream(actual_model, context, options=None):
         return AssistantMessageEventStream()
 
-    session.agent.streamFn = hanging_stream
+    session.agent.streamFunction = hanging_stream
     controller = DesktopResearchController(session, lambda payload: None).attach()
     await controller.set_team_model(model.provider, model.id, role='last_order')
     await session.bindExtensions({"mode": "json"})

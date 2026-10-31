@@ -17,22 +17,22 @@ from misaka.core.agent_session_services import (
     AgentSessionServices,
     CreateAgentSessionFromServicesOptions,
     CreateAgentSessionServicesOptions,
-    create_agent_session_from_services,
-    create_agent_session_services,
+    createAgentSessionFromServices,
+    createAgentSessionServices,
 )
-from misaka.core.extensions.runner import emit_session_shutdown_event
+from misaka.core.extensions.runner import emitSessionShutdownEvent
 from misaka.core.session_cwd import (
     MissingSessionCwdError,
     SessionCwdIssue,
-    assert_session_cwd_exists,
+    assertSessionCwdExists,
 )
 from misaka.core.session_manager import (
     NewSessionOptions,
     SessionManager,
-    load_entries_from_file,
+    loadEntriesFromFile,
 )
 from misaka.utils import atomic
-from misaka.utils.paths import resolve_path
+from misaka.utils.paths import resolvePath
 
 
 class ContextCarryUnsupportedError(RuntimeError):
@@ -41,8 +41,6 @@ class ContextCarryUnsupportedError(RuntimeError):
 
 class ExtensionRunnerLike(Protocol):
     def hasHandlers(self, event: str) -> bool: ...
-
-    def has_handlers(self, event: str) -> bool: ...
 
     async def emit(self, event: Any) -> Any: ...
 
@@ -114,7 +112,7 @@ class SessionImportFileNotFoundError(Exception):
         self.filePath = filePath
 
 
-def extract_user_message_text(content: str | list[dict[str, Any]]) -> str:
+def extractUserMessageText(content: str | list[dict[str, Any]]) -> str:
     if isinstance(content, str):
         return content
     return "".join(
@@ -234,7 +232,7 @@ class AgentSessionRuntime:
         }
         started = time.perf_counter()
         await self.session.moments.session_shutdown(shutdown_event)  # MISAKA fork
-        await emit_session_shutdown_event(self.session.extensionRunner, shutdown_event)
+        await emitSessionShutdownEvent(self.session.extensionRunner, shutdown_event)
         self.lastSwitchTimings["shutdownMs"] = round((time.perf_counter() - started) * 1000, 3)
         if self.beforeSessionInvalidate is not None:
             self.beforeSessionInvalidate()
@@ -273,7 +271,7 @@ class AgentSessionRuntime:
             None,
             options.get("cwdOverride") if options else None,
         )
-        assert_session_cwd_exists(session_manager, self.cwd)
+        assertSessionCwdExists(session_manager, self.cwd)
         await self.teardownCurrent("resume", session_manager.getSessionFile())
         started = time.perf_counter()
         self.apply(
@@ -390,7 +388,7 @@ class AgentSessionRuntime:
             ):
                 raise ValueError("Invalid entry ID for forking")
             target_leaf_id = selected_entry.get("parentId")
-            selected_text = extract_user_message_text(_message_content(selected_entry.get("message")))
+            selected_text = extractUserMessageText(_message_content(selected_entry.get("message")))
 
         previous_session_file = self.session.sessionFile
         if self.session.sessionManager.isPersisted():
@@ -404,8 +402,7 @@ class AgentSessionRuntime:
             else:
                 if not os.path.exists(current_session_file):
                     raise RuntimeError(
-                        "This session has not been saved yet. "
-                        "Wait for the first assistant response before cloning or forking it."
+                        "This session has not been saved yet. Send a message before cloning or forking it."
                     )
                 session_manager = SessionManager.open(current_session_file, session_dir)
                 forked_session_path = session_manager.createBranchedSession(str(target_leaf_id))
@@ -431,11 +428,11 @@ class AgentSessionRuntime:
             return {"cancelled": False, "selectedText": selected_text}
 
         session_manager = self.session.sessionManager
+        await self.teardownCurrent("fork", session_manager.getSessionFile())
         if not target_leaf_id:
-            session_manager.newSession(NewSessionOptions(parentSession=self.session.sessionFile))
+            session_manager.newSession(NewSessionOptions(parentSession=previous_session_file))
         else:
             session_manager.createBranchedSession(str(target_leaf_id))
-        await self.teardownCurrent("fork", session_manager.getSessionFile())
         self.apply(
             await self.createRuntime(
                 {
@@ -458,7 +455,7 @@ class AgentSessionRuntime:
         inputPath: str,
         cwdOverride: str | None = None,
     ) -> dict[str, bool]:
-        resolved_path = resolve_path(inputPath)
+        resolved_path = resolvePath(inputPath)
         if not os.path.isfile(resolved_path):
             raise SessionImportFileNotFoundError(resolved_path)
 
@@ -519,7 +516,7 @@ class AgentSessionRuntime:
                     await asyncio.to_thread(atomic.write_bytes, destination_path, payload, mode=0o600)
                     created_destination = True
                     await asyncio.to_thread(
-                        load_entries_from_file,
+                        loadEntriesFromFile,
                         destination_path,
                         strict=True,
                         repair_unterminated=True,
@@ -533,7 +530,7 @@ class AgentSessionRuntime:
 
             try:
                 session_manager = SessionManager.open(destination_path, session_dir, cwdOverride)
-                assert_session_cwd_exists(session_manager, self.cwd)
+                assertSessionCwdExists(session_manager, self.cwd)
             except BaseException:
                 if created_destination:
                     try:
@@ -564,17 +561,17 @@ class AgentSessionRuntime:
     async def dispose(self) -> None:
         shutdown_event = {"type": "session_shutdown", "reason": "quit"}
         await self.session.moments.session_shutdown(shutdown_event)  # MISAKA fork
-        await emit_session_shutdown_event(self.session.extensionRunner, shutdown_event)
+        await emitSessionShutdownEvent(self.session.extensionRunner, shutdown_event)
         if self.beforeSessionInvalidate is not None:
             self.beforeSessionInvalidate()
         self.session.dispose()
 
 
-async def create_agent_session_runtime(
+async def createAgentSessionRuntime(
     createRuntime: CreateAgentSessionRuntimeFactory,
     options: CreateAgentSessionRuntimeOptions,
 ) -> AgentSessionRuntime:
-    assert_session_cwd_exists(options["sessionManager"], options["cwd"])
+    assertSessionCwdExists(options["sessionManager"], options["cwd"])
     result = await createRuntime(options)
     return AgentSessionRuntime(
         result.session,
@@ -605,9 +602,6 @@ def _result_flag(result: Any, name: str, default: Any = None) -> Any:
     return getattr(result, name, default)
 
 
-createAgentSessionFromServices = create_agent_session_from_services
-createAgentSessionServices = create_agent_session_services
-createAgentSessionRuntime = create_agent_session_runtime
 
 __all__ = [
     "AgentSessionRuntime",

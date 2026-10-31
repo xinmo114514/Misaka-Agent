@@ -149,9 +149,9 @@ def test_node_detail_returns_errata_against_that_node_with_the_complete_correcti
         reviewer = runs.create_node(con, run["id"], question="A reviewer", parents=[root["id"]])
         payload = {"node": root["id"], "claim": "Earlier statement", "correction": "Corrected statement",
                    "grounds": "cards/evidence.md"}
-        con.execute("INSERT INTO research_actions VALUES (?,?,?,?,?,?,?)",
-                    (run["id"], reviewer["id"], "erratum:fixture", json.dumps(payload),
-                     "sessions/reviewer.jsonl", "fixture-call", int(time.time())))
+        from misaka.core import graph
+        graph.propose(con, run["id"], "action", payload, key="erratum:fixture", scope=reviewer["id"],
+                      proposer={"session_file": "sessions/reviewer.jsonl", "tool_call_id": "fixture-call"})
 
         detail = desktop_view.node_detail(con, run["id"], root["id"])
 
@@ -159,7 +159,7 @@ def test_node_detail_returns_errata_against_that_node_with_the_complete_correcti
 
 
 def _hold_lease(con, run_id, lock, *, expires_in=300):
-    con.execute("UPDATE research_runs SET driver_lock=?, driver_expires=? WHERE id=?",
+    con.execute("UPDATE graphs SET lease_token=?, lease_expires=? WHERE id=?",
                 (lock, int(time.time()) + expires_in, run_id))
 
 
@@ -176,7 +176,7 @@ def test_session_list_reports_driving_from_the_board_lease_rule(tmp_path):
         assert desktop_view.sessions_payload(con, run["id"])["run"]["driving"] is True
 
         # An expired lease is not a live driver: the run is resumable again.
-        con.execute("UPDATE research_runs SET driver_expires=1 WHERE id=?", (run["id"],))
+        con.execute("UPDATE graphs SET lease_expires=1 WHERE id=?", (run["id"],))
         assert desktop_view.sessions_payload(con, run["id"])["run"]["driving"] is False
 
 

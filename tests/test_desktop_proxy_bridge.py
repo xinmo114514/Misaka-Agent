@@ -23,6 +23,7 @@ def _rows(output):
 
 
 def _host(tmp_path):
+    from misaka.core.auth_storage import AuthStorage
     from misaka.core.settings_manager import SettingsManager
 
     host = MockRuntimeHost()
@@ -30,9 +31,39 @@ def _host(tmp_path):
     host.session.model = SimpleNamespace(
         provider="fixture", id="model", api="fixture", baseUrl="https://model.test/v1"
     )
-    storage = SimpleNamespace(runtimeOverrides={}, get=lambda _provider: None)
+    storage = AuthStorage.inMemory()
     host.session.modelRegistry = SimpleNamespace(authStorage=storage)
     return host
+
+
+@pytest.mark.asyncio
+async def test_credential_commands_await_native_storage_without_echoing_the_key(tmp_path, monkeypatch):
+    from misaka.cli import desktop_bridge as bridge
+
+    host = _host(tmp_path)
+    storage = host.session.modelRegistry.authStorage
+    snapshots = {}
+    output = io.StringIO()
+
+    def write(line):
+        row = json.loads(line)
+        if row.get("requestId"):
+            snapshots[row["requestId"]] = dict(storage.readState.data)
+        return output.write(line)
+
+    monkeypatch.setattr(bridge, "writeRawStdout", write)
+    commands = [
+        {"type": "set_provider_credential", "requestId": "save", "provider": "fixture", "apiKey": "private-fixture-key"},
+        {"type": "delete_provider_credential", "requestId": "delete", "provider": "fixture"},
+        {"type": "shutdown"},
+    ]
+    monkeypatch.setattr(sys, "stdin", io.StringIO("".join(json.dumps(row) + "\n" for row in commands)))
+    assert await bridge.run_desktop_bridge(host) == 0
+    acks = {row["requestId"]: row for row in _rows(output) if row.get("requestId")}
+    assert acks["save"]["ok"] and acks["delete"]["ok"]
+    assert snapshots["save"]["fixture"]["key"] == "private-fixture-key"
+    assert "fixture" not in snapshots["delete"]
+    assert "private-fixture-key" not in output.getvalue()
 
 
 @pytest.mark.asyncio
@@ -161,7 +192,6 @@ async def test_research_connection_check_ignores_cached_failed_route_and_uses_la
 
 @pytest.mark.asyncio
 async def test_provider_connectivity_uses_registry_stream_path_without_manual_auth_resolution():
-    from misaka.ai.auth.types import AuthResult, ModelAuth
     from misaka.cli.desktop_bridge import _test_model_connectivity
 
     model = SimpleNamespace(provider="fixture", id="model")
@@ -180,17 +210,13 @@ async def test_provider_connectivity_uses_registry_stream_path_without_manual_au
             calls.append((selected, context, options))
             return Stream()
 
-        async def getAuth(self, _model, _overrides):
-            return AuthResult(
-                auth=ModelAuth(apiKey="fixture-key", headers={"x-fixture": "yes"}),
-                env={"PROVIDER_REGION": "moon"},
-                source="fixture",
-            )
+        async def getAuth(self, *_args):
+            raise AssertionError("The runtime resolves request auth; the bridge must not resolve it twice")
 
     result = await _test_model_connectivity(SimpleNamespace(modelRegistry=Registry()), "fixture", "model")
     assert result["ok"] is True
     assert result["responseText"] == "OK"
     assert calls[0][2].maxTokens == 8
-    assert calls[0][2].apiKey == "fixture-key"
-    assert calls[0][2].headers == {"x-fixture": "yes"}
-    assert calls[0][2].env["PROVIDER_REGION"] == "moon"
+    assert calls[0][2].apiKey is None
+    assert calls[0][2].headers is None
+    assert calls[0][2].env is None

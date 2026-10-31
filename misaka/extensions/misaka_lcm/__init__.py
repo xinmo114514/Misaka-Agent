@@ -29,6 +29,25 @@ def register_native_auth(harn):
 
 register_native_auth.extension_name = 'desktop-native-auth'
 
+def identity(spec) -> str:
+    """Who this session is, as the rows it stores will say it: the address its mail goes by
+    (``last-order``, or a Sister's name), with ``@<card>`` when it works a card and
+    ``/<agent id>`` when it is a sub-agent -- the id its parent's ``Agent`` call returned, since a
+    sub-agent shares its parent's address. Upstream keeps this in each row's ``source`` -- its
+    "which platform" -- and here "which platform" is "which agent", so ``lcm_grep(source=...)``
+    narrows a project-wide search to one of them."""
+    import os
+
+    from misaka.core.wiring import sender_address
+
+    if getattr(spec, "sender", None) is None and not getattr(spec, "role", None):
+        return "misaka"  # a spec with no address at all (a bare fixture): the engine's own name
+    address = sender_address(spec)
+    if task := getattr(spec, "task_id", None):
+        return f"{address}@{task}"
+    agent = os.environ.get("MISAKA_SUBAGENT_ID") if getattr(spec, "kind", None) == "child" else None
+    return f"{address}/{agent}" if agent else address
+
 
 def activate(spec):
     import os
@@ -37,9 +56,10 @@ def activate(spec):
     from .host.extension import register
     # A subagent joins its parent session's project store, which the parent set on subagent_start.
     workspace = (os.environ.get(storage.PROJECT_ENV) if os.environ.get("MISAKA_SUBAGENT_ID") else None) or spec.workspace
+    source = identity(spec)
 
     def register_for_session(harn):
-        return register(harn, kind=spec.kind, workspace=workspace)
+        return register(harn, kind=spec.kind, workspace=workspace, source=source)
 
     register_for_session.desktop_research_factory = register_native_auth
     return register_for_session

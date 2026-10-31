@@ -46,7 +46,7 @@ def project_controller_snapshot(controller):
         run = session_run(controller.session, con)
         if run is None:
             return snapshot
-        rows = con.execute('SELECT t.* FROM tasks AS t JOIN research_run_tasks AS linked '
+        rows = con.execute('SELECT t.* FROM tasks AS t JOIN research_cards AS linked '
                            'ON linked.task_id=t.id WHERE linked.run_id=? ORDER BY t.created_at,t.id',
                            (run['id'],)).fetchall()
         for member in snapshot['team']['members']:

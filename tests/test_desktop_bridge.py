@@ -574,8 +574,16 @@ def test_cli_pipe_integration(tmp_path) -> None:
                     'contextWindow': 8192, 'maxTokens': 1024,
                     'cost': {'input': 0, 'output': 0, 'cacheRead': 0, 'cacheWrite': 0}}],
     }}}), encoding='utf-8')
-    cmd = ["uv", "run", "misaka", "desktop-bridge", "--no-session"]
-    payload = json.dumps({"type": "get_stats", "requestId": "sub-1"}) + "\n" + json.dumps({'type': 'shutdown'}) + '\n'
+    cmd = [sys.executable, "-m", "misaka", "desktop-bridge", "--no-session"]
+    commands = [
+        {"type": "get_stats", "requestId": "sub-1"},
+        {"type": "get_models", "requestId": "models"},
+        {"type": "get_providers", "requestId": "providers"},
+        {"type": "set_model", "requestId": "select", "provider": "fixture", "modelId": "fixture-model"},
+        {"type": "set_theme", "requestId": "theme", "name": "dark"},
+        {"type": "shutdown"},
+    ]
+    payload = "".join(json.dumps(command) + "\n" for command in commands)
     child_env = {key: value for key, value in os.environ.items()
                  if not key.startswith(('MISAKA_', 'HERMES_', 'LCM_', 'PI_'))
                  and not key.endswith(('_API_KEY', '_TOKEN'))}
@@ -589,7 +597,9 @@ def test_cli_pipe_integration(tmp_path) -> None:
         env={**child_env, 'MISAKA_HOME': str(fixture_home), 'MISAKA_OFFLINE': '1'},
     )
     try:
-        stdout, _stderr = proc.communicate(payload, timeout=60)
+        # This cold-start probe now exercises the full native catalog and theme
+        # stack as well as JSONL startup on slower Windows CI hosts.
+        stdout, _stderr = proc.communicate(payload, timeout=180)
     except subprocess.TimeoutExpired as error:
         (tmp_path / 'probe-stdout.txt').write_bytes(error.stdout or b'')
         (tmp_path / 'probe-stderr.txt').write_bytes(error.stderr or b'')
@@ -600,7 +610,7 @@ def test_cli_pipe_integration(tmp_path) -> None:
             proc.kill()
         proc.communicate(timeout=10)
         raise
-    assert proc.returncode == 0
+    assert proc.returncode == 0, _stderr
 
     lines = [json.loads(line) for line in stdout.strip().splitlines() if line]
     assert len(lines) >= 1
@@ -608,6 +618,13 @@ def test_cli_pipe_integration(tmp_path) -> None:
     assert lines[0]["requestId"] == "sub-1"
     assert lines[0]["ok"] is True
     assert "stats" in lines[0]["data"]
+    acks = {line.get("requestId"): line for line in lines if line.get("type") == "ack"}
+    for request_id in ("models", "providers", "select", "theme"):
+        assert acks[request_id]["ok"], acks[request_id]
+    fixture = next(model for model in acks["models"]["data"]["models"] if model["provider"] == "fixture")
+    assert fixture["source"] == "custom"
+    assert acks["select"]["data"]["currentModel"]["modelId"] == "fixture-model"
+    assert acks["theme"]["data"]["desktop"]["surface0"].startswith("#")
 
 
 @pytest.mark.asyncio
@@ -2241,7 +2258,7 @@ async def test_prompt_folds_research_command_keyword_case_and_keeps_the_body(mon
 def test_bridge_direct_entry_installs_meter_before_opening_session(monkeypatch, tmp_path):
     from types import SimpleNamespace
 
-    from misaka.ai import api_registry
+    from misaka.ai.api import _meter as api_registry
     from misaka.cli import desktop_bridge
     from misaka.core import wiring
     from misaka.core.platform import metering, session

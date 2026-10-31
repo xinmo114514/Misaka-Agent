@@ -222,7 +222,7 @@ class SessionControl:
         self._check_input_owner()
         if operation == "stats":
             from misaka.core.session_telemetry import collect_session_telemetry
-            from misaka.modes.jsonl import to_jsonable
+            from misaka.modes.json_event import to_jsonable
             return {"stats": to_jsonable(self.session.getSessionStats()),
                     "contextUsage": to_jsonable(self.session.getContextUsage()),
                     "telemetry": collect_session_telemetry(self.session)}
@@ -248,9 +248,10 @@ class SessionControl:
             accepted = asyncio.get_running_loop().create_future()
             accepted.add_done_callback(lambda result: result.exception() if not result.cancelled() else None)
 
-            def preflight(ok):
+            def preflight(disposition):
+                # Called only for an accepted prompt; `finally` below reports a rejected one.
                 if not accepted.done():
-                    accepted.set_result(ok)
+                    accepted.set_result(bool(disposition))
 
             async def deliver():
                 try:

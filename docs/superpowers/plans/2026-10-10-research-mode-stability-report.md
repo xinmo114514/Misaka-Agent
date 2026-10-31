@@ -1,6 +1,6 @@
 # 研究模式稳定性整治：修复与验收报告
 
-日期：2026-10-10（Asia/Hong_Kong）  
+日期：2026-10-10（Asia/Hong_Kong）
 工作分支：`codex/research-submission-recovery`
 
 ## 结论

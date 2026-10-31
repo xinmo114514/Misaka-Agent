@@ -112,7 +112,7 @@ async def test_stop_reenters_persisted_stopping_run_after_driver_disappears(chat
         lock, expires = f"driver:{socket.gethostname()}:2147483647:dead", int(time.time()) + 600
     else:
         lock, expires = None, None
-    board.execute("UPDATE research_runs SET driver_lock=?,driver_expires=? WHERE id=?",
+    board.execute("UPDATE graphs SET lease_token=?,lease_expires=? WHERE id=?",
                   (lock, expires, chat.run["id"]))
 
     await chat.command(f"stop {chat.run['id']}", chat.ctx)
@@ -131,7 +131,7 @@ async def test_stop_reenters_persisted_stopping_run_after_driver_disappears(chat
 async def test_stop_does_not_duplicate_a_live_or_foreign_driver(chat, board, lock):
     runs.set_state(board, chat.run["id"], status="stopping")
     runs.request_stop(board, chat.run["id"])
-    board.execute("UPDATE research_runs SET driver_lock=?,driver_expires=? WHERE id=?",
+    board.execute("UPDATE graphs SET lease_token=?,lease_expires=? WHERE id=?",
                   (lock, int(time.time()) + 600, chat.run["id"]))
 
     await chat.command(f"stop {chat.run['id']}", chat.ctx)

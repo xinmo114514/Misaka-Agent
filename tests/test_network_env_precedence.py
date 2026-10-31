@@ -12,7 +12,7 @@ from misaka.ai.auth.types import (
     ModelAuth,
     ProviderAuth,
 )
-from misaka.ai.models_runtime import ModelsImpl
+from misaka.ai.models import _ModelsImpl as ModelsImpl
 
 NETWORK_KEYS = ["http_proxy", "https_proxy", "all_proxy", "no_proxy", "ssl_cert_file", "ssl_cert_dir"]
 

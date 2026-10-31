@@ -2,7 +2,7 @@
 import asyncio
 import os
 
-from misaka.ai.models import get_models
+from misaka.ai.providers.openai_models import OPENAI_MODELS
 from misaka.ai.types import AssistantMessage, DoneEvent
 from misaka.ai.utils.event_stream import AssistantMessageEventStream
 from misaka.cli.desktop_bridge import ResearchMessageIngress, research_host_payload
@@ -12,7 +12,7 @@ from misaka.core.platform import cards
 from misaka.core.research import runs
 from misaka.core.research.wiring import research
 from misaka.core.resource_loader import DefaultResourceLoader
-from misaka.core.sdk import create_agent_session
+from misaka.core.sdk import createAgentSession as create_agent_session
 from misaka.core.session_manager import SessionManager
 from misaka.core.settings_manager import SettingsManager
 from tests.test_prompt_assembly_integration import prompt_home  # noqa: F401 - fixture
@@ -34,16 +34,23 @@ async def test_real_root_receives_first_question_resume_and_done_followup(prompt
     (prompt_home / "profiles" / "sisters").rename(prompt_home / "unused-fixture-experts")
     profile = prompt_home / "profiles" / "last_order"
     _, assembly, _ = wiring.role_session_setup(str(profile), str(workspace),
-                                             research_context=True, research_host=True)
+                                             workflow_context=True, research_host=True)
+    from misaka.desktop_research.runtime import prepare_desktop_assembly
+    assembly = prepare_desktop_assembly(assembly)
     loader = DefaultResourceLoader({"cwd": str(workspace), "agentDir": str(prompt_home / "agent"),
                                     "noExtensions": True, "noPromptTemplates": True, "noThemes": True})
     await loader.reload()
-    model = next(m for m in get_models("openai") if "image" in m.input)
+    model = next(m for m in OPENAI_MODELS.values() if "image" in m.input)
     auth = AuthStorage.inMemory()
-    auth.setRuntimeApiKey(model.provider, "deterministic-fixture")
+    from misaka.ai.auth.types import ApiKeyCredential
+    async def credential(_current):
+        return ApiKeyCredential(type="api_key", key="deterministic-fixture")
+    await auth.modify(model.provider, credential)
+    from misaka.core.model_runtime import ModelRuntime
+    model_runtime = await ModelRuntime.create({"authStorage": auth, "modelsPath": None})
     manager = SessionManager.create(str(workspace), str(prompt_home / "sessions"))
     result = await create_agent_session({"cwd": str(workspace), "agentDir": str(prompt_home / "agent"),
-        "model": model, "authStorage": auth, "resourceLoader": loader,
+        "model": model, "modelRuntime": model_runtime, "resourceLoader": loader,
         "settingsManager": SettingsManager.inMemory({"compaction": {"enabled": False}, "retry": {"enabled": False}}),
         "sessionManager": manager, "parts": assembly.parts, "customTools": assembly.custom_tools})
     session = result["session"]
@@ -60,7 +67,7 @@ async def test_real_root_receives_first_question_resume_and_done_followup(prompt
         output.end(reply)
         return output
 
-    session.agent.streamFn = stream
+    session.agent.streamFunction = stream
     con = research._con()
     workflow_calls = []
     resume_entered, resume_release = asyncio.Event(), asyncio.Event()

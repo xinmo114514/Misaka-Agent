@@ -154,5 +154,3 @@ class NativeScope:
                 namespace[key] = getattr(self.module(value.__module__), value.__name__)
         namespace.update(self.overrides.get(name, {}))
         return namespace
-
-

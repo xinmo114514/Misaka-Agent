@@ -1,15 +1,16 @@
 """Role profile layout: ~/.misaka/profiles/<role>/.
 
 A role directory is a partial overlay of the home: ``SOUL.md`` (voice), ``settings.json``
-(what she holds of her own: her pinned model, her MCP servers, her web overrides -- see
-``settings_manager.ROLE_KEYS``), ``skills/`` and ``subagents/``. Nothing lives in the source
-tree. Built-in subagent types ship with the package (misaka/core/subagent/agents/).
+(what she holds of her own: her pinned model, her web overrides -- see
+``settings_manager.ROLE_KEYS``), ``skills/`` and ``subagents/``. Her MCP servers (``mcp.json``) and MCP sign-ins
+overlay nothing: the home has none (``mcp_dir``). Nothing lives in the source tree. Built-in subagent types ship with the package (misaka/core/subagent/agents/).
 
 ``<role>`` is a path relative to profiles/, e.g. ``last_order`` or ``sisters/10032``.
 """
 import json
 import os
 
+from misaka.config import home
 from misaka.utils import atomic
 
 
@@ -25,6 +26,13 @@ def is_last_order(profile_dir):
     """Return whether the profile is Last Order, the one role without sub-agents."""
     role = role_of(profile_dir).strip().casefold().replace("-", "_").replace(" ", "_")
     return role == "last_order"
+
+
+def mcp_dir(profile_dir):
+    """Where a role keeps her MCP servers (``mcp.json``) and MCP sign-ins (``credentials/mcp-auth.json``): her
+    own profile, as a Hermes profile keeps its own; Last Order's for a session without a role. The home keeps
+    none, so no role reaches another's servers."""
+    return str(profile_dir) if profile_dir else str(home.path("roles_root") / "last_order")
 
 
 def settings_path(profile_dir):
@@ -70,16 +78,16 @@ def pinned_model(profile_dir, *, strict=False):
     return f"{provider}/{model}" if provider else ""
 
 
-def resolve_model_reference(reference, registry, *, fallback_provider=None):
+def resolve_model_reference(reference, runtime, *, fallback_provider=None):
     """Resolve a role pin to provider/id without borrowing another role's endpoint.
 
     An explicit legacy provider may disambiguate a bare ID. Canonical references
-    always win; raw model IDs containing slashes remain valid registry IDs.
+    always win; raw model IDs containing slashes remain valid catalog IDs.
     """
     from misaka.core.model_resolver import findExactModelReferenceMatch
 
     reference = str(reference or "").strip()
-    models = list(registry.getAll())
+    models = list(runtime.getModels())
     model = findExactModelReferenceMatch(reference, models)
     if model is None and fallback_provider:
         model = next((m for m in models if m.provider == fallback_provider and m.id == reference), None)
@@ -87,7 +95,11 @@ def resolve_model_reference(reference, registry, *, fallback_provider=None):
         matches = [f"{m.provider}/{m.id}" for m in models if m.id.casefold() == reference.casefold()]
         if matches:
             raise ValueError(f"Ambiguous model {reference!r}; choose provider/model: {', '.join(matches)}")
-        raise ValueError(f"Unknown model {reference!r}; choose a registered provider/model")
+        from misaka.core.model_runtime import personalizedCatalogHint
+
+        # A pinned OpenRouter model leaves the catalog when the user's key may not use it (pi 1.2 per-key lists).
+        hint = personalizedCatalogHint(reference.partition("/")[0] if "/" in reference else fallback_provider)
+        raise ValueError(f"Unknown model {reference!r}; choose a registered provider/model" + (f".{hint}" if hint else ""))
     return f"{model.provider}/{model.id}"
 
 
@@ -162,6 +174,6 @@ def shared_soul():
     path = str(home.path("shared_soul"))
     if not os.path.exists(path):
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "w", encoding="utf-8") as f:
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
             f.write(SHARED_SOUL_TEMPLATE)
     return path

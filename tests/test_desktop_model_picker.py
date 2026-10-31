@@ -7,9 +7,9 @@ import sys
 from types import SimpleNamespace
 
 import pytest
+from test_desktop_bridge import MockRuntimeHost, MockSession
 
 from misaka.cli.desktop_bridge import _thinking_state, run_desktop_bridge
-from test_desktop_bridge import MockRuntimeHost, MockSession
 
 
 @pytest.mark.parametrize("levels,supports,level", [
@@ -34,8 +34,8 @@ async def test_picker_commands_ack_the_resolved_session_and_keep_session_selecti
     session.supportsThinking = lambda: True
     selections = []
 
-    async def set_model(model, *, persist=False):
-        selections.append((model, persist))
+    async def set_model(model, options=None):
+        selections.append((model, bool((options or {}).get("persist"))))
         session.model = model
         session.thinkingLevel = "high"
 

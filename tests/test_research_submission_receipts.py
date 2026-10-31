@@ -8,7 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from misaka.ai.providers.openai_completions import convert_messages, get_compat
+from misaka.ai.api.openai_completions import convertMessages as convert_messages, _getCompat as get_compat
 from misaka.ai.types import Model, TranscriptContext, validate_message
 from misaka.core.agent_session import AgentSession
 from misaka.core.session_control import SessionControl
@@ -16,7 +16,7 @@ from misaka.core.session_control import SessionControl
 
 def test_user_delivery_identity_survives_native_validation_but_not_provider_wire():
     session = object.__new__(AgentSession)
-    message = session._build_user_message('正文\n\n1. 证据', request_id='input-1', delivery_id='research:s:input-1')
+    message = session._buildUserMessage('正文\n\n1. 证据', request_id='input-1', delivery_id='research:s:input-1')
     native = validate_message(message)
     assert native.requestId == 'input-1'
     assert native.deliveryId == 'research:s:input-1'
@@ -193,10 +193,10 @@ def test_delivery_identity_is_claimed_only_once_the_message_is_written(tmp_path)
     session = object.__new__(AgentSession)
     session.sessionManager = manager
     session._promptDeliveryIds = set()
-    message = session._build_user_message('研究正文', None, request_id='input-1',
+    message = session._buildUserMessage('研究正文', None, request_id='input-1',
                                           delivery_id='research:s:input-1')
     assert 'research:s:input-1' not in session._promptDeliveryIds
-    session._persist_message(message)
+    session._persistMessage(message)
     assert 'research:s:input-1' in session._promptDeliveryIds
 
 

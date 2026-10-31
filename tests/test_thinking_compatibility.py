@@ -5,9 +5,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from misaka.ai import api_registry
-from misaka.ai.api_registry import ApiProvider, get_api_provider, register_api_provider
-from misaka.ai.models import get_supported_thinking_levels
+from misaka.ai.models import getSupportedThinkingLevels as get_supported_thinking_levels
+from misaka.ai.thinking_compat import stream_with_thinking_compatibility
 from misaka.ai.types import AssistantMessage, Context, DoneEvent, ErrorEvent, Model, ModelCost, SimpleStreamOptions, StartEvent, TextContent, Usage, UsageCost
 from misaka.ai.utils.event_stream import AssistantMessageEventStream, spawn_stream_task
 from misaka.cli.desktop_bridge import _thinking_state
@@ -22,7 +21,6 @@ class ParameterError(Exception):
 
 @pytest.fixture
 def model(request, monkeypatch):
-    monkeypatch.setattr(api_registry, "_api_provider_registry", {})
     return Model(id=request.node.name, name="Trial", api="openai-completions", provider="fixture", baseUrl="http://fixture.invalid/v1",
                  reasoning=True, input=["text"], cost=ModelCost(input=0, output=0, cacheRead=0, cacheWrite=0), contextWindow=8000, maxTokens=1000)
 
@@ -66,8 +64,7 @@ def session(model, level="high"):
 
 
 def register(invoke):
-    register_api_provider(ApiProvider(api="openai-completions", stream=invoke, streamSimple=invoke))
-    return get_api_provider("openai-completions").streamSimple
+    return lambda model, context, options: stream_with_thinking_compatibility(invoke, model, context, options)
 
 
 def test_generic_levels_are_not_reported_as_confirmed(model):

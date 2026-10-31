@@ -48,7 +48,8 @@ def _copy(source: Path, target: Path) -> None:
 
 
 def _roles() -> list[Path]:
-    """Last Order's folder and every Sister's: each may hold its own settings.json and .env."""
+    """Last Order's folder and every Sister's: each may hold its own settings.json and .env, and holds her
+    mcp.json and MCP sign-ins."""
     return sorted(path for root in (home.path("roles_root"), home.path("profiles_root"))
                   if root.is_dir() for path in root.iterdir() if path.is_dir())
 
@@ -63,7 +64,7 @@ def snapshot(reason: str) -> Path:
     home.private_dir(shelf)          # the copies hold credentials
     target = shelf / f"{reason}-{time.strftime('%Y%m%d-%H%M%S')}"
     sources = [home.path(name) for name in SNAPSHOT]
-    sources += [home.path(name, role) for role in _roles() for name in ("settings", "env")]
+    sources += [home.path(name, role) for role in _roles() for name in ("settings", "env", "mcp_config", "mcp_auth")]
     for source in sources:
         if source.is_dir():
             for here, _dirs, files in os.walk(source):

@@ -22,14 +22,16 @@ async def _settle(runs, con, run_id, expected, seconds):
 
 async def test_stop_taken_while_the_root_waits_for_input_settles_the_run(prompt_home):  # noqa: F811
     """Real AgentSession, real coordinator and real workflow; only the provider is scripted."""
-    from misaka.ai.models import get_models
+    from misaka.ai.auth.types import ApiKeyCredential
+    from misaka.ai.providers.openai_models import OPENAI_MODELS
     from misaka.ai.types import AssistantMessage, DoneEvent
     from misaka.ai.utils.event_stream import AssistantMessageEventStream
     from misaka.core import wiring
     from misaka.core.auth_storage import AuthStorage
+    from misaka.core.model_runtime import ModelRuntime
     from misaka.core.research import runs
     from misaka.core.resource_loader import DefaultResourceLoader
-    from misaka.core.sdk import create_agent_session
+    from misaka.core.sdk import createAgentSession as create_agent_session
     from misaka.core.session_manager import SessionManager
     from misaka.core.settings_manager import SettingsManager
     from misaka.desktop_research.runtime import DesktopResearchController
@@ -37,15 +39,17 @@ async def test_stop_taken_while_the_root_waits_for_input_settles_the_run(prompt_
     workspace = prompt_home / 'workspace'
     workspace.mkdir()
     _, assembly, _ = wiring.role_session_setup(str(prompt_home / 'profiles/last_order'), str(workspace),
-                                               research_context=True, research_host=True)
+                                               workflow_context=True, research_host=True)
     loader = DefaultResourceLoader({'cwd': str(workspace), 'agentDir': str(prompt_home / 'agent'),
                                     'noExtensions': True, 'noPromptTemplates': True, 'noThemes': True})
     await loader.reload()
-    model = next(iter(get_models('openai')))
+    model = next(iter(OPENAI_MODELS.values()))
     auth = AuthStorage.inMemory()
-    auth.setRuntimeApiKey(model.provider, 'deterministic-fixture')
+    async def credential(_current):
+        return ApiKeyCredential(key="deterministic-fixture")
+    await auth.modify(model.provider, credential)
     result = await create_agent_session({
-        'cwd': str(workspace), 'agentDir': str(prompt_home / 'agent'), 'model': model, 'authStorage': auth,
+        'cwd': str(workspace), 'agentDir': str(prompt_home / 'agent'), 'model': model, 'modelRuntime': await ModelRuntime.create({'authStorage': auth, 'modelsPath': None}),
         'resourceLoader': loader,
         'settingsManager': SettingsManager.inMemory({'compaction': {'enabled': False}, 'retry': {'enabled': False}}),
         'sessionManager': SessionManager.create(str(workspace), str(prompt_home / 'sessions')),
@@ -77,7 +81,7 @@ async def test_stop_taken_while_the_root_waits_for_input_settles_the_run(prompt_
         out.end(reply)
         return out
 
-    session.agent.streamFn = stream
+    session.agent.streamFunction = stream
     from misaka.config.product import current_config
     controller = DesktopResearchController(session, lambda payload: None,
         {**current_config(), 'lo_model': f'{model.provider}/{model.id}'}).attach()
@@ -108,13 +112,15 @@ async def test_stop_taken_while_the_root_waits_for_input_settles_the_run(prompt_
 
 async def test_reopened_original_session_settles_orphaned_stop_without_model_turn(prompt_home):  # noqa: F811
     """Reopen a persisted stopping run; terminal card evidence survives its partial report."""
-    from misaka.ai.models import get_models
+    from misaka.ai.auth.types import ApiKeyCredential
+    from misaka.ai.providers.openai_models import OPENAI_MODELS
     from misaka.core import wiring
     from misaka.core.auth_storage import AuthStorage
+    from misaka.core.model_runtime import ModelRuntime
     from misaka.core.platform import cards, tasks
     from misaka.core.research import runs
     from misaka.core.resource_loader import DefaultResourceLoader
-    from misaka.core.sdk import create_agent_session
+    from misaka.core.sdk import createAgentSession as create_agent_session
     from misaka.core.session_manager import SessionManager
     from misaka.core.settings_manager import SettingsManager
     from misaka.desktop_research.runtime import DesktopResearchController
@@ -129,15 +135,17 @@ async def test_reopened_original_session_settles_orphaned_stop_without_model_tur
     assert reopened.sessionId == original_id
 
     _, assembly, _ = wiring.role_session_setup(str(prompt_home / 'profiles/last_order'), str(workspace),
-                                               research_context=True, research_host=True)
+                                               workflow_context=True, research_host=True)
     loader = DefaultResourceLoader({'cwd': str(workspace), 'agentDir': str(prompt_home / 'agent'),
                                     'noExtensions': True, 'noPromptTemplates': True, 'noThemes': True})
     await loader.reload()
-    model = next(iter(get_models('openai')))
+    model = next(iter(OPENAI_MODELS.values()))
     auth = AuthStorage.inMemory()
-    auth.setRuntimeApiKey(model.provider, 'deterministic-fixture')
+    async def credential(_current):
+        return ApiKeyCredential(key="deterministic-fixture")
+    await auth.modify(model.provider, credential)
     result = await create_agent_session({
-        'cwd': str(workspace), 'agentDir': str(prompt_home / 'agent'), 'model': model, 'authStorage': auth,
+        'cwd': str(workspace), 'agentDir': str(prompt_home / 'agent'), 'model': model, 'modelRuntime': await ModelRuntime.create({'authStorage': auth, 'modelsPath': None}),
         'resourceLoader': loader,
         'settingsManager': SettingsManager.inMemory({'compaction': {'enabled': False}, 'retry': {'enabled': False}}),
         'sessionManager': reopened, 'parts': assembly.parts, 'customTools': assembly.custom_tools})
@@ -149,7 +157,7 @@ async def test_reopened_original_session_settles_orphaned_stop_without_model_tur
         calls.append((args, kwargs))
         raise AssertionError('A persisted stop must not enter a provider window')
 
-    session.agent.streamFn = no_model
+    session.agent.streamFunction = no_model
     from misaka.config.product import current_config
     controller = DesktopResearchController(session, lambda payload: None,
         {**current_config(), 'lo_model': f'{model.provider}/{model.id}'}).attach()

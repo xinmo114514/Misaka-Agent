@@ -12,7 +12,7 @@ import uuid
 from collections import deque
 from typing import Any
 
-from misaka.ai.models import get_supported_thinking_levels
+from misaka.ai.models import getSupportedThinkingLevels as get_supported_thinking_levels
 from misaka.cli.desktop_attachments import prepare_attachments
 from misaka.config import get_agent_dir, get_auth_path, get_sessions_dir, home
 from misaka.config.product import current_config
@@ -34,7 +34,6 @@ from misaka.core.output_guard import (
     writeRawStdout,
 )
 from misaka.core.provider_brands import build_provider_groups, visible_provider_ids
-from misaka.core.provider_display_names import BUILT_IN_PROVIDER_DISPLAY_NAMES
 from misaka.core.research import submissions
 from misaka.core.research.ingress import (
     ResearchMessageIngress,
@@ -49,16 +48,23 @@ from misaka.core.session_manager import (
     SessionInfo,
     SessionManager,
     encode_cwd,
-    find_most_recent_session,
-    read_session_header,
     session_entry_to_display_messages,
     sessions_root_of,
 )
-from misaka.modes.jsonl import to_json_event, to_jsonable
-from misaka.ui.tui.interactive.theme.theme import (
-    get_resolved_theme_colors,
-    load_theme_json,
+from misaka.core.session_manager import (
+    findMostRecentSession as find_most_recent_session,
 )
+from misaka.core.session_manager import (
+    readSessionHeader as read_session_header,
+)
+from misaka.modes.interactive.theme.theme import (
+    getResolvedThemeColors as get_resolved_theme_colors,
+)
+from misaka.modes.interactive.theme.theme import (
+    loadThemeJson as load_theme_json,
+)
+from misaka.modes.json_event import to_jsonable
+from misaka.modes.json_event import toJsonEvent as to_json_event
 from misaka.utils.shell import killTrackedDetachedChildren
 from misaka.utils.values import read_field
 
@@ -759,6 +765,9 @@ def _serialize_research_run(runs: Any, con: Any, row: Any, session: Any = None) 
     """
     from misaka.config import home
 
+    # v0.19 stores ownership and driver leases in the graph backing this run.
+    # Read through the run projection even when the caller passed a raw SQL row.
+    row = runs.get(con, str(row["id"])) or row
     summary = runs.summary(con, str(row["id"])) or {"id": str(row["id"])}
     summary["question"] = row["question"]
     summary["createdAt"] = row["created_at"]
@@ -833,6 +842,9 @@ def _resolve_models_json_path(session: Any) -> str:
     back off the registry keeps the editor pointed at the file that is actually loaded.
     """
     registry = _model_registry_of(session)
+    runtime_path = getattr(getattr(registry, "modelRuntime", None), "_modelsPath", None)
+    if isinstance(runtime_path, str) and runtime_path:
+        return runtime_path
     for attribute in ("_modelsJsonPath", "modelsJsonPath"):
         candidate = getattr(registry, attribute, None)
         if isinstance(candidate, str) and candidate:
@@ -844,12 +856,10 @@ def _resolve_models_json_path(session: Any) -> str:
 
 def _custom_model_ids(session: Any, provider_id: str) -> set[str]:
     """Model ids this provider declares in models.json, used to tag them as custom."""
-    registry = _model_registry_of(session)
-    overrides = getattr(registry, "_modelOverrides", None)
-    if isinstance(overrides, dict):
-        provider_overrides = overrides.get(provider_id)
-        if isinstance(provider_overrides, dict):
-            return {str(model_id) for model_id in provider_overrides}
+    providers, error = load_custom_providers(_resolve_models_json_path(session))
+    entry = providers.get(provider_id, {}) if not error else {}
+    if isinstance(entry, dict):
+        return {str(model["id"]) for model in entry.get("models", []) if isinstance(model, dict) and model.get("id")}
     return set()
 
 
@@ -907,27 +917,22 @@ def _ordinary_model_network_context(session: Any) -> tuple[str, dict[str, str] |
     loaded_api_key = runtime_overrides.get(provider)
     stored = None
     if storage is not None and provider and not runtime_overrides.get(provider):
-        stored = storage.get(provider)
+        stored = getattr(getattr(storage, "readState", None), "data", {}).get(provider)
         if isinstance(stored, dict):
             if stored.get("type") == "api_key":
                 loaded_api_key = stored.get("key")
             candidate = stored.get("env")
             if isinstance(candidate, dict):
                 env = {str(key): str(value) for key, value in candidate.items()}
-            if stored.get("type") == "oauth":
-                from misaka.ai.utils.oauth import getOAuthProvider
-                from misaka.ai.utils.oauth.types import OAuthCredentials
-
-                flow = getOAuthProvider(provider)
-                get_base = getattr(flow, "getBaseUrl", None)
-                if callable(get_base):
-                    endpoint = str(get_base(OAuthCredentials.model_validate(
-                        {key: value for key, value in stored.items() if key != "type"}
-                    )) or endpoint)
+            if stored.get("type") == "oauth" and provider == "github-copilot":
+                from misaka.ai.auth.oauth.github_copilot import _getBaseUrlFromToken
+                endpoint = _getBaseUrlFromToken(stored.get("access", "")) or endpoint
     if not endpoint and getattr(model, "api", None) == "openai-codex-responses":
-        from misaka.ai.providers.openai_codex_responses import resolve_codex_url
+        from misaka.ai.api.openai_codex_responses import (
+            _resolveCodexUrl as resolve_codex_url,
+        )
 
-        endpoint = resolve_codex_url()
+        endpoint = resolve_codex_url(endpoint)
     api = getattr(model, "api", None)
     if api in {"google-generative-ai", "google-vertex"}:
         from misaka.ai.utils.google_endpoint import resolve_google_endpoint
@@ -937,10 +942,12 @@ def _ordinary_model_network_context(session: Any) -> tuple[str, dict[str, str] |
         # stored on a credential (resolve_location currently does not read it).
         location = os.environ.get("GOOGLE_CLOUD_LOCATION") or "global"
         if api == "google-vertex":
-            from misaka.ai.providers.google_vertex import resolve_api_key
+            from misaka.ai.api.google_vertex import _resolveApiKey as resolve_api_key
             from misaka.core.resolve_config_value import (
-                is_command_config_value,
-                resolve_config_value,
+                isCommandConfigValue as is_command_config_value,
+            )
+            from misaka.core.resolve_config_value import (
+                resolveConfigValue as resolve_config_value,
             )
 
             # Registry auth gives a configured key priority over ambient auth only
@@ -948,9 +955,9 @@ def _ordinary_model_network_context(session: Any) -> tuple[str, dict[str, str] |
             # Expand non-command templates in memory to apply the stream's
             # placeholder/marker filtering; never execute a configured command.
             if not loaded_api_key and stored is None:
-                configs = getattr(registry, "_providerRequestConfigs", {})
-                config = configs.get(provider) if provider else None
-                raw_key = getattr(config, "apiKey", None)
+                providers, _ = load_custom_providers(_resolve_models_json_path(session))
+                config = providers.get(provider, {})
+                raw_key = config.get("apiKey") if isinstance(config, dict) else None
                 if isinstance(raw_key, str):
                     loaded_api_key = raw_key if is_command_config_value(raw_key) else resolve_config_value(raw_key)
 
@@ -988,9 +995,7 @@ async def _test_model_connectivity(session: Any, provider_id: str, model_id: str
     provider for a couple of tokens. The error text separates an unreachable endpoint (a
     transport error) from a rejected credential (the provider answered with an auth error).
     """
-    from misaka.ai.auth.resolve import AuthResolutionOverrides
     from misaka.ai.types import Context, SimpleStreamOptions, UserMessage
-    from misaka.ai.utils.headers import provider_headers_to_record
 
     registry = _model_registry_of(session)
     if registry is None:
@@ -1005,18 +1010,10 @@ async def _test_model_connectivity(session: Any, provider_id: str, model_id: str
 
     started = time.monotonic()
     try:
-        resolution = await registry.getAuth(model, AuthResolutionOverrides())
-        if resolution is None:
-            return {"ok": False, "error": "no credential resolved"}
-        if resolution.auth.baseUrl and hasattr(model, "model_copy"):
-            model = model.model_copy(update={"baseUrl": resolution.auth.baseUrl})
         reply = await registry.streamSimple(
             model,
             Context(messages=[UserMessage(content="Reply with the single word OK.", timestamp=0)]),
             SimpleStreamOptions(
-                apiKey=resolution.auth.apiKey,
-                headers=provider_headers_to_record(resolution.auth.headers),
-                env=resolution.env,
                 maxTokens=8,
             ),
         ).result()
@@ -1718,7 +1715,7 @@ async def run_desktop_bridge(runtime_host: Any, options: Any = None) -> int:
                     if policy.get("state") != "ready":
                         raise RuntimeError(policy.get("error") or "The desktop team model switch is pending.")
                 else:
-                    await session.setModel(model, persist=persist)
+                    await session.setModel(model, {"persist": persist})
                 cur = getattr(session, "model", None)
                 payload = {
                     **_thinking_state(session),
@@ -2351,7 +2348,8 @@ async def run_desktop_bridge(runtime_host: Any, options: Any = None) -> int:
                 write_ack(req_id, ok=True, data={"run": None, "graph": None})
                 return
             try:
-                from misaka.core.research import graph, runs
+                from misaka.core.research import runs
+                from misaka.core.research import views as graph
 
                 run_id = obj.get("runId")
                 run = runs.get(con, str(run_id)) if run_id else _latest_run_row(runs, con, _research_workspace(obj, session))
@@ -2381,7 +2379,9 @@ async def run_desktop_bridge(runtime_host: Any, options: Any = None) -> int:
                 write_ack(req_id, ok=False, error="export_session requires 'path'")
                 return
             try:
-                from misaka.core.session_export import export_session_to_jsonl
+                from misaka.core.session_export import (
+                    exportSessionToJsonl as export_session_to_jsonl,
+                )
 
                 manager = SessionManager.open(str(path))
                 written = export_session_to_jsonl(manager, str(output) if output else None)
@@ -2705,19 +2705,21 @@ async def run_desktop_bridge(runtime_host: Any, options: Any = None) -> int:
 
         elif cmd in ("get_providers", "getproviders"):
             try:
-                known_providers = set(BUILT_IN_PROVIDER_DISPLAY_NAMES.keys())
+                known_providers = set(visible_provider_ids())
                 reg = getattr(session, "modelRegistry", None)
                 oauth_provider_ids = set()
                 if reg is not None:
                     for m in reg.getAll():
                         known_providers.add(m.provider)
-                    for p in reg.getProviders():
+                    runtime = getattr(reg, "modelRuntime", reg)
+                    registered = runtime.getProviders()
+                    for p in registered:
                         known_providers.add(p.id)
-                    oauth_provider_ids = {p.id for p in reg.getOAuthProviders()}
+                    oauth_provider_ids = {p.id for p in registered if getattr(getattr(p, "auth", None), "oauth", None) is not None}
 
                 providers_list = []
                 for pid in sorted(known_providers):
-                    display_name = reg.getProviderDisplayName(pid) if reg else BUILT_IN_PROVIDER_DISPLAY_NAMES.get(pid, pid)
+                    display_name = reg.getProviderDisplayName(pid) if reg else pid
                     status = reg.getProviderAuthStatus(pid) if reg else None
                     is_configured = bool(status and (status.configured or status.source))
                     providers_list.append({
@@ -2895,9 +2897,12 @@ async def run_desktop_bridge(runtime_host: Any, options: Any = None) -> int:
                 reg = getattr(session, "modelRegistry", None)
                 models_list = []
                 if reg is not None:
+                    custom_ids_by_provider: dict[str, set[str]] = {}
                     for m in reg.getAll():
                         has_auth = reg.hasConfiguredAuth(m)
-                        custom_ids = _custom_model_ids(session, m.provider)
+                        if m.provider not in custom_ids_by_provider:
+                            custom_ids_by_provider[m.provider] = _custom_model_ids(session, m.provider)
+                        custom_ids = custom_ids_by_provider[m.provider]
                         models_list.append({
                             "id": m.id,
                             "name": m.name or m.id,
@@ -3051,8 +3056,13 @@ async def run_desktop_bridge(runtime_host: Any, options: Any = None) -> int:
                 return
             try:
                 reg = getattr(session, "modelRegistry", None)
-                if reg and hasattr(reg, "authStorage"):
-                    reg.authStorage.set(provider, {"type": "api_key", "key": api_key})
+                if reg and getattr(reg, "authStorage", None) is not None:
+                    from misaka.ai.auth.types import ApiKeyCredential
+
+                    async def replace_credential(_previous):
+                        return ApiKeyCredential(key=api_key)
+
+                    await reg.authStorage.modify(provider, replace_credential)
                     write_ack(req_id, ok=True)
                 else:
                     write_ack(req_id, ok=False, error="Session has no auth storage")
@@ -3066,8 +3076,8 @@ async def run_desktop_bridge(runtime_host: Any, options: Any = None) -> int:
                 return
             try:
                 reg = getattr(session, "modelRegistry", None)
-                if reg and hasattr(reg, "authStorage"):
-                    reg.authStorage.remove(provider)
+                if reg and getattr(reg, "authStorage", None) is not None:
+                    await reg.authStorage.delete(provider)
                     write_ack(req_id, ok=True)
                 else:
                     write_ack(req_id, ok=False, error="Session has no auth storage")
@@ -3311,7 +3321,7 @@ def main(args: Any = None) -> int:
     profile_dir = os.path.join(current_config()["roles_root"], "last_order")
     role_flags, assembly, role_env = role_session_setup(
         profile_dir, cwd, model=getattr(args, "model", None),
-        receive_messages=False, research_context=bool(getattr(args, "research_context", False)),
+        receive_messages=False, workflow_context=bool(getattr(args, "research_context", False)),
         research_host=bool(getattr(args, "research_context", False)))
     if getattr(args, "research_context", False):
         from misaka.desktop_research.runtime import prepare_desktop_assembly

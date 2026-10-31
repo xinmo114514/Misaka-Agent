@@ -327,4 +327,3 @@ export const ThinkingSlider: React.FC<ThinkingSliderProps> = ({
     </div>
   )
 }
-

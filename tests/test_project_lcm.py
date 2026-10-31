@@ -200,6 +200,76 @@ def test_full_checkpoint_rebuild_and_fork_preserve_session_bytes(tmp_path):
     assert built.get_runtime_identity()["plugin_name"] == "misaka-lcm"
 
 
+def failed_attempt(ctx, tick, *, retried):
+    """A provider error's empty assistant row; a retry drops it before the next request."""
+    entry_id = ctx.sessionManager.appendMessage({
+        "role": "assistant", "content": [], "api": "a", "provider": "p", "model": "m",
+        "usage": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "totalTokens": 0,
+                  "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "total": 0}},
+        "stopReason": "error", "errorMessage": "Error code: 503", "timestamp": 1789460420000 + tick})
+    if retried:
+        ctx.sessionManager.appendContextEdit(entry_id, None)
+    return entry_id
+
+
+def unowned_frontier_sources(built, snapshot):
+    _, stored = ce._archive_map(built, snapshot)
+    source_entries = {source for sources in stored.values() for source in sources}
+    foreign = set(carry.sources(built, snapshot).values())
+    with ce._summary_scope(built, transcript=snapshot):
+        return [source for node in built._summary_frontier_nodes() for source in carry.source_ids(built, node)
+                if source not in source_entries and source not in foreign]
+
+
+def test_a_retried_attempt_after_a_checkpoint_leaves_its_frontier_owned(tmp_path):
+    """2026-10-26: a checkpoint held a stored empty assistant row; later 503 retries appended
+    identical rows that a context edit dropped before any ingest. Counting those in the archive
+    let upstream's surplus-skip matcher hand the checkpoint's row to nobody, and compaction
+    raised "frontier contains sources outside the transcript archive" in Last Order's turn."""
+    ctx = session(tmp_path / "project")
+    failed_attempt(ctx, 0, retried=False)                    # retries exhausted: it stays, and is stored
+    summary(ctx)
+    say(ctx, "after the checkpoint", tick=1)
+    ce.sync(ctx)
+    for tick in range(2, 5):
+        failed_attempt(ctx, tick, retried=True)
+    say(ctx, "after the retries", tick=5)
+    ce.sync(ctx)
+    built, snapshot = ce.bound_engine(ctx), ce.snapshot(ctx)
+    assert unowned_frontier_sources(built, snapshot) == []
+    native = ctx.sessionManager.buildSessionContext().messages
+    ce.compact(ce.prepare({"reason": "manual", "messages": native}, ctx))
+
+
+def test_a_rebind_does_not_ingest_the_attempts_a_retry_dropped(tmp_path):
+    ctx = session(tmp_path / "project")
+    say(ctx, "question")
+    ce.sync(ctx)
+    dropped = [failed_attempt(ctx, tick, retried=True) for tick in range(3)]
+    say(ctx, "answer", tick=3)
+    ce.sync(ctx)
+    built = ce.bound_engine(ctx)
+    stored = count(built)
+    ce.start(ctx)                                            # session_compact_failed, a tree switch, a restart
+    ce.sync(ctx)
+    assert count(built) == stored == 2
+    _, rows = ce._archive_map(built, ce.snapshot(ctx))
+    assert all(not rows[entry] for entry in dropped)
+
+
+def test_an_unowned_frontier_skips_the_compaction_instead_of_failing_the_turn(tmp_path, monkeypatch):
+    ctx = session(tmp_path / "project")
+    summary(ctx)
+    say(ctx, "next", tick=1)
+    ce.sync(ctx)
+    monkeypatch.setattr(ce, "_archive_sources", lambda *_: ({}, {}))
+    native = ctx.sessionManager.buildSessionContext().messages
+    prepared = ce.prepare({"reason": "manual", "messages": native}, ctx)
+    calls = []
+    monkeypatch.setattr(prepared.built, "compress", lambda *a, **k: calls.append(a))
+    assert ce.compact(prepared) is None and calls == []
+
+
 def carried(ctx):
     ce.bound_engine(ctx)._config.new_session_retain_depth = -1
     target = SessionManager.create(ctx.cwd, ctx.sessionManager.getSessionDir())
@@ -258,12 +328,25 @@ def test_carry_rejects_missing_modified_or_cross_project_sources(tmp_path, damag
         ce.sync(target)
 
 
+def _contract(value):
+    """A JSON Schema without its prose: what a call may and must carry."""
+    if isinstance(value, dict):
+        return {key: _contract(item) for key, item in value.items() if key != "description"}
+    if isinstance(value, list):
+        return [_contract(item) for item in value]
+    return value
+
+
 def test_core_tool_schemas_unchanged_and_product_guidance(tmp_path):
     from misaka.extensions.misaka_lcm.host import tools
     from misaka.extensions.misaka_lcm.vendor.engine import LCMEngine
     for schema in LCMEngine.get_tool_schemas():
         definition = tools._definition(schema, str(tmp_path))
-        assert definition.parameters == schema["parameters"]
+        # The contract is upstream's; only the prose is said in misaka's terms (2026-10-17).
+        assert _contract(definition.parameters) == _contract(schema["parameters"])
+        for key, spec in schema["parameters"].get("properties", {}).items():
+            if "description" in spec:
+                assert definition.parameters["properties"][key]["description"] == tools.misaka_text(spec["description"])
         assert definition.name == schema["name"]
     assert "MISAKA LCM" in tools.recall_guideline()
     assert "Hermes-LCM" not in tools.recall_guideline()
@@ -534,7 +617,7 @@ def test_research_restores_the_recall_rules_without_repeating_them(tmp_path):
     dropped them, and repeats none under the default prompt -- this long multi-paragraph one too."""
     from misaka.core.agent_session import AgentSession
     from misaka.core.research.prompting import system_context
-    from misaka.core.system_prompt import build_system_prompt
+    from misaka.core.system_prompt import buildSystemPrompt
     from misaka.core.wiring import ToolCollector
     from misaka.extensions.misaka_lcm.host import tools
 
@@ -545,8 +628,8 @@ def test_research_restores_the_recall_rules_without_repeating_them(tmp_path):
                              getAgentsFiles=lambda: {"agentsFiles": []})
     host = SimpleNamespace(_cwd=str(tmp_path), _resourceLoader=loader,
                            _toolRegistry=definitions, _toolDefinitions=definitions)
-    AgentSession._rebuild_system_prompt(host, list(definitions))
-    prompt = build_system_prompt(host._baseSystemPromptOptions)
+    AgentSession._rebuildSystemPrompt(host, list(definitions))
+    prompt = buildSystemPrompt(host._baseSystemPromptOptions)
     session = SimpleNamespace(getToolDefinition=definitions.get)
     rule = tools.recall_guideline()
     assert rule in prompt and rule not in system_context(session, list(definitions), prompt)

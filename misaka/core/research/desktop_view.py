@@ -7,11 +7,11 @@ from datetime import datetime
 from functools import lru_cache
 from pathlib import Path
 
-from misaka.ai.utils.text import content_text
+from misaka.ai.utils.text import contentText as content_text
 from misaka.config import home
 from misaka.core.platform import tasks as task_store
-from misaka.core.research import graph, ledger, runs
-from misaka.core.session_manager import load_entries_from_file
+from misaka.core.research import views, ledger, runs
+from misaka.core.session_manager import loadEntriesFromFile as load_entries_from_file
 from misaka.utils.redact import redact
 from misaka.utils.values import read_field
 
@@ -37,7 +37,7 @@ def _read_session(path, version):
 
 
 def _session_id(path):
-    from misaka.core.session_manager import read_session_header
+    from misaka.core.session_manager import readSessionHeader as read_session_header
     return read_session_header(path).get("id") if path else None
 
 
@@ -120,7 +120,7 @@ def sessions_payload(con, run_id):
                "createdAt": run["created_at"] * 1000, "updatedAt": run["updated_at"] * 1000,
                "driverLock": run["driver_lock"], "driverExpires": run["driver_expires"],
                "driving": runs.driver_is_live(run)}
-    snapshot = graph.snapshot(con, run)
+    snapshot = views.snapshot(con, run)
     # A plan that waits for the user's go-ahead keeps the run `active` while its driver has
     # legitimately finished its turn: the lease is free, but this is a wait, not an interruption.
     # Publishing the wait separately keeps the resume rule ("no live driver" is not enough) honest.
@@ -318,7 +318,7 @@ def run_detail(con, run_id):
     run = runs.get(con, str(run_id))
     if run is None:
         return None
-    snapshot = graph.snapshot(con, run)
+    snapshot = views.snapshot(con, run)
     snapshot["plans"] = []
     pending_questions = []
     for node in runs.nodes(con, run_id):
@@ -381,7 +381,7 @@ def node_detail(con, run_id, node_id):
     return {
         "node": {"id": str(node["id"]), "question": str(node["question"]),
                  "depth": int(node["depth"]), "status": str(node["status"]),
-                 "kind": graph.kind(con, node)},
+                 "kind": views.kind(con, node)},
         "plan_round": int(plan_round),
         "plan": plan_action["payload"] if plan_action else None,
         "cards": cards,
@@ -397,7 +397,7 @@ def task_detail(con, run_id, task_id):
     run = runs.get(con, str(run_id))
     task = task_store.get(con, str(task_id))
     link = con.execute(
-        "SELECT branch_id FROM research_run_tasks WHERE run_id=? AND task_id=?",
+        "SELECT branch_id FROM research_cards WHERE run_id=? AND task_id=?",
         (str(run_id), str(task_id)),
     ).fetchone()
     if run is None or task is None or link is None:
@@ -602,7 +602,7 @@ def execution_detail(con, run_id, task_id, *, instance_id=None, cursor=None, lim
     """
     run = runs.get(con, str(run_id))
     link = con.execute(
-        "SELECT branch_id FROM research_run_tasks WHERE run_id=? AND task_id=?",
+        "SELECT branch_id FROM research_cards WHERE run_id=? AND task_id=?",
         (str(run_id), str(task_id)),
     ).fetchone() if run is not None else None
     if run is None or link is None:

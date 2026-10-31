@@ -27,4 +27,3 @@ export const MisakaLogo: React.FC<MisakaLogoProps> = ({
 }
 
 export default MisakaLogo
-

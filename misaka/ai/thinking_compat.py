@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from misaka.ai.types import AssistantMessage, ErrorEvent, Model, ProviderStreamOptions, Usage, UsageCost
-from misaka.ai.utils.diagnostics import AssistantMessageDiagnostic, append_assistant_message_diagnostic
+from misaka.ai.utils.diagnostics import AssistantMessageDiagnostic, appendAssistantMessageDiagnostic as append_assistant_message_diagnostic
 from misaka.ai.utils.event_stream import AssistantMessageEventStream, spawn_stream_task
 
 LEVELS = ("off", "minimal", "low", "medium", "high", "xhigh", "max")

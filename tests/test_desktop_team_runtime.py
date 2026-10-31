@@ -50,7 +50,7 @@ async def test_exact_binding_stream_holds_barrier_through_stream_completion(tmp_
     class Registry:
         def find(self, provider, model):
             return selected if (provider, model) == (selected.provider, selected.id) else None
-        async def checkConfiguredAuth(self, model):
+        async def checkAuth(self, model):
             return True
 
     class Stream:
@@ -66,15 +66,15 @@ async def test_exact_binding_stream_holds_barrier_through_stream_completion(tmp_
         calls.append((model.provider, model.id))
         return Stream()
 
-    async def set_model(model, persist=False):
-        assert persist is False
+    async def set_model(model, options=None):
+        assert options == {"persist": False}
         session.model = model
         session.agent.state.model = model
 
     session = SimpleNamespace(model=wrong, modelRegistry=Registry(),
-        agent=SimpleNamespace(streamFn=inner,state=SimpleNamespace(model=wrong)), setModel=set_model)
+        agent=SimpleNamespace(streamFunction=inner,state=SimpleNamespace(model=wrong)), setModel=set_model)
     install_model_binding(session, policy, "root")
-    stream = await session.agent.streamFn(wrong, {}, {})
+    stream = await session.agent.streamFunction(wrong, {}, {})
     assert calls == [("openai", "pinned")]
     assert session.model is selected
     assert len(__import__("json").loads(policy.path.read_text())["requests"]) == 1
@@ -171,7 +171,7 @@ from tests.test_prompt_assembly_integration import (
 
 async def test_real_original_agent_recruits_roles_before_native_planner(prompt_home):  # noqa: F811
     """Actual AgentSession+native ingress+native workflow+phase tool; no provider spend."""
-    from misaka.ai.models import get_models
+    from misaka.ai.providers.openai_models import OPENAI_MODELS
     from misaka.ai.types import AssistantMessage, DoneEvent
     from misaka.ai.utils.event_stream import AssistantMessageEventStream
     from misaka.core import wiring
@@ -179,22 +179,27 @@ async def test_real_original_agent_recruits_roles_before_native_planner(prompt_h
     from misaka.core.research import runs
     from misaka.core.research.wiring.research import ResearchPart
     from misaka.core.resource_loader import DefaultResourceLoader
-    from misaka.core.sdk import create_agent_session
+    from misaka.core.sdk import createAgentSession as create_agent_session
     from misaka.core.session_manager import SessionManager
     from misaka.core.settings_manager import SettingsManager
     from misaka.desktop_research.runtime import DesktopResearchController
     workspace = prompt_home / 'workspace'
     workspace.mkdir()
     _, assembly, _ = wiring.role_session_setup(str(prompt_home/'profiles/last_order'), str(workspace),
-        research_context=True, research_host=True)
+        workflow_context=True, research_host=True)
     loader = DefaultResourceLoader({'cwd':str(workspace),'agentDir':str(prompt_home/'agent'),
         'noExtensions':True,'noPromptTemplates':True,'noThemes':True})
     await loader.reload()
-    model = next(iter(get_models('openai')))
+    model = next(iter(OPENAI_MODELS.values()))
     auth = AuthStorage.inMemory()
-    auth.setRuntimeApiKey(model.provider, 'deterministic-fixture')
+    from misaka.ai.auth.types import ApiKeyCredential
+    async def credential(_current):
+        return ApiKeyCredential(type='api_key', key='deterministic-fixture')
+    await auth.modify(model.provider, credential)
+    from misaka.core.model_runtime import ModelRuntime
+    model_runtime = await ModelRuntime.create({"authStorage": auth, "modelsPath": None})
     result = await create_agent_session({'cwd':str(workspace),'agentDir':str(prompt_home/'agent'),
-        'model':model,'authStorage':auth,'resourceLoader':loader,
+        'model':model,'modelRuntime':model_runtime,'resourceLoader':loader,
         'settingsManager':SettingsManager.inMemory({'compaction':{'enabled':False},'retry':{'enabled':False}}),
         'sessionManager':SessionManager.create(str(workspace),str(prompt_home/'sessions')),
         'parts':assembly.parts,'customTools':assembly.custom_tools})
@@ -224,7 +229,7 @@ async def test_real_original_agent_recruits_roles_before_native_planner(prompt_h
         out.push(DoneEvent(reason=reply.stopReason,message=reply))
         out.end(reply)
         return out
-    session.agent.streamFn = stream
+    session.agent.streamFunction = stream
     events = []
     controller = DesktopResearchController(session, events.append,
         config={**__import__('misaka.config.product', fromlist=['current_config']).current_config(),
@@ -240,7 +245,7 @@ async def test_real_original_agent_recruits_roles_before_native_planner(prompt_h
         from misaka.core.network.wiring.network import NetworkPart
         assert type(next(p for p in session.moments.parts if isinstance(p,WebPart))) is controller.scope.native.module('misaka.core.web').WebPart
         assert type(next(p for p in session.moments.parts if isinstance(p,NetworkPart))) is controller.scope.native.module('misaka.core.network.wiring.network').NetworkPart
-        assert session.extensionRunner.create_context().modelRegistry is session.modelRegistry
+        assert session.extensionRunner.createContext().modelRegistry is session.modelRegistry
         async with asyncio.timeout(15):
             while not runs.listing(con) or runs.listing(con)[0]['status'] not in {'waiting_input','failed'}:
                 await asyncio.sleep(.02)
@@ -269,28 +274,33 @@ async def test_real_original_agent_recruits_roles_before_native_planner(prompt_h
 
 async def test_a_failed_recruitment_intake_retries_the_start_without_redelivering_it(prompt_home):  # noqa: F811
     """One requestId records one intake turn; its retry continues the start, it never re-recruits."""
-    from misaka.ai.models import get_models
+    from misaka.ai.providers.openai_models import OPENAI_MODELS
     from misaka.ai.types import AssistantMessage, DoneEvent
     from misaka.ai.utils.event_stream import AssistantMessageEventStream
     from misaka.core import wiring
     from misaka.core.auth_storage import AuthStorage
     from misaka.core.resource_loader import DefaultResourceLoader
-    from misaka.core.sdk import create_agent_session
+    from misaka.core.sdk import createAgentSession as create_agent_session
     from misaka.core.session_manager import SessionManager
     from misaka.core.settings_manager import SettingsManager
     from misaka.desktop_research.runtime import DesktopResearchController
     workspace = prompt_home / 'workspace'
     workspace.mkdir()
     _, assembly, _ = wiring.role_session_setup(str(prompt_home/'profiles/last_order'), str(workspace),
-        research_context=True, research_host=True)
+        workflow_context=True, research_host=True)
     loader = DefaultResourceLoader({'cwd':str(workspace),'agentDir':str(prompt_home/'agent'),
         'noExtensions':True,'noPromptTemplates':True,'noThemes':True})
     await loader.reload()
-    model = next(iter(get_models('openai')))
+    model = next(iter(OPENAI_MODELS.values()))
     auth = AuthStorage.inMemory()
-    auth.setRuntimeApiKey(model.provider, 'deterministic-fixture')
+    from misaka.ai.auth.types import ApiKeyCredential
+    async def credential(_current):
+        return ApiKeyCredential(type='api_key', key='deterministic-fixture')
+    await auth.modify(model.provider, credential)
+    from misaka.core.model_runtime import ModelRuntime
+    model_runtime = await ModelRuntime.create({"authStorage": auth, "modelsPath": None})
     result = await create_agent_session({'cwd':str(workspace),'agentDir':str(prompt_home/'agent'),
-        'model':model,'authStorage':auth,'resourceLoader':loader,
+        'model':model,'modelRuntime':model_runtime,'resourceLoader':loader,
         'settingsManager':SettingsManager.inMemory({'compaction':{'enabled':False},'retry':{'enabled':False}}),
         'sessionManager':SessionManager.create(str(workspace),str(prompt_home/'sessions')),
         'parts':assembly.parts,'customTools':assembly.custom_tools})
@@ -324,7 +334,7 @@ async def test_a_failed_recruitment_intake_retries_the_start_without_redeliverin
         out.push(DoneEvent(reason=reply.stopReason,message=reply))
         out.end(reply)
         return out
-    session.agent.streamFn = stream
+    session.agent.streamFunction = stream
     controller = DesktopResearchController(session, lambda payload: None,
         config={**__import__('misaka.config.product', fromlist=['current_config']).current_config(),
                 'lo_model': f'{model.provider}/{model.id}'}).attach()
@@ -389,7 +399,7 @@ async def test_real_native_agent_child_uses_desktop_bootstrap_and_exact_team_pai
                 prompt='Evidence-minded test helper',source='inline',model='fixture-b/different'),
                 description='Desktop child binding',prompt='CHILD_MODEL_MARKER',model='fixture-global/global',
                 background=False,name=None,isolation=None,cwd=None,tool_call_id='',
-                context=session.extensionRunner.create_context())
+                context=session.extensionRunner.createContext())
             assert (task.model_provider,task.model_id)==('fixture-lo','shared')
             failures=[]
             run_turn=manager._run_turn
@@ -462,13 +472,13 @@ async def test_request_pauses_on_failed_boundary_until_explicit_cancel(tmp_path)
     old = SimpleNamespace(provider='fixture',id='old')
     session = SimpleNamespace(model=old,modelRegistry=SimpleNamespace(
        find=lambda p,m: old if (p,m)==('fixture','old') else None,
-       checkConfiguredAuth=lambda model: asyncio.sleep(0,result=True)),
-       agent=SimpleNamespace(state=SimpleNamespace(model=old),streamFn=lambda *args: None),
+       checkAuth=lambda model: asyncio.sleep(0,result=True)),
+       agent=SimpleNamespace(state=SimpleNamespace(model=old),streamFunction=lambda *args: None),
        setModel=lambda *args,**kwargs: asyncio.sleep(0))
     install_model_binding(session,policy,'root')
     failed = await policy.switch('missing','model')
     assert failed['state']=='failed'
-    request = asyncio.create_task(session.agent.streamFn(old,{},{}))
+    request = asyncio.create_task(session.agent.streamFunction(old,{},{}))
     await asyncio.sleep(.03)
     assert not request.done()
     await policy.cancel_switch()
@@ -512,11 +522,11 @@ async def test_request_binding_rebuilds_native_auth_after_model_override(tmp_pat
         assert model is pinned
         return resolution
     session = SimpleNamespace(model=pinned,modelRegistry=SimpleNamespace(
-       find=lambda p,m:pinned,checkConfiguredAuth=lambda m:asyncio.sleep(0,result=True),getAuth=get_auth),
-       agent=SimpleNamespace(state=SimpleNamespace(model=pinned),streamFn=lambda m,c,o:actual.append(o)),
+       find=lambda p,m:pinned,checkAuth=lambda m:asyncio.sleep(0,result=True),getAuth=get_auth),
+       agent=SimpleNamespace(state=SimpleNamespace(model=pinned),streamFunction=lambda m,c,o:actual.append(o)),
        setModel=lambda *a,**kw:asyncio.sleep(0))
     install_model_binding(session,policy,'root')
-    out = await session.agent.streamFn(SimpleNamespace(provider='wrong',id='wrong'),{},
+    out = await session.agent.streamFunction(SimpleNamespace(provider='wrong',id='wrong'),{},
         {'apiKey':'WRONG_KEY','headers':{'authorization':'Bearer WRONG'},'env':{'WRONG_ENV':'wrong'},'maxTokens':321})
     await out.aclose()
     assert actual[0]['apiKey']=='RIGHT_KEY'
@@ -558,17 +568,17 @@ async def test_request_binding_diagnostics_use_stream_effective_network_env(tmp_
         model=pinned,
         modelRegistry=SimpleNamespace(
             find=lambda _provider, _model: pinned,
-            checkConfiguredAuth=lambda _model: asyncio.sleep(0, result=True),
+            checkAuth=lambda _model: asyncio.sleep(0, result=True),
             getAuth=get_auth,
         ),
         agent=SimpleNamespace(
             state=SimpleNamespace(model=pinned),
-            streamFn=lambda _model, _context, _options: Stream(),
+            streamFunction=lambda _model, _context, _options: Stream(),
         ),
         setModel=lambda *args, **kwargs: asyncio.sleep(0),
     )
     install_model_binding(session, policy, 'root')
-    stream = await session.agent.streamFn(pinned, {}, {})
+    stream = await session.agent.streamFunction(pinned, {}, {})
     try:
         assert session._desktop_network_context['env'] == expected_env
     finally:
@@ -598,11 +608,11 @@ async def test_provider_finalizer_drains_before_ticket_release(tmp_path):
         await finalizer_release.wait()
     spawn_stream_task(producer(),stream=output)
     session = SimpleNamespace(model=model,modelRegistry=SimpleNamespace(find=lambda p,m:model,
-        checkConfiguredAuth=lambda m:asyncio.sleep(0,result=True)),
-        agent=SimpleNamespace(state=SimpleNamespace(model=model),streamFn=lambda *a:output),
+        checkAuth=lambda m:asyncio.sleep(0,result=True)),
+        agent=SimpleNamespace(state=SimpleNamespace(model=model),streamFunction=lambda *a:output),
         setModel=lambda *a,**kw:asyncio.sleep(0))
     install_model_binding(session,policy,'root')
-    stream=await session.agent.streamFn(model,{},{})
+    stream=await session.agent.streamFunction(model,{},{})
     terminal=asyncio.create_task(stream.result())
     await finalizer_entered.wait()
     await asyncio.sleep(.01)
@@ -764,8 +774,8 @@ async def test_moa_semantic_transport_is_rejected_before_any_fanout(tmp_path):
     physical=SimpleNamespace(provider='physical',id='moa-display-name',api='openai-completions')
     models={('physical','moa-display-name'):physical,('moa','preset'):virtual}
     session=SimpleNamespace(model=physical,modelRegistry=SimpleNamespace(find=lambda p,m:models.get((p,m)),
-        checkConfiguredAuth=lambda model:asyncio.sleep(0,result=True)),
-        agent=SimpleNamespace(state=SimpleNamespace(model=physical),streamFn=lambda *a:calls.append(a)),
+        checkAuth=lambda model:asyncio.sleep(0,result=True)),
+        agent=SimpleNamespace(state=SimpleNamespace(model=physical),streamFunction=lambda *a:calls.append(a)),
         setModel=lambda *a,**kw:asyncio.sleep(0))
     install_model_binding(session,policy,'root')
     state=await policy.switch('moa','preset')
@@ -774,7 +784,7 @@ async def test_moa_semantic_transport_is_rejected_before_any_fanout(tmp_path):
     assert 'heterogeneous' in state['error']
     assert not calls
     await policy.cancel_switch()
-    stream=await session.agent.streamFn(virtual,{},{})
+    stream=await session.agent.streamFunction(virtual,{},{})
     await stream.aclose()
     assert calls[0][0] is physical  # model/display name is not blacklisted
 

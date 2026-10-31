@@ -87,8 +87,8 @@ def _worker_identity():
     ``reconcile`` below would find a live unrelated process behind the recorded number, skip the
     card forever, and the drive loop would offer it again on every poll.
 
-    When the claiming process leads its own process group -- the shape ``research.node`` starts a
-    card child in -- publish the group form the Sister path uses, so the reconciler can also
+    When the claiming process leads its own process group -- the shape a workflow's node process
+    starts a card child in -- publish the group form the Sister path uses, so the reconciler can also
     fence the model session the child left behind before the card is given to a new owner. The
     prefix is a promise about the process group, so it is only made when it is true: claimed from
     inside someone else's group, it would aim ``terminate_orphaned_group`` at that group.
@@ -138,6 +138,10 @@ def reconcile(con, cfg, *, task_ids=None, workspace=None):
 
     wanted = set(task_ids) if task_ids is not None else None
     now = int(_time.time())
+    # A consultation whose process went with its daemon: settled, and its sender told.
+    from misaka.core.network import messages
+    for run in db.abandon_consultations(con, now=now):
+        messages.tell_asker(con, run, run["summary"])
     for t in db.by_status(con, "running", workspace=workspace):
         if wanted is not None and t["id"] not in wanted:
             continue
@@ -219,10 +223,15 @@ def run_task(con, t, cfg, *, say=None, consult=False, expected_generation=None):
             return False
         claiming = globals().get('_SCOPE_CONTINUATION_CLAIMING')
         if claiming is not None:
-            claiming(t['id'], generation, lock, identity)
-        if not db.claim_resume(con, t["id"], lock, os.getpid(), worker_identity=identity,
-                               expected_generation=generation, host_cap=host_cap, assignee_cap=assignee_cap,
-                               consult=consult):
+            claiming(t['id'], generation, lock, identity, consult=consult)
+        consultation = None
+        if consult:
+            consultation = db.start_consultation(con, t["id"], generation=generation, lock=lock,
+                                                 pid=os.getpid(), identity=identity)
+            if consultation is None or consultation["claim_lock"] != lock:
+                return False
+        elif not db.claim_resume(con, t["id"], lock, os.getpid(), worker_identity=identity,
+                                 expected_generation=generation, host_cap=host_cap, assignee_cap=assignee_cap):
             return False
         t = db.get(con, t["id"])
         generation = int(t["generation"])
@@ -240,6 +249,10 @@ def run_task(con, t, cfg, *, say=None, consult=False, expected_generation=None):
         return False
     workspace = db.workspace_for(t)
     if not os.path.isdir(workspace):          # the card's folder is the project; a gone one is never recreated in silence
+        if say is not None and consult:
+            from misaka.core.network import messages
+            messages.settle_consultation(con, consultation["id"], lock, "failed", reason="project folder no longer exists")
+            return False
         db.block_task(con, t["id"], "needs_input", f"the project folder no longer exists: {workspace}",
                       generation=generation)
         return False
@@ -257,6 +270,8 @@ def run_task(con, t, cfg, *, say=None, consult=False, expected_generation=None):
     )
 
     task = dict(t)
+    if say is not None and consult:
+        task["_consult_run"] = dict(consultation)
     if say is not None:
         task["_say"] = say
     from misaka.core.platform import cards as card_files
@@ -265,6 +280,10 @@ def run_task(con, t, cfg, *, say=None, consult=False, expected_generation=None):
     task.update(worker.card_extras(con, t, cfg))
     bud = budget.status(con, cfg.get("token_cap"), task_id=t["id"])
     if bud["mode"] == "stop":
+        if say is not None and consult:
+            from misaka.core.network import messages
+            messages.settle_consultation(con, consultation["id"], lock, "stopped", reason="token budget exhausted")
+            return False
         if db.back_to_ready(
             con, t["id"], generation=generation, claim_lock=lock
         ):
@@ -284,7 +303,7 @@ def run_task(con, t, cfg, *, say=None, consult=False, expected_generation=None):
     try:
         claimed = globals().get('_SCOPE_CONTINUATION_CLAIMED')
         if claimed is not None:
-            claimed(t['id'], generation, lock)
+            claimed(t['id'], generation, lock, consult=consult)
         verdict = _run_ally(con, task, generation, lock, usage_db, say) if ally else worker.run_card(
             task, run_dir, profile_dir, cfg["provider"], cfg["default_model"],
             on_event=lambda line: (event := _compact_event(line)) is not None and db.add_event(
@@ -304,6 +323,10 @@ def run_task(con, t, cfg, *, say=None, consult=False, expected_generation=None):
     except BaseException as error:
         # Cancellation may be retried; an actual startup/runtime fault must not spawn
         # the same broken card every scheduler tick. Preserve its actionable cause.
+        if say is not None and consult:
+            from misaka.core.network import messages
+            messages.settle_consultation(con, consultation["id"], lock, "failed", reason=str(error))
+            raise
         with db.write_txn(con):
             settle = db.mark_failed if isinstance(error, Exception) else db.back_to_ready
             reason = f"{type(error).__name__}: {error}"[:2000]
@@ -311,6 +334,13 @@ def run_task(con, t, cfg, *, say=None, consult=False, expected_generation=None):
             if settle(con, t["id"], generation=generation, claim_lock=lock, **details):
                 record_dispatch_error(con, t["id"], generation, error)
         raise
+    if say is not None and consult:
+        from misaka.core.network import messages
+        messages.settle_consultation(con, consultation["id"], lock,
+                                     "stopped" if verdict.get("budget_stop") else
+                                     "done" if verdict.get("settled") or verdict.get("exit_code") == 0 else "failed",
+                                     reason=verdict.get("reason"))
+        return True
     if verdict.get("budget_stop"):
         if db.back_to_ready(
             con, t["id"], generation=generation, claim_lock=lock
@@ -458,6 +488,42 @@ def accept(con, t, submission, *, generation, claim_lock):
     ):
         return False
     accept_side_effects(con, t, submission, generation=generation)
+    return True
+
+
+def redeclare(con, row):
+    """Declare a finished card's outputs again, as a newer ``submitted`` row of its generation.
+
+    Completion does not end a card's session: a note from Last Order that crossed the
+    completion, or a message she answers in a consultation, starts more turns in it, and the
+    deliverables they change stayed declared under the old digests. The run's settle then saw
+    bytes that did not match the declaration and, until 2026-09-24, failed the whole run (18
+    changed paths on 6 cards). The declaration follows the work instead: the same submission
+    the completion built, rebuilt from the output folder and the findings recorded in the
+    generation, and indexed again. No model turn is spent on it. Blocking; a Sister's session
+    and an ally's runner both call it. True when a newer declaration was recorded."""
+    generation = int(row["generation"])
+    try:
+        last = json.loads(db.latest_payload(con, row["id"], "submitted", generation=generation) or "{}")
+    except (TypeError, ValueError):
+        last = {}
+    if not isinstance(last, dict):
+        last = {}
+    try:
+        submission = worker.build_submission(con, row, str(last.get("summary") or ""))
+        prepared = prepare_submission(row, submission)
+    except Exception as error:  # noqa: BLE001 - a declaration that cannot be rebuilt is noted, not fatal
+        db.add_event(con, row["id"], "redeclare_failed", {"reason": str(error)[:200]}, generation=generation)
+        return False
+    payload = prepared.payload
+    # Findings recorded after the completion change the declaration as much as a file does.
+    if all(payload.get(key) == last.get(key) for key in ("artifact_digests", "artifacts", "findings", "uncertain")):
+        return False
+    with db.write_txn(con):
+        db.add_event(con, row["id"], "submitted", payload, generation=generation)
+        db.add_event(con, row["id"], "redeclared", {"artifacts": len(payload.get("artifacts") or [])},
+                     generation=generation)
+    accept_side_effects(con, row, submission, generation=generation)
     return True
 
 

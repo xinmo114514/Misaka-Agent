@@ -37,9 +37,9 @@ def delivery(board, tmp_path, monkeypatch):
     monkeypatch.setattr(control, '_queue', lambda *args: None)
     monkeypatch.setattr(messages, '_SCOPE_WAKE_HOOK', control.wake_card)
     monkeypatch.setattr(dispatch, '_SCOPE_CONTINUATION_CLAIMED',
-                        lambda *args: control.claimed(*args), raising=False)
+                        lambda *args, **kwargs: control.claimed(*args, **kwargs), raising=False)
     monkeypatch.setattr(dispatch, '_SCOPE_CONTINUATION_CLAIMING',
-                        lambda *args: control.claiming(*args), raising=False)
+                        lambda *args, **kwargs: control.claiming(*args, **kwargs), raising=False)
     monkeypatch.setattr(dispatch.worker, 'run_card', lambda *args, **kwargs: {'settled': True})
     with closing(messages.connect()) as mail:
         yield SimpleNamespace(control=control, tid=tid, board=board, mail=mail, config=config, tmp=tmp_path)
@@ -54,7 +54,7 @@ def resume(world, monkeypatch, expected=1):
     monkeypatch.setenv('MISAKA_DESKTOP_CONTINUATION_EXECUTION_ID', record['executionId'])
     monkeypatch.setenv('MISAKA_DESKTOP_CONTINUATION', world.tid)
     return dispatch.run_task(world.board, tasks.get(world.board, world.tid), world.config,
-                             say='Read the queued questions.', consult=True, expected_generation=expected)
+                             say='Read the queued questions.', consult=False, expected_generation=expected)
 
 
 def reader(world, monkeypatch, generation, *, session=None):
@@ -63,13 +63,13 @@ def reader(world, monkeypatch, generation, *, session=None):
     from misaka.core.session_manager import SessionManager
     if session is None:
         session = object.__new__(AgentSession)
-        session.agent = Agent()
+        session.agent = Agent({"streamFn": lambda *_: None})
         session._customMessageReceipts = {}
         session.sessionManager = SessionManager.create(str(world.tmp), str(world.tmp / 'sessions'))
         session.sessionManager.rewrite_file()
         async def persist(payload, options):
             session._customMessageReceipts[options['_deliveryId']] = options
-            session._append_custom_message({'role': 'custom', **payload,
+            session._appendCustomMessage({'role': 'custom', **payload,
                 'details': {**payload['details'], 'delivery_id': options['_deliveryId']}})
         session.sendCustomMessage = persist
     part = messages.MessagesPart(sender='commune-historian', receive=True, card_task=world.tid)
@@ -196,7 +196,7 @@ async def test_pre_release_return_to_ready_recovers_input_on_scheduler_retry(del
     world = delivery
     send(world, 'Durable input before the claim was returned to ready')
 
-    def cancel(*args):
+    def cancel(*args, **kwargs):
         raise asyncio.CancelledError()
 
     with monkeypatch.context() as patch:
@@ -336,12 +336,12 @@ async def test_unrelated_later_attempt_does_not_release_continuation_input(deliv
     send(world, 'Input reserved for the accepted continuation')
     # Another actor wins the original CAS; it is not this registry execution.
     assert tasks.claim_resume(world.board, world.tid, 'foreign:1:claim', os.getpid(),
-                              expected_generation=1, consult=True)
+                              expected_generation=1)
     row = tasks.get(world.board, world.tid)
     assert tasks.mark_failed(world.board, world.tid, generation=2, claim_lock=row['claim_lock'],
                              failure_kind='configuration', reason='foreign worker failed')
     assert dispatch.run_task(world.board, tasks.get(world.board, world.tid), world.config,
-                             say='Unrelated later work', expected_generation=2, consult=True)
+                             say='Unrelated later work', expected_generation=2)
     part = reader(world, monkeypatch, 3)
     await part._deliver_once(world.mail)
     assert entries(part) == []
@@ -370,7 +370,7 @@ async def test_worker_crash_rebinds_only_owned_undelivered_mail(delivery, monkey
     # same generation; it does not invent a second continuation CAS.
     assert tasks.get(world.board, world.tid)['status'] == 'ready'
     send(world, 'Question accepted during recovery')
-    monkeypatch.setattr(dispatch, '_SCOPE_CONTINUATION_CLAIMED', lambda *args: world.control.claimed(*args))
+    monkeypatch.setattr(dispatch, '_SCOPE_CONTINUATION_CLAIMED', lambda *args, **kwargs: world.control.claimed(*args, **kwargs))
     monkeypatch.setattr(dispatch.worker, 'run_card', lambda *args, **kwargs: {'settled': True})
     monkeypatch.delenv('MISAKA_DESKTOP_CONTINUATION_EXECUTION_ID')
     monkeypatch.delenv('MISAKA_DESKTOP_CONTINUATION')
@@ -401,13 +401,13 @@ config, task_id, directory, before = json.loads(sys.argv[1])
 scope = SimpleNamespace(team=SimpleNamespace(directory=Path(directory)), current_config=lambda: config)
 control = DesktopCardControl(scope)
 dispatch._SCOPE_CONTINUATION_CLAIMING = control.claiming
-def abruptly_exit(*args):
+def abruptly_exit(*args, **kwargs):
     if not before:
-        control.claimed(*args)
+        control.claimed(*args, **kwargs)
     os._exit(23)
 dispatch._SCOPE_CONTINUATION_CLAIMED = abruptly_exit
 con = tasks.connect(config['db'])
-dispatch.run_task(con, tasks.get(con, task_id), config, say='Read the inbox', consult=True, expected_generation=1)
+dispatch.run_task(con, tasks.get(con, task_id), config, say='Read the inbox', consult=False, expected_generation=1)
 raise AssertionError('The continuation never reached the post-CAS process boundary')
 '''
     child = await asyncio.to_thread(subprocess.run, [sys.executable, '-c', source, json.dumps(
@@ -434,7 +434,7 @@ def test_real_remove_and_plan_replay_rebuilds_dependency_projection(board, tmp_p
     run = runs.create(board, workspace=str(tmp_path), question='Rebuild removed dependency')
     root = runs.nodes(board, run['id'])[0]
     assert runs.acquire_driver(board, run['id'], 'driver')
-    runs.prepare_runner(board, 'research_branches', root['id'])
+    runs.prepare_runner(board, 'research_execution', root['id'])
     run, root = runs.get(board, run['id']), runs.node(board, root['id'])
     specs = [task('a'), task('b', dependencies=['a'])]
     before = asyncio.run(workflow._submit_tasks(board, run, root, specs, kind='research'))
@@ -447,3 +447,133 @@ def test_real_remove_and_plan_replay_rebuilds_dependency_projection(board, tmp_p
     assert tasks.parent_ids(board, after['b'], strict=True) == [after['a']]
     written = cards.read(cards.card_path(str(tmp_path), after['b']))
     assert written['fields']['status'] == 'todo' and written['fields']['needs'] == [after['a']]
+
+
+async def test_native_consultation_releases_mail_without_reopening_card(delivery, monkeypatch):
+    world = delivery
+    out = send(world, "Consult the accepted result")
+    record = world.control._registry()[world.tid]
+    monkeypatch.setenv("MISAKA_DESKTOP_CONTINUATION", world.tid)
+    monkeypatch.setenv("MISAKA_DESKTOP_CONTINUATION_EXECUTION_ID", record["executionId"])
+    assert dispatch.run_task(world.board, tasks.get(world.board, world.tid), world.config,
+        say="Read inbox", consult=True, expected_generation=1)
+    row = tasks.get(world.board, world.tid)
+    assert row["status"] == "done" and row["generation"] == 1
+    part = reader(world, monkeypatch, 1)
+    await part._deliver_once(world.mail)
+    mail = world.mail.execute("SELECT * FROM messages WHERE id=?", (out["details"]["message_id"],)).fetchone()
+    assert mail["generation"] == 1 and mail["delivered_at"] is not None
+    assert len(entries(part)) == 1
+
+
+@pytest.mark.parametrize("before_release", [True, False])
+async def test_native_consultation_retry_retains_mail_and_finished_card(delivery, monkeypatch, before_release):
+    world = delivery
+    send(world, "Question before the consultation failed")
+    record = world.control._registry()[world.tid]
+    monkeypatch.setenv("MISAKA_DESKTOP_CONTINUATION", world.tid)
+    monkeypatch.setenv("MISAKA_DESKTOP_CONTINUATION_EXECUTION_ID", record["executionId"])
+    def fail(*args, **kwargs):
+        raise OSError("consult fixture failure")
+    with monkeypatch.context() as patch:
+        patch.setattr(dispatch if before_release else dispatch.worker,
+            "_SCOPE_CONTINUATION_CLAIMED" if before_release else "run_card", fail)
+        with pytest.raises(OSError, match="consult fixture failure"):
+            dispatch.run_task(world.board, tasks.get(world.board, world.tid), world.config,
+                say="Read inbox", consult=True, expected_generation=1)
+    row = tasks.get(world.board, world.tid)
+    assert row["status"] == "done" and row["generation"] == 1
+    assert tasks.live_consultation(world.board, world.tid) is None
+    assert dispatch.run_task(world.board, row, world.config,
+        say="Read inbox", consult=True, expected_generation=1)
+    part = reader(world, monkeypatch, 1)
+    await part._deliver_once(world.mail)
+    assert len(entries(part)) == 1
+
+
+@pytest.mark.parametrize("before_release", [True, False])
+async def test_reap_automatically_requeues_dead_native_consultation_once(delivery, monkeypatch, before_release):
+    import threading
+    from misaka.desktop_research import card_control
+    from misaka.desktop_research.model_policy import atomic_json
+    world = delivery
+    send(world, "Exact original question, preserved through automatic recovery")
+    original = world.control._registry()[world.tid]
+    monkeypatch.setenv("MISAKA_DESKTOP_CONTINUATION", world.tid)
+    monkeypatch.setenv("MISAKA_DESKTOP_CONTINUATION_EXECUTION_ID", original["executionId"])
+    def crash(*args, **kwargs):
+        raise OSError("dead consultation")
+    with monkeypatch.context() as patch:
+        patch.setattr(dispatch if before_release else dispatch.worker,
+            "_SCOPE_CONTINUATION_CLAIMED" if before_release else "run_card", crash)
+        with pytest.raises(OSError):
+            dispatch.run_task(world.board, tasks.get(world.board, world.tid), world.config,
+                say="Read inbox", consult=True, expected_generation=1)
+    records = world.control._registry()
+    records[world.tid]["state"] = "running"
+    atomic_json(world.control.registry_path, records)
+    world.control.continuations[world.tid] = SimpleNamespace(poll=lambda: 23)
+    queued, ready = [], threading.Event()
+    monkeypatch.setattr(world.control, "_queue", lambda *args: (queued.append(args), ready.set()))
+    monkeypatch.setattr(card_control, "REAP_INTERVAL_SECONDS", .01)
+    world.control._ensure_monitor()
+    try:
+        assert await asyncio.to_thread(ready.wait, 2)
+        retry = world.control._registry()[world.tid]
+        assert retry["state"] == "pending" and retry["automaticRetries"] == 1
+        assert retry["generation"] == 1 and retry["executionId"] != original["executionId"]
+        assert len(queued) == 1
+        monkeypatch.setenv("MISAKA_DESKTOP_CONTINUATION_EXECUTION_ID", retry["executionId"])
+        assert dispatch.run_task(world.board, tasks.get(world.board, world.tid), world.config,
+            say=queued[0][1], consult=True, expected_generation=1)
+        part = reader(world, monkeypatch, 1)
+        await part._deliver_once(world.mail)
+        await part._deliver_once(world.mail)
+        assert len(entries(part)) == 1
+        assert "Exact original question" in entries(part)[0]["content"]
+        records = world.control._registry()
+        records[world.tid]["state"] = "running"
+        atomic_json(world.control.registry_path, records)
+        world.control.continuations[world.tid] = SimpleNamespace(poll=lambda: 0)
+        world.control._reap()
+        assert len(queued) == 1
+        row = tasks.get(world.board, world.tid)
+        assert row["status"] == "done" and row["generation"] == 1
+    finally:
+        world.control._monitor_stop.set()
+        world.control._monitor_thread.join(2)
+
+
+def test_dead_consultation_automatic_recovery_has_persisted_retry_limit(delivery, monkeypatch):
+    from misaka.desktop_research.card_control import MAX_AUTOMATIC_RETRIES
+    from misaka.desktop_research.model_policy import atomic_json
+    world = delivery
+    send(world, "Do not loop forever")
+    records = world.control._registry()
+    records[world.tid].update(state="running", automaticRetries=MAX_AUTOMATIC_RETRIES)
+    atomic_json(world.control.registry_path, records)
+    world.control.continuations[world.tid] = SimpleNamespace(poll=lambda: 23)
+    queued = []
+    monkeypatch.setattr(world.control, "_queue", lambda *args: queued.append(args))
+    world.control._reap()
+    record = world.control._registry()[world.tid]
+    assert record["state"] == "failed" and record["errorCode"] == "DESKTOP_CONTINUATION_RETRY_LIMIT"
+    world.control._reap()
+    assert queued == []
+    assert world.mail.execute("SELECT delivered_at FROM messages").fetchone()[0] is None
+
+
+def test_new_host_recovers_previously_reaped_native_consultation(delivery, monkeypatch):
+    from misaka.desktop_research.model_policy import atomic_json
+    world = delivery
+    send(world, "Question left behind by the previous host")
+    records = world.control._registry()
+    records[world.tid]["state"] = "settled"
+    atomic_json(world.control.registry_path, records)
+    queued = []
+    monkeypatch.setattr(world.control, "_queue", lambda *args: queued.append(args))
+    world.control._reap()
+    assert len(queued) == 1
+    retry = world.control._registry()[world.tid]
+    assert retry["state"] == "pending" and retry["automaticRetries"] == 1
+    assert retry["generation"] == 1

@@ -8,8 +8,12 @@ import os
 from collections.abc import Sequence
 from typing import Any
 
-from misaka.utils.image_process import ProcessImageOptions, process_image
-from misaka.utils.mime import IMAGE_TYPE_SNIFF_BYTES, detect_supported_image_mime_type
+from misaka.utils.image_process import ProcessImageOptions
+from misaka.utils.image_process import processImage as process_image
+from misaka.utils.mime import IMAGE_TYPE_SNIFF_BYTES
+from misaka.utils.mime import (
+    detectSupportedImageMimeType as detect_supported_image_mime_type,
+)
 
 MAX_ATTACHMENTS = 10
 MAX_TOTAL_BYTES = 25 * 1024 * 1024

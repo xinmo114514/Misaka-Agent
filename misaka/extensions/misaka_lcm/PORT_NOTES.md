@@ -1,5 +1,25 @@
 # MISAKA LCM fork 契约
 
+## 2026-10-28：图片按张计价（U11）
+
+- `vendor/tokens.py` 的 `count_message_tokens` 把结构化内容整段 `json.dumps` 后按文本计，图片的 base64 也算进去：一张 670 KB 的页面截图算成 475,853 token（实际一两千）。每轮首请求前的 `should_compress_preflight` 用它判断，LO 的 1M 窗口在真实用量 33% 时就压缩了；图片更多时还会被判为超出组装上限、强制溢出恢复（R44）。上游 hermes-lcm 至 a13e709 未改，也没有 issue。
+- 改法照搬 Hermes 自己的估算器（`native/model_metadata.py` `estimate_messages_tokens_rough`）：图片部件按 `_count_image_tokens` 数张数，乘以 `current_image_token_cost()`（宿主在 `host/execution.py` 按模型绑定学到的单价，未校准时 1500）；文本照旧，计数前用 `_wire_message_shadow` 把图片换成同样的占位。只有列表内容走这条路，纯文本和无图列表的计数与上游逐一相同。这是新的 vendor→native 接缝：按 `__init__.py` 的先例用绝对路径导入，三个名字登记在 `vendor/dependency-contract.json` 的 `external_imports.misaka`。
+- 回归在 `tests/test_lcm_image_tokens.py`：真实尺寸的图片按单价计、跟随学到的单价、无图内容计数与上游相同、大图不再触发 preflight。
+- 上游 `vendor/tests/test_lcm_core.py::TestTokens::test_count_message_tokens_normalizes_content_parts` 断言的正是旧行为（带图片的部件列表与它的 JSON 文本计数相同），与 U05 的旧断言同类：原版测试文本不改，这一条在本 fork 下失败是预期的。
+
+## 2026-10-17：表层——会话身份、工具文案、结果出口、未启用的工具
+
+核心源码未改：`vendor/`、`native/` 逐字节不变，改动全在 `host/`、`__init__.py`、技能文档和打包配置。
+
+- **会话身份写入 source 列。** 绑定引擎时传给上游的 `platform` 从常量 `misaka` 改为会话自己的地址（`host/context_engine.py`、`host/carry.py` 两处）：`last-order`、Sister 名字，卡片会话加 `@<卡号>`（`momo@t_3fa9c1`），子代理加 `/<agent id>`（父会话 `Agent` 调用返回的 id；子代理与父会话同名，不加就分不开）。上游把它写进每行的 `source` 列，所以每条命中都带上是谁说的，`lcm_grep(source=...)` 的精确过滤随之可用。地址由 `activate(spec)` 从 `SessionSpec` 取得（`misaka_lcm.identity`），经 `storage.ProjectContext.lcm_source` 传到引擎；`misaka lcm` CLI 没有会话，仍为 `misaka`。上游对 platform 的其余用途不变：会话匹配键（`LCM_IGNORE_SESSION_PATTERNS`、`LCM_STATELESS_SESSION_PATTERNS` 现在能按地址写）、前台重绑记账、辅助会话 bypass 集合；引擎只比较它在同一会话内是否变化，不判断取值。重放对账（`reconcile.py`）不看 source。
+- **工具文案。** 上游说明里有 7 处指向 Hermes 的 `session_search`（misaka 没有这个工具），`lcm_recall` 自称搜索"agent 的全部记忆、所有对话、所有时间"，`source`/`conversation_id` 参数举的是 cli/discord/telegram 和 Discord 频道。`host/tools.py` 的 `_REWRITES` 按上游原句逐句改写或删除，作用于工具说明、参数说明和召回规则；原来只替换工具说明里的 "Hermes"，参数说明里的 "Hermes-tracked" 漏掉了。每条原句由测试核对仍逐字存在于上游，换上游版本时改了措辞会直接失败，而不是悄悄漏改。召回规则前言改写为一段：缓存的真实范围，以及按 `source` 找别的会话的完整做法（原来的做法要求 `session_id`，Sister 拿不到）。
+- **结果出口 `_deliver`。** 所有工具结果先过这里再进 `fence.refence`：（1）JSON 以 `ensure_ascii=False` 重新序列化，中文不再是 `\uXXXX`（一个汉字 6 个字符）；含孤立代理项、无法编码为 UTF-8 时保留上游转义。（2）单次结果上限 25k token（`RESULT_BUDGET_TOKENS`），按模型实际收到的文本计：连同 fence 的外框，以及内容里每个标记被 defang 后加长的部分——抓了大量网页的会话，一页里可能有上百个标记。上游只限每一项（行数、每行字符、命中数），不限乘积，默认 `lcm_load_session` 一页就可能是 100 行 × 4000 字符。超限的 `lcm_load_session` 页保留能放下的前若干行，`has_more`/`next_cursor` 按上游游标约定指向下一行，并注明 `trimmed_to_budget`；其他工具超限时返回 `error`，提示缩小请求或分页。fence 的标记和精确引用都是 ASCII，重新序列化不影响围栏判断。
+- **自动召回的标题。** 上游块标题说记忆来自"earlier conversations"（Hermes 是一个 agent 跨聊天的记忆），这里改为"本项目其他会话（Last Order 和各 Sister）"（`host/preanswer.py`）。测试用上游真实构建器核对原标题。
+- **未启用的工具不注册。** `lcm_query_state`（`LCM_ASSERTIONS_ENABLED`）和 `lcm_retrieve`（`LCM_ADAPTIVE_RETRIEVAL_ENABLED`）在开关关闭时只会回答 `disabled`，不再注册；开关打开时与上游一样注册，配置读不出来时注册全部。其余工具说明里没有提到这两个工具。
+- **打包。** wheel 不再打包 `vendor/` 的测试、基准、CI 配置和文档图片（`pyproject.toml`）；`vendor/scripts`、`vendor/skills` 和 `vendor/docs/*.md` 保留，运维入口与技能引用不变。仓库内文件不变，完整性门照旧。
+- 技能文档（`host/skills/misaka-lcm/SKILL.md`）同步：地址格式、结果上限，以及上游参考文档里 `session_search`、Hermes 配置与平台在 misaka 中的对应做法。下方"路径与开关"里过时的默认路径说明一并改正。
+- 回归在 `tests/test_lcm_surface.py`（含真实会话端到端与随机化压测）。
+
 ## 2026-09-20：长检索输入的 SQLite 表达式深度修复
 
 - 固定上游版本与 `CORE_INTEGRITY.json.files` 的原始哈希保持不变；本次本地差异单独登记在 `documented_fixes`，不是声称与上游逐字节一致。
@@ -12,7 +32,7 @@
 - `/lcm-settings` 由插件自行注册，使用已有扩展 UI；通用设置页不增加 LCM 专用代码。
 - 插件偏好文件持久化开关和向量模型配置；项目任务缓存仍在最后 owner 退出时清理。
 - 普通 native 请求也调用原版召回 builder；仅临时附加，不等待必须发生压缩，也不把注入块写入原生 checkpoint。
-- 仅对 FastEmbed 本地路由，用原版 profile/backfill API 为已载入内容建立有界索引；不自动导入旧归档、不自动下载模型、不自动向云端发原文。
+- 仅对原版判定的本地 provider（`command._is_local_embedding_provider`：fastembed、ollama），用原版 profile/backfill API 为已载入内容建立有界索引；不自动导入旧归档、不自动下载模型、不自动向云端发原文。
 - 设置、原版阈值/分块边界、退出所有权及验收见 [SETTINGS.md](SETTINGS.md)。核心源码未改。
 
 ## 2026-09-15：项目缓存后续 bug 验收
@@ -55,6 +75,7 @@
 | `config.py` | from_env、Hermes YAML defaults | 宿主配置适配 | 接受显式 host_config；MISAKA 传只读全局 settings，不读取另一个 Hermes 安装的 config.yaml。默认 None 仍保留原版配置来源与优先级 | 重放显式宿主配置入口；保留原版默认路径回归 |
 | `dag.py` | add_node、retain-depth | 宿主取消与会话树适配 | 可选 before_publish 检查点在摘要 INSERT 前和提交前检查取消；取消则回滚该次 INSERT。宿主可临时设置节点范围，只有成功提交的节点加入范围；U07 在 retain-depth 删除中间节点之前，将仍存活且直接引用这些节点的父摘要改连到相同原文；保留节点 ID、原文引用和其他 DAG 边；直接遍历 DAG，不依赖原文表存在，不改 schema。原版 leaf/condensed 统一经过此处，不在网络请求期间持有写事务 | 上游有等价取消接缝时采用上游；保留 SQLite 发布中止回归 |
 | `reconcile.py` | _get_store_id_map_for_messages | 宿主会话树适配 | 可选 active_store_ids 限定当前分支的原文来源，避免同文兄弟分支串线。None 保持原版匹配规则；来源集合由宿主按 append-only 原文顺序和真实 SessionManager 分支计算 | 重放最小候选过滤接缝；保留同文分支来源与原版重放测试 |
+| `tokens.py` | count_message_tokens | 上游错误修复 U11；vendor→native 接缝 | 结构化内容里的图片按 Hermes 的单张单价计（`native/model_metadata._count_image_tokens` × `native/image_token_cost.current_image_token_cost()`），文本用 `_wire_message_shadow` 去掉图片后照旧计；不再按 base64 长度计 | 上游修正后移除；保留 `tests/test_lcm_image_tokens.py` |
 | `sqlite_util.py` | permission worker | 上游错误修复 U02 | 在同一进程打开再关闭 DB/WAL/SHM 会撤销 SQLite 的 POSIX 锁；保留原版 fd/no-follow/identity 检查，把权限写入放到无 SQLite 连接的短命进程。已是 0600 的文件只做 metadata 校验，不启动进程 | 上游修正后移除；保留持锁加固、第二写者隔离与多进程压测 |
 | `externalize.py` | `_stream_json_read_string` | 上游错误修复 U01 | JSONDecoder 返回字符偏移，原版却与 UTF-8 字节长度比较，中文等内容被误判损坏 | 上游修正后移除本地差异；保留 Unicode 正向、损坏输入和公开调用链回归 |
 | `diagnostics.py` | state_db_path_for_engine | 宿主目录 | 优先采用原 owner 的 native catalog；不猜测相邻 Hermes DB | 保留只读诊断测试 |
@@ -66,7 +87,7 @@
 | `dependency-contract.json` | external_imports.misaka | 依赖登记 | 声明本移植实际使用的 native package API；不改原版依赖扫描器 | native validator 完整扫描 |
 
 
-U07：retain-depth 删除中间摘要导致仍存活摘要的原文链路丢失。U01：JSON 字符偏移与 UTF-8 字节偏移混用。U02：同进程额外关闭 SQLite 文件会撤销 POSIX 文件锁。U03：要求全集的消费者把分页查询当全集。U05：未验证的启动快速路径会抹掉后台 FTS 损坏标记。U06：跨进程 scan claim 缺少持写锁后的重检，可能重复启动扫描。U04：sqlite3 Connection 的上下文管理器只结束事务，不关闭连接；历史导入和外部化回填入口现用 `contextlib.closing`。这些是保留的上游缺陷修复，不为追求字节相同重新复制错误。历史证据分别见 `docs/audits/hermes-lcm-2026-09-08.md`、`hermes-lcm-upgrade-2026-09-08.md`、`hermes-lcm-frontier-2026-09-09.md`。
+U11：图片的 base64 被当作文本计 token，触发过早压缩与强制溢出恢复。U07：retain-depth 删除中间摘要导致仍存活摘要的原文链路丢失。U01：JSON 字符偏移与 UTF-8 字节偏移混用。U02：同进程额外关闭 SQLite 文件会撤销 POSIX 文件锁。U03：要求全集的消费者把分页查询当全集。U05：未验证的启动快速路径会抹掉后台 FTS 损坏标记。U06：跨进程 scan claim 缺少持写锁后的重检，可能重复启动扫描。U04：sqlite3 Connection 的上下文管理器只结束事务，不关闭连接；历史导入和外部化回填入口现用 `contextlib.closing`。这些是保留的上游缺陷修复，不为追求字节相同重新复制错误。历史证据分别见 `docs/audits/hermes-lcm-2026-09-08.md`、`hermes-lcm-upgrade-2026-09-08.md`、`hermes-lcm-frontier-2026-09-09.md`。
 
 ## 一份策略，一套原会话
 
@@ -93,7 +114,7 @@ U07：retain-depth 删除中间摘要导致仍存活摘要的原文链路丢失�
 
 ## 路径与开关
 
-LCM 原文派生库默认 `~/.misaka/lcm.db`；`LCM_DATABASE_PATH` 优先于 MISAKA 的数据库配置。大结果 `lcm-large-outputs/` 和提取 `lcm-extractions/` 默认在该 DB 旁。显式 operator 路径按其原版 grammar。研究正文/证据仍在工作区，不新建 `.misaka/runs`。
+LCM 原文派生库在项目的 `<project>/.misaka/lcm/lcm.db`（项目目录就是主目录，或所在盘无法保持私有权限时，放在 `~/.misaka/state/plugins/misaka-lcm/` 下）。大结果 `lcm-large-outputs/` 和提取 `lcm-extractions/` 在该 DB 旁。显式 operator 路径按其原版 grammar。研究正文/证据仍在工作区，不新建 `.misaka/runs`。
 
 算法参数只用原版 `LCM_*`；删除旧 summary/retrieval/embedding 产品别名和临时 `os.environ` 修改。路径现由项目归属决定，`MISAKA_LCM_DB`、`LCM_DATABASE_PATH` 及内容侧文件路径覆盖均不再生效。`LCMConfig.from_env(host_config=...)` 接收 MISAKA 全局 settings，不读 Hermes YAML、profile secrets 或 auth.json。
 

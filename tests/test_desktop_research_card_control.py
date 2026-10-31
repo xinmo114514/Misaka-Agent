@@ -78,7 +78,7 @@ def test_without_a_hook_the_panel_route_is_unchanged(monkeypatch):
     monkeypatch.delenv("MISAKA_NET_PANE", raising=False)
     out = messages.wake_card({"to_task": "t_ab12cd", "generation": 4}, "msg")
     assert calls == [("pane.continue_card", {"task_id": "t_ab12cd", "say": "msg",
-                                             "expected_generation": 4, "consult": True})]
+                                             "expected_generation": 4})]
     assert out["pane_id"] == "p9"
 
 
@@ -86,13 +86,13 @@ def test_claim_resume_generation_and_consult_reach_the_real_cas(board, tmp_path)
     tid, _ = _finished_card(board, tmp_path)
     lock = "test:2:bbbb"
     # Stale generation must be refused by the real CAS.
-    assert tasks.claim_resume(board, tid, lock, os.getpid(), expected_generation=0, consult=True) is False
+    assert tasks.start_consultation(board, tid, generation=0, lock=lock, pid=os.getpid()) is None
     assert tasks.get(board, tid)["status"] == "done"
     # Consult continues without invalidating descendants and bumps the generation once.
     before = tasks.get(board, tid)["generation"]
-    assert tasks.claim_resume(board, tid, lock, os.getpid(), expected_generation=before, consult=True) is True
+    assert tasks.start_consultation(board, tid, generation=before, lock=lock, pid=os.getpid()) is not None
     row = tasks.get(board, tid)
-    assert row["status"] == "running" and row["generation"] == before + 1
+    assert row["status"] == "done" and row["generation"] == before
 
 
 def test_dispatch_run_task_carries_consult_to_claim_resume(board, tmp_path, monkeypatch):
@@ -120,13 +120,13 @@ def test_dispatch_run_task_carries_consult_to_claim_resume(board, tmp_path, monk
                                         "provider": "fixture", "default_model": "fixture"},
                            say="the consult", consult=True, expected_generation=row_before)
     assert ok is True
-    assert seen["status"] == "running" and seen["generation"] == row_before + 1
+    assert seen["status"] == "done" and seen["generation"] == row_before
     # A second, stale continuation must refuse before the CAS and leave the card running: this is
     # the generated-generation race the desktop fences are for.
     refuses = dispatch.run_task(board, tasks.get(board, tid),
                                 {"db": str(tmp_path / "board.db"), "profiles_root": str(workspaces),
                                  "roles_root": str(workspaces), "provider": "fixture", "default_model": "fixture"},
-                                say="stale", consult=True, expected_generation=row_before)
+                                say="stale", consult=True, expected_generation=row_before - 1)
     assert refuses is False
 
 
@@ -195,13 +195,15 @@ def control_fixture(board, tmp_path):
     run = runs.create(board, workspace=workspace, question='Fixture question')
     root = tmp_path / 'root.jsonl'
     runs.set_state(board, run['id'], root_session=str(root))
-    board.execute('INSERT INTO research_run_tasks(task_id,run_id,branch_id,kind,created_at) VALUES(?,?,?,?,?)',
+    board.execute('INSERT INTO research_cards(task_id,run_id,branch_id,kind,created_at) VALUES(?,?,?,?,?)',
                   (tid, run['id'], 'fixture', 'research', 1))
     directory = tmp_path / 'team'
     directory.mkdir()
     (directory / 'owner.json').write_text(json.dumps({'rootSession': str(root), 'workspace': workspace}), encoding='utf-8')
     policy = DesktopTeamModelPolicy(directory / 'policy.json', 'fixture', 'model')
-    scope = SimpleNamespace(team=SimpleNamespace(directory=directory, model_policy=policy), policy=policy,
+    scope = SimpleNamespace(team=SimpleNamespace(directory=directory, model_policy=policy),
+                            policy=SimpleNamespace(guard_model=lambda **kwargs: policy.guard_model(),
+                                                   snapshot=lambda **kwargs: policy.snapshot()),
                             base_config={'db': str(tmp_path / 'board.db')}, pending_launches=set(),
                             record_launch=lambda binding: 'launch-fixture',
                             current_config=lambda: {'db': str(tmp_path / 'board.db')})
@@ -322,7 +324,7 @@ async def test_reopened_host_automatically_recovers_report_without_resume(board,
     aid, _ = runs.register_file(board, run['id'], 'report', 'Final', str(report),
                                sha256=hashlib.sha256(report.read_bytes()).hexdigest())
     session = object.__new__(AgentSession)
-    session.agent = Agent()
+    session.agent = Agent({"streamFn": lambda *_: None})
     session._customMessageReceipts = {}
     manager = SessionManager.create(str(tmp_path), str(tmp_path / 'sessions'))
     manager.rewrite_file()
@@ -332,7 +334,7 @@ async def test_reopened_host_automatically_recovers_report_without_resume(board,
     part = research.ResearchPart()
     def send(payload, options):
         session._customMessageReceipts[options['_deliveryId']] = options
-        session._append_custom_message({'role': 'custom', **payload,
+        session._appendCustomMessage({'role': 'custom', **payload,
             'details': {**payload['details'], 'delivery_id': options['_deliveryId']}})
     session.moments = SimpleNamespace(parts=[part], send_message=send)
     part.attach(session)
@@ -358,7 +360,7 @@ async def test_same_host_reconnect_retries_failed_native_persistence(board, tmp_
     aid, _ = runs.register_file(board, run['id'], 'report', 'Final', str(report),
                                sha256=hashlib.sha256(report.read_bytes()).hexdigest())
     session = object.__new__(AgentSession)
-    session.agent = Agent()
+    session.agent = Agent({"streamFn": lambda *_: None})
     session._customMessageReceipts = {}
     session.sessionManager = SessionManager.create(str(tmp_path), str(tmp_path / 'sessions'))
     session.sessionManager.rewrite_file()
@@ -377,7 +379,7 @@ async def test_same_host_reconnect_retries_failed_native_persistence(board, tmp_
     def send(payload, options):
         session._customMessageReceipts[options['_deliveryId']] = options
         try:
-            session._append_custom_message({'role': 'custom', **payload,
+            session._appendCustomMessage({'role': 'custom', **payload,
                 'details': {**payload['details'], 'delivery_id': options['_deliveryId']}})
         except OSError:
             pass  # native Moments logs async send errors; _onError already received the failure
@@ -390,3 +392,40 @@ async def test_same_host_reconnect_retries_failed_native_persistence(board, tmp_
     assert await bridge.recover_research_report(session, board) == 'delivered'
     assert board.execute('SELECT COUNT(*) FROM events WHERE task_id=? AND kind=?', (run['id'], delivery.KIND)).fetchone()[0] == receipts
     assert len([e for e in session.sessionManager.getEntries() if e.get('customType') == 'research-final']) == 1
+
+
+def test_parse_card_prompt_file_keeps_long_unicode_and_generation(tmp_path):
+    from misaka.desktop_research.worker_entry import parse_card_flags
+    prompt = tmp_path / "continuation.md"
+    text = "研究上下文\r\n" * 20000
+    prompt.write_bytes(text.encode("utf-8"))
+    assert parse_card_flags(["--run-card", "t_ab12cd", "--say-file", str(prompt),
+        "--expected-generation", "8", "--consult"]) == ("t_ab12cd", text, 8, True)
+
+
+def test_long_continuation_prompt_is_a_file_until_child_settles(board, tmp_path, monkeypatch):
+    from misaka.desktop_research import card_control
+    from misaka.desktop_research.model_policy import atomic_json
+    from misaka.utils.prompt_file import readPromptFile
+    control, tid, _run, policy = control_fixture(board, tmp_path)
+    message = "很长的研究问题\r\n" * 20000
+    atomic_json(control.registry_path, {tid: {"executionId": "long", "state": "pending", "generation": 1}})
+    seen = {}
+    class Process:
+        pid = 987654321
+        def poll(self):
+            return 0
+    def spawn(argv, **kwargs):
+        assert "--say" not in argv and message not in argv
+        path = argv[argv.index("--say-file") + 1]
+        seen["path"] = Path(path)
+        assert readPromptFile(path) == message
+        assert argv[argv.index("--expected-generation") + 1] == "1" and "--consult" in argv
+        return Process()
+    monkeypatch.setattr(card_control.subprocess, "Popen", spawn)
+    pending = card_control._PendingLaunch(control, tid, message, 1, "long", str(tmp_path))
+    control._launch(pending)
+    assert "path" in seen, str(control._registry())
+    assert seen["path"].exists()
+    control._reap()
+    assert not seen["path"].exists() and control.prompt_files == {}

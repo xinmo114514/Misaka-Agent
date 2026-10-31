@@ -38,7 +38,7 @@ def test_native_worker_requests_selected_team_pair_and_keeps_native_validators(l
         run = runs.create(con, workspace=str(root / 'workspace'), question='NODE_MODEL_MARKER',
                           limits={'max_depth': 0, 'max_nodes': 1})
         branch = runs.root(con, run['id'])
-        con.execute('UPDATE research_branches SET runner_key=? WHERE id=?', ('fixture-key', branch['id']))
+        con.execute('UPDATE research_execution SET runner_key=? WHERE id=?', ('fixture-key', branch['id']))
         native = [sys.executable, '-m', 'misaka', 'research', '--node', run['id'], branch['id'],
                   '--runner-key', 'fixture-key']
     binding = team.model_policy.guard_model()
@@ -84,7 +84,7 @@ def test_native_worker_requests_selected_team_pair_and_keeps_native_validators(l
 def test_desktop_worker_preserves_native_stall_watchdog(tmp_path, monkeypatch, lane, owner, label, flags):
     from types import SimpleNamespace
 
-    from misaka.ai import api_registry
+    from misaka.ai.api import _meter as api_registry
     from misaka.core import wiring
     from misaka.desktop_research import worker_entry
     from misaka.desktop_research.model_policy import atomic_json

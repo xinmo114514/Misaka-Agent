@@ -81,6 +81,9 @@ def parse_card_flags(flags):
         flag = rest.pop(0)
         if flag == '--say' and rest:
             say = rest.pop(0)
+        elif flag == '--say-file' and rest:
+            from misaka.utils.prompt_file import readPromptFile
+            say = readPromptFile(rest.pop(0))
         elif flag == '--expected-generation' and rest:
             expected_generation = int(rest.pop(0))
         elif flag == '--consult':

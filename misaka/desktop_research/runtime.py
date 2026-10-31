@@ -254,7 +254,7 @@ class DesktopModelRegistry:
 def install_model_binding(session, policy, executor_id, scope=None, *, role='sister'):
     if getattr(session, '_desktop_model_policy', None) is policy:
         return
-    inner = session.agent.streamFn
+    inner = session.agent.streamFunction
     source_registry = session.modelRegistry
 
     async def prepare(provider, model_id, _epoch):
@@ -267,10 +267,10 @@ def install_model_binding(session, policy, executor_id, scope=None, *, role='sis
             raise ValueError(f'Team model is missing from the native registry: {provider}/{model_id}')
         if read_field(model, 'api') == 'moa' or read_field(model, 'provider') == 'moa':
             raise ValueError('The selected virtual MoA provider emits heterogeneous physical model requests; strict team binding requires a native physical model.')
-        if not await registry.checkConfiguredAuth(model):
+        if not await getattr(registry, "modelRuntime", registry).checkAuth(provider):
             raise ValueError(f'Team model credentials are missing: {provider}/{model_id}')
         if read_field(session.model, 'provider') != provider or read_field(session.model, 'id') != model_id:
-            await session.setModel(model, persist=False)
+            await session.setModel(model, {"persist": False})
         return model
 
     if isinstance(policy, DesktopRoleModelPolicy):
@@ -279,15 +279,15 @@ def install_model_binding(session, policy, executor_id, scope=None, *, role='sis
         policy.register_executor(executor_id, prepare)
 
     async def open_bound_stream(_override_model, context, options=None, *, _transport=None):
-        from misaka.ai.utils.abort import AbortController, combine_abort_signals
-        from misaka.core.sdk import _to_dict
+        from misaka.utils.js import AbortController, AbortSignal
+        from misaka.core.sdk import _toDict as _to_dict
         request_options = _to_dict(options)
         # Every admitted request owns one cancellation door. It composes over the caller's
         # signal so a consumer who gives up can end exactly this transport (停止研究), while a
         # turn-wide abort still reaches the request as before; the caller's signal itself is
         # never raised from here.
         door = AbortController()
-        signal = combine_abort_signals(request_options.get('signal'), door)
+        signal = AbortSignal.any([item for item in (request_options.get('signal'), door.signal) if item is not None])
         while True:
             if getattr(session, '_desktop_closing', False):
                 raise asyncio.CancelledError('Executor closing')
@@ -325,13 +325,13 @@ def install_model_binding(session, policy, executor_id, scope=None, *, role='sis
                 scope.apply_thinking(session)
             # Caller/compaction/hook options may have been built under an older
             # model. Re-resolve auth AFTER admission, using native registry only.
-            from misaka.core.sdk import _to_dict
+            from misaka.core.sdk import _toDict as _to_dict
             request_options = _to_dict(options)
             request_options['signal'] = signal
-            auth_resolver = getattr(session.modelRegistry, 'getAuth', None)
+            auth_resolver = getattr(getattr(source_registry, 'modelRuntime', source_registry), 'getAuth', None)
             if auth_resolver is not None:
                 from misaka.ai.auth.resolve import AuthResolutionOverrides
-                from misaka.ai.utils.headers import provider_headers_to_record
+                from misaka.ai.utils.headers import providerHeadersToRecord as provider_headers_to_record
                 resolution = await auth_resolver(model, AuthResolutionOverrides(signal=request_options.get('signal')))
                 if resolution is None:
                     raise ValueError('Team model provider has no configured authentication')
@@ -388,7 +388,7 @@ def install_model_binding(session, policy, executor_id, scope=None, *, role='sis
     warmer = getattr(session, '_cacheWarmer', None)
     if warmer is not None:
         warmer.models = proxy
-    session.agent.streamFn = bound_stream
+    session.agent.streamFunction = bound_stream
     session._desktop_model_policy = policy
     session._desktop_executor_id = executor_id
     session._desktop_model_role = role
@@ -942,7 +942,7 @@ class DesktopResearchController:
         lo_pair = {'provider': model.provider, 'modelId': model.id}
         if lo_reference and not (Path(directory) / 'desktop-team' / 'model-policy.json').exists():
             from misaka.config.profiles import resolve_model_reference
-            canonical = resolve_model_reference(lo_reference, session.modelRegistry,
+            canonical = resolve_model_reference(lo_reference, getattr(session.modelRegistry, "modelRuntime", session.modelRegistry),
                                                 fallback_provider=self.config.get('provider') or model.provider)
             lo_pair = dict(zip(('provider', 'modelId'), canonical.split('/', 1)))
         self.team = DesktopResearchTeam(directory, self.config['profiles_root'], model.provider, model.id,
@@ -979,7 +979,7 @@ class DesktopResearchController:
         root_spec = getattr(catalog, 'spec', None) or SessionSpec(
             profile_dir=str(Path(self.config['roles_root']) / 'last_order'), role='last_order',
             workspace=self.session.sessionManager.getCwd(), kind='foreground',
-            research_context=True, research_host=True)
+            workflow_context=True, research_host=True)
         for index, part in enumerate(tuple(self.session.moments.parts)):
             path = type(part).__module__
             replacement = None
@@ -1077,7 +1077,7 @@ class DesktopResearchController:
                     raise submissions.request_conflict()
                 self.scene.intake = True
                 token = current_request_id.set(request_id)
-                before = getattr(self.session, '_find_last_assistant_message', lambda: None)()
+                before = getattr(self.session, '_findLastAssistantMessage', lambda: None)()
                 self.session._desktop_network_context = None
                 recruitment.record(self.session, obj, 'preparing', attempt=attempt)
                 intake_task = None
@@ -1085,7 +1085,7 @@ class DesktopResearchController:
                     # Hidden native custom intake preserves the user's exact input once;
                     # the workflow publishes its existing research-question entry on start.
                     members = self.team.snapshot()['team']['members']
-                    last = getattr(self.session, '_find_last_assistant_message', lambda: None)()
+                    last = getattr(self.session, '_findLastAssistantMessage', lambda: None)()
                     interrupted = last is not None and read_field(last, 'stopReason') != 'stop'
                     async def _run_intake():
                         if previous is None and request_id not in self.intake_requests:
@@ -1117,7 +1117,7 @@ class DesktopResearchController:
                     if not done:
                         raise TimeoutError('Research recruitment deadline exceeded')
                     await intake_task
-                    after = getattr(self.session, '_find_last_assistant_message', lambda: None)()
+                    after = getattr(self.session, '_findLastAssistantMessage', lambda: None)()
                     if after is not None and after is not before and read_field(after, 'stopReason') in {'error', 'aborted'}:
                         raise recruitment.failure(self.session, after, attempt=attempt)
                     if not self.team.snapshot()['team']['members']:
@@ -1172,7 +1172,7 @@ class DesktopResearchController:
                         raise ValueError(f'Team model is missing from the native registry: {provider}/{model_id}')
                     if read_field(selected, 'api') == 'moa' or provider == 'moa':
                         raise ValueError('Strict role binding requires a native physical model.')
-                    if not await registry.checkConfiguredAuth(selected):
+                    if not await getattr(registry, "modelRuntime", registry).checkAuth(selected.provider):
                         raise ValueError(f'Team model credentials are missing: {provider}/{model_id}')
                 binding = await self.team.model_policy.switch(provider, model_id, role=role)
                 sister = self.team.model_policy.snapshot(role='sister')

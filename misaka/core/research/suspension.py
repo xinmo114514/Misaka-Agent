@@ -5,6 +5,7 @@ import hashlib
 import json
 import time
 
+from misaka.core import graph
 from misaka.core.platform import tasks as task_store
 from misaka.core.research import ledger, runs
 from misaka.utils.redact import redact
@@ -13,22 +14,20 @@ PREFIX = "system:all-cards-stopped:"
 
 
 def active_suspensions(con, run_id):
-    rows = con.execute("SELECT payload_json FROM research_actions WHERE run_id=? AND action_key LIKE ? "
-                       "ORDER BY created_at,action_key", (run_id, PREFIX + "%")).fetchall()
-    values = [json.loads(row["payload_json"]) for row in rows]
+    values = [graph.thaw(entry.payload) for entry in graph.entries(
+        con, run_id, key_prefix=PREFIX, status=runs._LIVE)]
     return [value for value in values if value.get("resolvedAt") is None]
 
 
 def resolve_suspensions(con, run_id, node_id=None):
-    for row in con.execute("SELECT branch_id,action_key,payload_json FROM research_actions "
-                           "WHERE run_id=? AND action_key LIKE ?", (run_id, PREFIX + "%")).fetchall():
-        payload = json.loads(row["payload_json"])
+    for entry in graph.entries(con, run_id, key_prefix=PREFIX, status=runs._LIVE):
+        payload = graph.thaw(entry.payload)
         if node_id is not None and (payload.get("scope") != "node" or payload.get("nodeId") != node_id):
             continue
         if payload.get("resolvedAt") is None:
             payload["resolvedAt"] = int(time.time() * 1000)
-            con.execute("UPDATE research_actions SET payload_json=? WHERE run_id=? AND branch_id=? AND action_key=?",
-                        (json.dumps(payload, ensure_ascii=False), run_id, row["branch_id"], row["action_key"]))
+            graph.propose(con, run_id, "action", payload, key=entry.key, scope=entry.scope,
+                          proposer=entry.proposer, supersede=True)
 
 
 def has_accepted_output(con, run_id, node_id=None):
@@ -68,10 +67,9 @@ def _save(con, run, node, scope, confirmations, has_output, *, kind="research"):
         "createdAt": int(time.time() * 1000), "resolvedAt": None}
     # Existing action uniqueness is the durable dedup fence. All callers hold the native owner.
     with runs.owned_txn(con, run, node if scope == "node" else None, allow_stop=True):
-        con.execute("INSERT OR IGNORE INTO research_actions "
-            "(run_id,branch_id,action_key,payload_json,session_file,tool_call_id,created_at) VALUES (?,?,?,?,?,?,?)",
-            (run["id"], node["id"], key, json.dumps(payload, ensure_ascii=False),
-             node["session_file"] or run["root_session"] or "", key, int(time.time())))
+        graph.propose(con, run["id"], "action", payload, key=key, scope=node["id"],
+                      proposer={"session_file": node["session_file"] or run["root_session"] or "",
+                                "tool_call_id": key})
     return runs.action(con, run["id"], node["id"], key)["payload"]
 
 

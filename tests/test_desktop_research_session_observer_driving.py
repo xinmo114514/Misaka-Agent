@@ -50,7 +50,7 @@ async def test_only_the_driver_lease_changing_still_pushes_a_session_list_event(
     observer.job = asyncio.create_task(observer._run())
     assert await _wait_for(lambda: any(e["type"] == "research_sessions_changed" for e in events))
     with closing(tasks.connect(str(tmp_path / "board.db"))) as con:
-        con.execute("UPDATE research_runs SET driver_lock=?, driver_expires=? WHERE id=?",
+        con.execute("UPDATE graphs SET lease_token=?, lease_expires=? WHERE id=?",
                     ("driver:elsewhere:4242:lease", 9999999999, run["id"]))
         con.commit()
     assert await _wait_for(lambda: sum(e["type"] == "research_sessions_changed" for e in events) >= 2)
@@ -74,7 +74,7 @@ async def test_the_list_event_reports_the_board_value_never_a_derived_one(tmp_pa
         run = runs.create(con, workspace=str(workspace), question="A question")
         runs.set_state(con, run["id"], status="active", phase="executing")
         # A lease that has already expired is not a driver: resumable, not "driving".
-        con.execute("UPDATE research_runs SET driver_lock=?, driver_expires=1 WHERE id=?",
+        con.execute("UPDATE graphs SET lease_token=?, lease_expires=1 WHERE id=?",
                     ("driver:elsewhere:4242:stale", run["id"]))
         con.commit()
         expected = runs.driver_is_live(runs.get(con, run["id"]))

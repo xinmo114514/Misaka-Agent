@@ -30,7 +30,7 @@ def prepare_desktop_assembly(assembly):
 
 def install_auxiliary_factories(owner, overrides, modules, classes):
     async def image_content(body, _question, context):
-        from misaka.core.web.browser.tools import process_image
+        from misaka.core.web.browser.tools import processImage as process_image
         from misaka.utils.values import read_field
 
         from .runtime import wait_model_ready

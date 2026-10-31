@@ -34,7 +34,8 @@ export function completeModelFixture(home: string) {
       }
       const critique=/red-team the (?:conclusion|saved final-report draft) at/i.test(messages)
       const divergence=/Read the conclusion at[^\n]*through the choices it made/.test(messages)
-      if (!used('misaka_card_note')) return call('misaka_card_note',{text:'Test materials checked; bounded findings and limitations recorded.',
+      const evidenceRequested = /Record final evidence-backed findings|Record the red-team issues|Record the alternatives/.test(prompt)
+      if (!used('misaka_card_note') || evidenceRequested) return call('misaka_card_note',{text:'Test materials checked; bounded findings and limitations recorded.',
         findings:[],uncertain:['The fixture materials have no independent corroboration.'],
         ...(critique ? {issues:[]} : {}),...(divergence ? {alternatives:[]} : {})})
       // Native reviews deliberately ask their author to check file vs recorded
@@ -42,7 +43,7 @@ export function completeModelFixture(home: string) {
       // ending the model turn after that expected first-call rejection.
       if (/Before this review is submitted/.test(prompt)) return call('misaka_card_complete',{
         summary:'Checked that the review file and recorded issue/alternative lists agree; explicit evidence limitations retained.'})
-      if (!used('misaka_card_complete')) return call('misaka_card_complete',{summary:'Delivered the bounded local-material comparison/review with explicit evidence limitations.'})
+      if (!used('misaka_card_complete') || /Logged on the card/.test(prompt)) return call('misaka_card_complete',{summary:'Delivered the bounded local-material comparison/review with explicit evidence limitations.'})
       return text('The contract deliverable is complete.')
     }
     if (last?.role==='user' && Array.isArray(last.content) && last.content.some((block:any)=>block.type==='tool_result')) return text('The command was recorded.')

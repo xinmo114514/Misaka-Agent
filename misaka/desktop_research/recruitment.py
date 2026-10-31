@@ -73,19 +73,16 @@ def network_context(session, *, use_cached=True):
         provider = read_field(model, 'provider')
         # Read only the already-loaded credential configuration. Never resolve/refresh
         # authentication or run a provider request merely to check a TCP endpoint.
-        stored = storage.get(provider) if storage is not None and not storage.runtimeOverrides.get(provider) else None
+        state = getattr(storage, 'readState', None)
+        stored = read_field(state, 'data', {}).get(provider) if state is not None else None
         if isinstance(stored, dict):
             env = stored.get('env')
-            if stored.get('type') == 'oauth':
-                from misaka.ai.utils.oauth import getOAuthProvider
-                from misaka.ai.utils.oauth.types import OAuthCredentials
-                flow = getOAuthProvider(provider)
-                get_base = getattr(flow, 'getBaseUrl', None)
-                if callable(get_base):
-                    endpoint = get_base(OAuthCredentials.model_validate({k: v for k, v in stored.items() if k != 'type'})) or endpoint
+            if stored.get('type') == 'oauth' and provider == 'github-copilot':
+                from misaka.ai.auth.oauth.github_copilot import _getBaseUrlFromToken
+                endpoint = _getBaseUrlFromToken(stored.get('access', '')) or endpoint
     if not endpoint and read_field(model, 'api') == 'openai-codex-responses':
-        from misaka.ai.providers.openai_codex_responses import resolve_codex_url
-        endpoint = resolve_codex_url()
+        from misaka.ai.api.openai_codex_responses import _resolveCodexUrl
+        endpoint = _resolveCodexUrl()
     return endpoint, env
 
 
@@ -200,7 +197,7 @@ def failure(session, source, *, attempt, code='RESEARCH_RECRUITMENT_MODEL_ERROR'
         summary = '主控尚未完成研究团队招募，研究尚未启动；原始课题已保留，可以重试。'
     diagnostics = read_field(source, 'diagnostics')
     if diagnostics:
-        from misaka.modes.jsonl import to_jsonable
+        from misaka.modes.json_event import to_jsonable
         details['diagnostics'] = _clean_tree(session, to_jsonable(diagnostics))
     if isinstance(source, Exception) and source.__traceback__ is not None:
         details['stack'] = _clean(session, ''.join(traceback.format_exception(source)))

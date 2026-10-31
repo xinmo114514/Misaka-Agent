@@ -1,0 +1,13 @@
+
+ RUN  v3.2.4 C:/frontend-research/Misaka-Agent/desktop
+
+ ✓ src/components/ResearchWorkspace/ResearchTilingWorkspace.test.tsx (4 tests) 5505ms
+   ✓ research tiling workspace > renders LO and four actual sisters, each with its own transcript instead of root messages  3184ms
+   ✓ research tiling workspace > shows the selected node stop confirmation while other nodes keep running  1238ms
+   ✓ research tiling workspace > projects native node card statuses and plan dependencies beside LO without replacing her transcript  424ms
+   ✓ research tiling workspace > keeps five focused Sisters visible alongside LO while reading state survives  601ms
+
+ Test Files  1 passed (1)
+      Tests  4 passed (4)
+   Start at  17:11:08
+   Duration  31.23s (transform 10.92s, setup 1.58s, collect 19.45s, tests 5.51s, environment 3.43s, prepare 294ms)

@@ -3,57 +3,57 @@ import json
 from contextlib import contextmanager
 
 from misaka.core.network.roster import coordinator_profile, routing_catalog
-from misaka.core.platform import prompt_guard
-from misaka.core.research.tool_policy import DRIVER_OWNED_TOOLS
+from misaka.core.platform import owners, prompt_guard
+from misaka.core.platform.vocabulary import DRIVER_OWNED_TOOLS
 
 
 class SisterCapabilitiesPart:
-    def __init__(self, workspace, catalog=None, *, research_context=False, sister_id=None):
+    def __init__(self, workspace, catalog=None, *, workflow_context=False, sister_id=None):
         self.tools = []
         self.commands = []
         self.workspace = workspace
         self.sister_id = sister_id
         self.catalog = catalog
-        self.research_context = research_context
+        self.workflow_context = workflow_context
         self.session = None
 
     def attach(self, session):
         self.session = session
 
     def project_tools(self, tools):
-        if self.research_context and self.sister_id is None:
+        if self.workflow_context and self.sister_id is None:
             return [tool for tool in tools if tool.name not in DRIVER_OWNED_TOOLS]
         return tools
 
     async def tool_call(self, event, ctx):
-        if (self.research_context and self.sister_id is None
+        if (self.workflow_context and self.sister_id is None
                 and event["toolName"] in DRIVER_OWNED_TOOLS):
-            return {"block": True, "reason": "Research's driver owns this workflow; use the current research phase tools."}
+            return {"block": True, "reason": "The workflow's driver owns these cards; use the current phase's tools."}
 
     @contextmanager
     def snapshot(self, catalog=None):
-        """Publish Research context and, when supplied, the validator's exact catalog."""
-        previous = self.catalog, self.research_context
+        """Publish the workflow's context and, when supplied, the validator's exact catalog."""
+        previous = self.catalog, self.workflow_context
         if catalog is not None:
             self.catalog = catalog
-        self.research_context = True
+        self.workflow_context = True
         try:
             if self.session is not None and not previous[1]:
                 self.session.refreshTools()
             yield
         finally:
-            self.catalog, self.research_context = previous
+            self.catalog, self.workflow_context = previous
             if self.session is not None and not previous[1]:
                 self.session.refreshTools()
 
     async def before_agent_start(self, event, ctx):
         system_prompt = event["systemPrompt"].rstrip()
-        if self.research_context:
-            from misaka.core.research.prompting import system_context
-            common = system_context(self.session, self.session.getActiveToolNames(), system_prompt,
-                                    sister_id=self.sister_id)
-            if common:
-                system_prompt += "\n\n" + common
+        if self.workflow_context:
+            for owner in owners.registered():
+                common = owner.system_context(self.session, self.session.getActiveToolNames(), system_prompt,
+                                              self.sister_id)
+                if common:
+                    system_prompt += "\n\n" + common
         compact = ([coordinator_profile(entry) for entry in self.catalog]
                    if self.catalog is not None else routing_catalog())
         if self.sister_id is not None:
@@ -75,6 +75,6 @@ def part(spec):
     if (is_lo and spec.kind not in {"foreground", "dm", "bare"}) or (not is_lo and spec.kind == "bare"):
         return None
     return SisterCapabilitiesPart(
-        spec.workspace, spec.sister_catalog, research_context=spec.research_context,
+        spec.workspace, spec.sister_catalog, workflow_context=spec.workflow_context,
         sister_id=None if is_lo else spec.role.rsplit("/", 1)[-1],
     )

@@ -23,7 +23,7 @@ async def test_prepared_desktop_root_omits_optional_lcm_but_native_sdk_compactio
     home.path('settings').write_text(json.dumps(fixture_settings))
     bootstrap.install()
     flags,assembly,_env=role_session_setup(str(root/'profiles/last_order'),str(root/'workspace'),
-        research_context=True,research_host=True)
+        workflow_context=True,research_host=True)
     normal_factories=list(assembly.extension_factories)
     assert any(item['name']=='misaka_lcm' for item in normal_factories)
     external=[]
@@ -69,14 +69,14 @@ async def test_browser_screenshot_reports_selected_model_capability_without_alte
     from misaka.core.web.browser import settings, tools
     from misaka.desktop_research.runtime import DesktopExecutionScope
     from misaka.desktop_research.team import DesktopResearchTeam
-    stream=importlib.import_module('misaka.ai.stream')
+    stream=importlib.import_module('misaka.ai.api.openai_completions')
     team=DesktopResearchTeam(tmp_path/'session',tmp_path/'shared','fixture','text-only')
     scope=DesktopExecutionScope(team,current_config())
     calls=[]
     async def forbidden(*args,**kwargs):
         calls.append(args)
         raise AssertionError('Alternate image inference attempted')
-    monkeypatch.setattr(stream,'complete_simple',forbidden)
+    monkeypatch.setattr(stream,'streamSimple',forbidden)
     monkeypatch.setattr(settings,'config',lambda:{'vision_model':'external/vision'})
     from io import BytesIO
 

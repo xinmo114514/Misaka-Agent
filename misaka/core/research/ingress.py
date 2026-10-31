@@ -114,7 +114,9 @@ def owns_run(session, run):
 def session_run(session, con):
     if con is None:
         return None
-    return next((row for row in con.execute("SELECT * FROM research_runs ORDER BY created_at DESC, rowid DESC")
+    from misaka.core.research import runs
+
+    return next((row for row in runs.listing(con)
                  if owns_run(session, row)), None)
 
 
@@ -207,7 +209,7 @@ class ResearchMessageIngress:
 
     def event(self, event):
         """Correlate real messages only; never synthesize acceptance or run events."""
-        from misaka.modes.jsonl import to_jsonable
+        from misaka.modes.json_event import to_jsonable
 
         message = read_field(event, "message")
         kind = read_field(message, "customType")
@@ -229,6 +231,7 @@ class ResearchMessageIngress:
         from misaka.cli.desktop_bridge import research_start_prompt
         from misaka.config.product import current_config
         from misaka.core.network.roster import ensure_research_sisters
+        from misaka.core.research import runs
 
         session = self.session
         text, control_spec = validate_research_input(obj, session.sessionId)
@@ -252,7 +255,7 @@ class ResearchMessageIngress:
                 if accepted_text != text or requested_run_id != accepted_run_id:
                     raise submissions.request_conflict()
                 return dict(ack)
-            run = (con.execute("SELECT * FROM research_runs WHERE id=?", (requested_run_id,)).fetchone()
+            run = (runs.get(con, requested_run_id)
                    if con is not None and requested_run_id else adoptable_run(session, con, obj))
             if requested_run_id and (run is None or not owns_run(session, run)):
                 raise ValueError("The research run does not belong to this workspace and root session.")

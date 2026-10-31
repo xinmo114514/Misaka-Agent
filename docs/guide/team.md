@@ -42,28 +42,38 @@ each Sister.
 | File | What it does |
 |---|---|
 | `DESCRIBE.md` | Her specialty. Last Order reads it to decide who gets what. |
-| `SOUL.md` | Her personality and voice, optional. It shapes how she talks and thinks; her duties stay the same. |
-| `settings.json` | What is hers alone: her model (`defaultProvider` / `defaultModel`), `defaultThinkingLevel`, her MCP servers (`mcpServers`) and `web` overrides. |
+| `SOUL.md` | Her personality and voice, optional. It shapes how she talks and thinks; her duties stay the same. Last Order's is written on the first start, a Sister's when she is created; delete or empty it to go without. |
+| `settings.json` | What is hers alone: her model (`defaultProvider` / `defaultModel`), `defaultThinkingLevel` and `web` overrides. |
+| `mcp.json` | Her MCP servers. No other role connects them. |
+| `credentials/mcp-auth.json` | Her MCP sign-ins (`/mcp` in her window). |
 | `.env` | Keys that are hers, laid over the home's `.env`. |
 | `skills/` | Skills only she sees. |
 | `skill-bundles/` | Named sets of skills saved for her (`misaka bundles save`). |
 | `subagents/` | Sub-agent types only she can start. |
 
-MCP servers are set per role, in that role's own `settings.json`, in the shape Hermes uses:
+MCP servers are set in `mcp.json` files, in the `mcpServers` shape other MCP clients use. Each role
+has her own in her folder: Last Order's in `profiles/last_order/mcp.json`, a Sister's in
+`profiles/sisters/<number>/mcp.json`. One role never connects another's servers, and the home has no
+`mcp.json`. A sub-agent a Sister starts reaches her servers and no others; servers written inline in a
+sub-agent's definition are not started:
 
 ```json
-"mcpServers": {"camofox": {"command": "npx", "args": ["-y", "camofox-mcp"]}}
+{"mcpServers": {"camofox": {"command": "npx", "args": ["-y", "camofox-mcp"]}}}
 ```
 
-`/mcp` in her window lists the servers and their tools.
+`misaka mcp add camofox -- npx -y camofox-mcp` writes Last Order's file, and `misaka mcp --as 10032 add
+camofox -- npx -y camofox-mcp` writes Sister 10032's. `misaka mcp list` (with the same `--as`) checks
+that her servers and the project's connect. `/mcp` in her window lists hers too, signs in to one,
+reconnects it, or turns it off. The [configuration reference](../reference/configuration.md#skills-and-mcp) lists every key.
 
 A server starts with a small part of MISAKA's environment: `PATH`, `HOME`, the locale, the proxy
 and certificate variables, the settings of npm, uv and pip (a registry mirror reaches `npx` and
 `uvx`) and the like, never an API key or a registry's token. A key it needs goes in its `env`, where
-`${NAME}` takes the value from the environment (or the home's `.env`):
+`${NAME}` takes the value from the environment (or the home's `.env`); a server whose variable is not
+set does not start, and its error names the variable:
 
 ```json
-"mcpServers": {"github": {"command": "npx", "args": ["-y", "github-mcp"], "env": {"GITHUB_TOKEN": "${GITHUB_TOKEN}"}}}
+{"mcpServers": {"github": {"command": "npx", "args": ["-y", "github-mcp"], "env": {"GITHUB_TOKEN": "${GITHUB_TOKEN}"}}}}
 ```
 
 What every role shares lives in the home: `~/.misaka/MISAKA.md` (the shared identity),
@@ -110,7 +120,10 @@ local models and thinking levels.
   folder: `-c` continues the latest, `--pick` chooses one.
 - `misaka dm 10032 "MESSAGE"` delivers a message to her **contact session**, a standing
   conversation for messages, and runs one turn there. Without a message it delivers what is
-  already waiting for her.
+  already waiting for her. The contact session is the conversation named "Bot Chat" in her
+  `dm` folder, as in Hermes: it cannot be renamed, and to start it afresh you delete it (the
+  "All" tab of `/resume` or `misaka chat --pick`, Ctrl+D); her next message begins a new one.
+  A conversation with a turn running or mail waiting is not deleted.
 
 Agents message each other with the `SendMessage` tool, one recipient per message:
 
@@ -119,14 +132,17 @@ Agents message each other with the `SendMessage` tool, one recipient per message
   session in the sender's panel space, or her contact session when she has none open there. If
   several are open, the sender is shown them and picks one;
 - **a card ID** (`t_3cfb45`) reaches the session working that card. A card that has not started
-  gets the message when it does. A finished card is woken: the message is her next turn in her
-  own conversation (in her window, if it is still open), she answers, and completes again. Waking
-  her does not send the cards built on her work back to be redone;
-- **a session ID** reaches that live session; a finished card's session, open or closed, wakes
-  its card.
+  gets the message when it does. A finished card answers it in her own conversation -- through
+  her window if it is still open, in a reopened one if not -- and stays finished: this is a
+  consultation, not a new attempt. What she changes while answering is declared again when her
+  turn ends, the cards built on her work are left as they are, and closing her window or a crash
+  ends only the consultation (the sender is told it went unanswered);
+- **a session ID** reaches that live session; a finished card's session, open or closed, reaches
+  its card the same way.
 
 A contact session's answer goes back to the window that wrote to it. Last Order can wait for a
-woken Sister's answer with `misaka_sister_output` (`block: true`) before she goes on.
+finished Sister's answer with `misaka_sister_output` (`block: true`) before she goes on: it holds
+until the consultation ends, and says how it ended.
 
 A Sister who needs a decision she can't make herself asks Last Order this way, and her card waits
 for the answer. Last Order brings the question to you when it is yours to decide.

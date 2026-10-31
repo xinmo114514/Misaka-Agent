@@ -16,7 +16,7 @@ import { clipboardErrorMessage, copyTextToClipboard } from '../../../lib/clipboa
 import { SettingsRow } from '../SettingsRow'
 
 export const AboutSection: React.FC = () => {
-  const [version, setVersion] = useState<string>('0.18.11')
+  const [version, setVersion] = useState<string>('0.19.18')
   const [copiedDiag, setCopiedDiag] = useState(false)
   const [copyingDiag, setCopyingDiag] = useState(false)
   const [copyDiagError, setCopyDiagError] = useState<string | null>(null)

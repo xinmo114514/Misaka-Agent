@@ -202,7 +202,7 @@ async def test_real_jsonl_report_persistence_repair_and_lost_ack(board, tmp_path
     from misaka.core.session_manager import SessionManager
     run, aid = _done_run(board, tmp_path)
     session = object.__new__(AgentSession)
-    session.agent = Agent()
+    session.agent = Agent({"streamFn": lambda *args: None})
     session._customMessageReceipts = {}
     session.sessionManager = SessionManager.create(str(tmp_path), str(tmp_path / 'sessions'))
     session.sessionManager.rewrite_file()
@@ -216,7 +216,7 @@ async def test_real_jsonl_report_persistence_repair_and_lost_ack(board, tmp_path
         message = {'role': 'custom', **payload,
                    'details': {**payload['details'], 'delivery_id': options['_deliveryId']}}
         session._customMessageReceipts[options['_deliveryId']] = options
-        session._append_custom_message(message)
+        session._appendCustomMessage(message)
     prepared = delivery.prepare_final_delivery(board, current, session)
     assert await delivery.persist_final_delivery(board, current, prepared, session, send) == 'delivered'
     saved = session.sessionManager.getEntries()

@@ -18,9 +18,9 @@ from pathlib import Path
 from ruamel.yaml import YAML
 
 from misaka.config import home
-from misaka.core.platform import repo, tasks
+from misaka.core.platform import owners, repo, tasks
 from misaka.utils import atomic
-from misaka.utils.frontmatter import parse_frontmatter
+from misaka.utils.frontmatter import parseFrontmatter
 
 LOG_HEADING = "## log"
 _FIELD_ORDER = ("id", "title", "status", "generation", "assignee", "reviewer", "model",
@@ -58,7 +58,7 @@ def _dump(fields, body):
 
 
 # The mtime gate for :func:`reconcile_one`, which is run over every card in the project on
-# every dispatch and every research tick. Nothing durable lives here: losing the dict to
+# every dispatch and every workflow tick. Nothing durable lives here: losing the dict to
 # process death costs one re-read per card, never a lost fact, so it stays on the allowed
 # side of "process-local caches may not hold anything a crash must not lose".
 #
@@ -142,7 +142,7 @@ def _write_file(path, text):
 
 def read(path):
     """``{"fields": frontmatter, "body": contract text}`` for one card file."""
-    parsed = parse_frontmatter(Path(path).read_text(encoding="utf-8"))
+    parsed = parseFrontmatter(Path(path).read_text(encoding="utf-8"))
     return {"fields": parsed.frontmatter or {}, "body": (parsed.body or "").strip()}
 
 
@@ -181,7 +181,7 @@ def iter_cards(workspace):
 def create(con, workspace, title, body, assignee, *, reviewer=None, model=None,
            priority=0, origin_session=None, after_row=None, needs=()):
     """The one front door for new cards: index row first (it mints the id), then ``after_row(tid)``
-    for whatever else the row must be tied to (a research link), then the file. Any failure before
+    for whatever else the row must be tied to (a workflow's link), then the file. Any failure before
     the file exists rolls the row back -- no card exists without its truth, and no file without its row."""
     workspace = tasks.canonical_workspace(workspace)
     needs = list(dict.fromkeys(needs))
@@ -543,7 +543,7 @@ def _needs(card):
     return list(dict.fromkeys(raw))
 
 
-def dispatchable(con, workspace, task_id, *, require_parents=True):
+def dispatchable(con, workspace, task_id):
     """Whether this one card may be claimed -- without walking the whole project.
 
     A parent releases its child only by reaching ``done``, and a card reaches ``done``
@@ -552,10 +552,6 @@ def dispatchable(con, workspace, task_id, *, require_parents=True):
     ``needs`` fixed point that :func:`reconcile` computes is index-rebuild work, not
     per-claim work: doing it inside every claim made one dispatch tick read every card
     file once per claim.
-
-    ``require_parents=False`` is for a finished card woken to answer a message: she
-    starts no work built on her parents, so a parent being consulted at that moment
-    does not keep her from answering it (2026-10-01).
     """
     workspace = tasks.canonical_workspace(workspace)
     card = reconcile_one(con, workspace, task_id)
@@ -564,7 +560,7 @@ def dispatchable(con, workspace, task_id, *, require_parents=True):
     needs = _needs(card)
     if needs is None or task_id in needs:
         return False
-    for parent in needs if require_parents else ():
+    for parent in needs:
         row = con.execute("SELECT status,workspace FROM tasks WHERE id=?", (parent,)).fetchone()
         if row is None or row["status"] != "done":
             return False
@@ -635,13 +631,6 @@ downloads/
 .DS_Store
 __pycache__/
 *.pyc
-# research source bundles: rebuilt at every settle, hard links of files kept elsewhere
-nodes/**/SOURCES.md
-nodes/**/sources/
-nodes/**/.SOURCES-*.part
-final/*-SOURCES.md
-final/*-sources/
-final/.SOURCES-*.part
 """
 
 PROJECT_TEMPLATE = """# {name}
@@ -690,7 +679,7 @@ def init_project(folder, *, draft_brief=True, git=True):
     """Make a folder a MISAKA project: the skeleton (PROJECT.md, cards/, .gitignore) with its
     cards indexed, and -- with ``git``, as ``misaka init`` asks -- a git repository. Only a
     repository this call itself created gets the initial commit; an existing repository is never
-    committed to. Starting research passes ``git=False``: git is the user's, never a side effect."""
+    committed to. A workflow starting in a folder passes ``git=False``: git is the user's, never a side effect."""
     folder = tasks.canonical_workspace(folder)
     _refuse_whole_home(folder)
     actions = []
@@ -706,9 +695,10 @@ def init_project(folder, *, draft_brief=True, git=True):
     ignore = os.path.join(folder, ".gitignore")
     config_dir = home.project_dir(folder)
     if not os.path.exists(ignore) and config_dir is not None:
-        # Derived and cache material only. The research bundle patterns are anchored to the
-        # research layout, so a person's own ``sources/`` elsewhere stays theirs to commit.
-        atomic.write_text(ignore, GITIGNORE_TEMPLATE.format(config_dir=config_dir.name))
+        # Derived and cache material only, the board's and what each card owner derives (anchored
+        # to its own layout, so a person's own ``sources/`` elsewhere stays theirs to commit).
+        atomic.write_text(ignore, GITIGNORE_TEMPLATE.format(config_dir=config_dir.name)
+                          + "".join(owner.gitignore() for owner in owners.registered()))
         actions.append(".gitignore written")
     con = tasks.connect(os.path.expanduser(_cfg_db()))
     try:
@@ -749,7 +739,7 @@ def _refuse_whole_home(folder):
         raise RuntimeError(
             f"{folder} is your home directory; a project has to be a folder of its own. "
             "Make one and initialize that instead, for example:\n"
-            "  mkdir ~/research && cd ~/research && misaka init")
+            "  mkdir ~/project && cd ~/project && misaka init")
 
 
 def _cfg_db():

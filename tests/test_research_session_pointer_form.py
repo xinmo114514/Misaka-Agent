@@ -97,7 +97,7 @@ def test_pointers_are_stored_relative_and_read_absolute(env):
     run, node = awaiting(env.con, env, node_level=False)
     stored_run = env.con.execute("SELECT root_session FROM research_runs WHERE id=?",
                                  (run["id"],)).fetchone()[0]
-    stored_node = env.con.execute("SELECT session_file FROM research_branches WHERE id=?",
+    stored_node = env.con.execute("SELECT session_file FROM research_execution WHERE id=?",
                                   (node["id"],)).fetchone()[0]
     # The board keeps the portable home-relative name...
     assert stored_run and not os.path.isabs(stored_run)
