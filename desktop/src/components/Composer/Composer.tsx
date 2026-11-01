@@ -52,28 +52,28 @@ const PERMISSION_MODE_OPTIONS: {
     label: '标准模式',
     icon: ShieldCheck,
     badgeColor: 'text-warning',
-    desc: '敏感与越界命令需人工审批（推荐）',
+    desc: '仅当前会话：敏感与越界命令需人工审批（推荐）',
   },
   {
     id: 'plan',
     label: '只读规划',
     icon: BookOpen,
     badgeColor: 'text-permission-plan',
-    desc: '严格只读，禁止改动文件，文献研读/大纲论证专用',
+    desc: '仅当前会话：严格只读，禁止改动文件，文献研读/大纲论证专用',
   },
   {
     id: 'acceptEdits',
     label: '自动编辑',
     icon: FileEdit,
     badgeColor: 'text-permission-edit',
-    desc: '工作区内文件自由读写修改，无需逐次审批',
+    desc: '仅当前会话：工作区内文件自由读写修改，无需逐次审批',
   },
   {
     id: 'bypassPermissions',
     label: '完全放行',
     icon: Zap,
     badgeColor: 'text-permission-bypass',
-    desc: '完全自主执行，跳过所有权限询问（无阻执行）',
+    desc: '仅当前会话：完全自主执行，跳过所有权限询问（无阻执行）',
   },
   {
     id: 'research',
@@ -642,7 +642,7 @@ export const Composer: React.FC<ComposerProps> = ({ onOpenModelSettings, welcome
                   aria-expanded={showModePicker}
                   aria-haspopup="menu"
                 disabled={researchStarting || isSessionLoading || Boolean(sessionLoadError) || Boolean(sessionOperation) || isCompacting}
-                  title="点击切换 Agent 模式"
+                  title="点击切换 Agent 模式；权限设置仅对当前会话生效"
                 >
                   <CurrentModeIcon className={"w-3.5 h-3.5 " + currentModeConfig.badgeColor} />
                   <span className={currentModeConfig.badgeColor}>{currentModeConfig.label}</span>
@@ -653,7 +653,7 @@ export const Composer: React.FC<ComposerProps> = ({ onOpenModelSettings, welcome
                 {showModePicker && (
                   <div className="conversation-permission-popover misaka-glass-popover absolute bottom-full left-0 mb-2 w-72 max-h-[min(24rem,calc(100dvh-10rem))] overflow-y-auto rounded-xl bg-card border border-border-subtle shadow-e3 p-2 z-50 text-xs space-y-1">
                     <div className="px-2 py-1 text-[11px] font-semibold text-text-main border-b border-border-subtle">
-                      选择 Agent 模式
+                      选择 Agent 模式（权限仅当前会话生效）
                     </div>
                     {PERMISSION_MODE_OPTIONS.map((opt) => {
                       const OptIcon = opt.icon

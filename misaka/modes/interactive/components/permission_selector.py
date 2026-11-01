@@ -58,7 +58,7 @@ class PermissionSelectorComponent(Container):
         self.selectList.onCancel = onCancel
         self.addChild(self.selectList)
         self.addChild(Spacer(1))
-        self.addChild(Text(theme.fg("dim", "  Enter to select · Esc to cancel"), 0, 0))
+        self.addChild(Text(theme.fg("dim", "  Current session only · Enter to select · Esc to cancel"), 0, 0))
         self.addChild(DynamicBorder())
 
     def handleInput(self, data: str) -> None:

@@ -735,8 +735,8 @@ class SettingsSelectorComponent(Container):
             ),
             SettingItem(
                 id="permission-mode",
-                label="Permission mode",
-                description="Agent tool permission boundary",
+                label="Permission mode (current session)",
+                description="Agent tool permission boundary for the current session only",
                 currentValue=PERMISSION_MODE_LABELS.get(config.permissionMode, config.permissionMode),
                 values=list(PERMISSION_MODE_LABELS.values()),
             ),

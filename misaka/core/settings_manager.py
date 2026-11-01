@@ -957,12 +957,6 @@ class SettingsManager:
     def setDefaultProjectTrust(self, defaultProjectTrust: DefaultProjectTrust) -> None:
         self._set_global_value("defaultProjectTrust", defaultProjectTrust)
 
-    def getPermissionMode(self) -> str:
-        return str(self.settings.get("permissionMode") or "default")
-
-    def setPermissionMode(self, mode: str) -> None:
-        self._set_global_value("permissionMode", mode)
-
     def getOrCreateDeviceId(self) -> str:
         """Stable ID of this installation, e.g. sent to OpenAI as its agent host ID.
 

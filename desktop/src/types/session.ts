@@ -124,6 +124,8 @@ export interface PermissionRequestPayload {
   reason?: string
   mode?: string
   agentId?: string | null
+  suggestionLabel?: string
+  canApplySuggestions?: boolean
 }
 
 export type TreeFilterMode = 'default' | 'no-tools' | 'user-only' | 'labeled-only' | 'all'

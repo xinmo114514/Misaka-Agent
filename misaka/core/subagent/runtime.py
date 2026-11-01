@@ -2421,7 +2421,7 @@ class SubagentManager:
         """Bubble a synchronous/bubble agent permission to the parent UI."""
 
         resolver = getattr(self.session, "requestAgentPermission", None)
-        if callable(resolver):
+        if callable(resolver) and callable(getattr(self.session, "_agentPermissionResolver", None)):
             try:
                 value = resolver(task, dict(event))
                 return bool(await value) if inspect.isawaitable(value) else bool(value)

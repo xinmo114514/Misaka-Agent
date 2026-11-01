@@ -914,7 +914,11 @@ class InteractiveMode:
         setCapabilityOverrides(self.settingsManager.getTerminalCapabilityOverrides())
         self.options = options
         self.autoTrustOnReloadCwd = options.autoTrustOnReloadCwd
-        self.runtimeHost.setBeforeSessionInvalidate(lambda: self.resetExtensionUI())
+        def invalidateSessionUI() -> None:
+            self.clearAgentPermissionResolver()
+            self.resetExtensionUI()
+
+        self.runtimeHost.setBeforeSessionInvalidate(invalidateSessionUI)
 
         async def rebindSession(_session: Any = None) -> None:
             await self.rebindCurrentSession({"renderBeforeBind": True})
@@ -2179,6 +2183,14 @@ class InteractiveMode:
             if callable(setAutocompleteMaxVisible):
                 setAutocompleteMaxVisible(autocompleteMaxVisible)
 
+    def clearAgentPermissionResolver(self) -> None:
+        owner = getattr(self, "_permissionResolverOwner", None)
+        self._permissionResolverOwner = None
+        self._permissionResolverToken = None
+        setter = getattr(owner, "setAgentPermissionResolver", None)
+        if callable(setter):
+            setter(None)
+
     async def rebindCurrentSession(self, options: dict[str, Any] | None = None) -> None:
         if options is None:
             options = {}
@@ -2188,8 +2200,21 @@ class InteractiveMode:
             self.unsubscribe()
         self.unsubscribe = None
         self.programStatus.reset()
+        InteractiveMode.clearAgentPermissionResolver(self)
         if hasattr(self.session, "setAgentPermissionResolver"):
-            self.session.setAgentPermissionResolver(self.handleAgentPermissionRequest)
+            token = object()
+            self._permissionResolverOwner = session
+            self._permissionResolverToken = token
+
+            async def resolvePermission(task: Any, event: dict[str, Any]) -> dict[str, Any]:
+                if self.session is not session or self._permissionResolverToken is not token:
+                    return {"approved": False, "scope": "once"}
+                result = await self.handleAgentPermissionRequest(task, event)
+                if self.session is not session or self._permissionResolverToken is not token:
+                    return {"approved": False, "scope": "once"}
+                return result
+
+            session.setAgentPermissionResolver(resolvePermission)
         self.applyRuntimeSettings()
 
         if options.get("renderBeforeBind"):
@@ -5361,11 +5386,11 @@ class InteractiveMode:
             self.session.setPermissionMode(mode)
             self.footer.invalidate()
             self.ui.requestRender()
-            self.showStatus(f"Permission mode: {mode}")
+            self.showStatus(f"Current session permission mode: {mode}")
         except Exception as error:  # noqa: BLE001
             self.showError(f"Failed to set permission mode: {error}")
 
-    async def handleAgentPermissionRequest(self, task: Any, event: dict[str, Any]) -> bool:
+    async def handleAgentPermissionRequest(self, task: Any, event: dict[str, Any]) -> dict[str, Any]:
         tool_name = str(event.get("toolName") or "tool")
         reason = event.get("reason") or "Tool requires permission to execute"
         rendered = json.dumps(event.get("toolInput") or {}, ensure_ascii=False, sort_keys=True)
@@ -5374,18 +5399,17 @@ class InteractiveMode:
         agent_prefix = f"Agent {task.id}" if task is not None and getattr(task, "id", None) else "Agent"
         title = f"{agent_prefix} permission: {tool_name}"
         message = str(reason) + "\n" + rendered
-        options = [
-            "Yes, allow once",
-            "Yes, always allow in this session",
-            "No, deny",
-        ]
+        suggestion_label = event.get("suggestionLabel")
+        can_apply = (isinstance(event.get("suggestions"), list) and bool(event["suggestions"])
+                     and isinstance(suggestion_label, str) and bool(suggestion_label.strip()))
+        options = ["Yes, allow once"]
+        if can_apply:
+            options.append(suggestion_label)
+        options.append("No, deny")
         prompt_text = title + "\n" + message
         choice = await self.showExtensionSelector(prompt_text, options)
-        if choice == "Yes, always allow in this session":
-            if hasattr(self.session, "addSessionPermission"):
-                self.session.addSessionPermission(tool_name)
-            return True
-        return choice == "Yes, allow once"
+        return {"approved": choice == "Yes, allow once" or (can_apply and choice == suggestion_label),
+                "scope": "suggested" if can_apply and choice == suggestion_label else "once"}
 
     def showTrustSelector(self) -> None:
         cwd = self.sessionManager.getCwd()
@@ -7205,6 +7229,7 @@ class InteractiveMode:
             pass
 
     def stop(self) -> None:
+        InteractiveMode.clearAgentPermissionResolver(self)
         # MISAKA fork (D1): no fullscreen exit output to choose.
         self.disposeActiveSelector()
         # MISAKA fork: cancels the extension dialog waiting for its turn as well.

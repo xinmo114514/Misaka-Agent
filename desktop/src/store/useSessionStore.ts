@@ -308,7 +308,7 @@ interface SessionState {
   setActiveResearchGraphRunId: (runId: string | null) => void
   setResearchHistoryOpen: (open: boolean) => void
   fetchResearchCardDetails: (runId: string) => Promise<void>
-  respondPermission: (requestId: string, decision: 'allow' | 'deny', scope?: 'once' | 'session', feedback?: string) => void
+  respondPermission: (requestId: string, decision: 'allow' | 'deny', scope?: 'once' | 'suggested', feedback?: string) => void
   setDraft: (text: string) => void
   takeRetainedEditorText: () => string | null
   /** Runs `/tree` and `/compact [instructions]`; reports whether the text was a command. */
@@ -1981,6 +1981,8 @@ export const useSessionStore = create<SessionState>((set, get) => ({
           reason: ev.reason,
           mode: ev.mode,
           agentId: ev.agentId,
+          suggestionLabel: ev.suggestionLabel,
+          canApplySuggestions: ev.canApplySuggestions,
         },
       })
       return

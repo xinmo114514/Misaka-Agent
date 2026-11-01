@@ -18,8 +18,8 @@ export const PermissionDialog: React.FC = () => {
     respondPermission(requestId, 'allow', 'once', feedback)
   }
 
-  const handleAllowSession = () => {
-    respondPermission(requestId, 'allow', 'session', feedback)
+  const handleAllowSuggested = () => {
+    respondPermission(requestId, 'allow', 'suggested', feedback)
   }
 
   const handleDeny = () => {
@@ -130,14 +130,14 @@ export const PermissionDialog: React.FC = () => {
             <Check className="w-3.5 h-3.5" />
             <span>本次允许</span>
           </button>
-          <button
+          {pending.canApplySuggestions === true && pending.suggestionLabel?.trim() && <button
             type="button"
-            onClick={handleAllowSession}
+            onClick={handleAllowSuggested}
             className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium bg-accent hover:opacity-90 text-on-accent transition-colors cursor-pointer shadow-e2"
           >
             <ShieldCheck className="w-3.5 h-3.5" />
-            <span>本会话始终允许</span>
-          </button>
+            <span>{pending.suggestionLabel}</span>
+          </button>}
         </div>
       </div>
     </div>

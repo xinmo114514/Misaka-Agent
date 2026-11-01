@@ -698,6 +698,7 @@ class AgentSession:
         return unsubscribe
 
     def dispose(self) -> None:
+        self._agentPermissionResolver = None
         try:
             self.abortRetry()
             self.abortCompaction()
@@ -1355,10 +1356,31 @@ class AgentSession:
 
     async def requestAgentPermission(self, task: Any, event: dict[str, Any]) -> bool:
         resolver = getattr(self, "_agentPermissionResolver", None)
-        if callable(resolver):
-            res = resolver(task, event)
-            return bool(await res) if inspect.isawaitable(res) else bool(res)
-        return False
+        if not callable(resolver):
+            return False
+        # Capture the owner's policy and native suggestions before awaiting the UI.
+        # Neither a client response nor a later session switch may replace the grant.
+        suggestions = copy.deepcopy(event.get("suggestions"))
+        apply_updates = next((
+            policy.apply_permission_updates
+            for part in self.moments.parts
+            if (policy := getattr(part, "policy", None)) is not None
+            and callable(getattr(policy, "apply_permission_updates", None))
+        ), None)
+        res = resolver(task, copy.deepcopy(event))
+        if inspect.isawaitable(res):
+            res = await res
+        if getattr(self, "_agentPermissionResolver", None) is not resolver:
+            return False
+        if not isinstance(res, Mapping):
+            return isinstance(res, bool) and res
+        approved = res.get("approved") is True
+        if (approved and res.get("scope") == "suggested"
+                and isinstance(suggestions, list) and suggestions
+                and isinstance(event.get("suggestionLabel"), str) and event["suggestionLabel"].strip()
+                and apply_updates is not None):
+            apply_updates(suggestions)
+        return approved
 
     def addSessionPermission(self, rule: str) -> None:
         if not hasattr(self, "_sessionPermissions"):
@@ -1377,9 +1399,7 @@ class AgentSession:
                 val = getter()
                 if val is not None:
                     return val
-        if hasattr(self, "settingsManager"):
-            return self.settingsManager.getPermissionMode()
-        return "default"
+        return None
 
     def setPermissionMode(self, mode: str) -> None:
         from misaka.core.subagent.configuration import validate_permission_mode
@@ -1390,8 +1410,8 @@ class AgentSession:
             setter = getattr(part, "set_permission_mode", None)
             if callable(setter):
                 setter(validated_mode)
-        if hasattr(self, "settingsManager"):
-            self.settingsManager.setPermissionMode(validated_mode)
+        if not any(callable(getattr(part, "set_permission_mode", None)) for part in self.moments.parts):
+            raise ValueError("This session has no agent permission policy part")
         self._emit({"type": "permission_mode_change", "mode": validated_mode, "previousMode": previous_mode})
 
     def registerCustomTools(self, definitions: list[Any]) -> None:

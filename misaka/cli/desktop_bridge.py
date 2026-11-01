@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import os
 import signal
@@ -1132,8 +1133,8 @@ async def run_desktop_bridge(runtime_host: Any, options: Any = None) -> int:
     desktop_tasks: set[asyncio.Task[None]] = set()
     research_input_tasks: set[asyncio.Task[None]] = set()
     took_over = False
-    pending_permissions: dict[str, asyncio.Future[Any]] = {}
-    pending_permission_tool_names: dict[str, str] = {}
+    pending_permissions: dict[str, tuple[Any, asyncio.Future[Any], list[Any]]] = {}
+    permission_channel_open = True
     commands: deque[tuple[str, float] | None] = deque()
     commands_available = asyncio.Event()
     # One long session operation at a time, so a command never interleaves with a navigation or
@@ -1187,12 +1188,23 @@ async def run_desktop_bridge(runtime_host: Any, options: Any = None) -> int:
         })
 
 
-    async def bridge_permission_resolver(task: Any, event: dict[str, Any]) -> bool:
+    def cancel_permissions() -> None:
+        for _owner, future, _suggestions in tuple(pending_permissions.values()):
+            if not future.done():
+                future.set_result({"approved": False, "scope": "once"})
+        pending_permissions.clear()
+
+    async def bridge_permission_resolver(owner: Any, task: Any, event: dict[str, Any]) -> dict[str, Any]:
+        if disposed or not permission_channel_open or owner is not session:
+            return {"approved": False, "scope": "once"}
         perm_id = f"perm_{uuid.uuid4().hex[:8]}"
         future = loop.create_future()
-        pending_permissions[perm_id] = future
+        label = event.get("suggestionLabel")
+        suggestions = copy.deepcopy(event.get("suggestions"))
+        can_apply = (isinstance(suggestions, list) and bool(suggestions)
+                     and isinstance(label, str) and bool(label.strip()))
+        pending_permissions[perm_id] = (owner, future, suggestions if can_apply else [])
         tool_name = str(event.get("toolName") or "tool")
-        pending_permission_tool_names[perm_id] = tool_name
         req_event = {
             "type": "permission:request",
             "requestId": perm_id,
@@ -1200,17 +1212,18 @@ async def run_desktop_bridge(runtime_host: Any, options: Any = None) -> int:
             "toolName": tool_name,
             "toolInput": event.get("toolInput", {}),
             "reason": event.get("reason"),
-            "mode": session.getPermissionMode() or "default",
+            "mode": owner.getPermissionMode() or "default",
+            "canApplySuggestions": can_apply,
+            "suggestionLabel": label if can_apply else None,
         }
         handle_event(req_event)
         try:
             res = await future
-            return bool(res.get("approved")) if isinstance(res, dict) else bool(res)
+            return res
         except Exception:  # noqa: BLE001 - failed permission resolves as denied
-            return False
+            return {"approved": False, "scope": "once"}
         finally:
             pending_permissions.pop(perm_id, None)
-            pending_permission_tool_names.pop(perm_id, None)
 
     if not isStdoutTakenOver():
         takeOverStdout()
@@ -1247,6 +1260,9 @@ async def run_desktop_bridge(runtime_host: Any, options: Any = None) -> int:
         if disposed:
             return
         disposed = True
+        cancel_permissions()
+        if hasattr(session, "setAgentPermissionResolver"):
+            session.setAgentPermissionResolver(None)
         if callable(unsubscribe):
             unsubscribe()
             unsubscribe = None
@@ -1266,6 +1282,9 @@ async def run_desktop_bridge(runtime_host: Any, options: Any = None) -> int:
 
     async def rebind_session(_session: Any = None) -> None:
         nonlocal session, unsubscribe, unsubscribe_backpressure, prompt_preflight_lock, research_ingress, research_controller
+        cancel_permissions()
+        if hasattr(session, "setAgentPermissionResolver"):
+            session.setAgentPermissionResolver(None)
         session = runtime_host.session
         research_ingress = ResearchMessageIngress(session)
         end_session_operation()
@@ -1336,7 +1355,8 @@ async def run_desktop_bridge(runtime_host: Any, options: Any = None) -> int:
         if callable(unsubscribe_backpressure):
             unsubscribe_backpressure()
         if hasattr(session, "setAgentPermissionResolver"):
-            session.setAgentPermissionResolver(bridge_permission_resolver)
+            session.setAgentPermissionResolver(
+                lambda task, event, owner=session: bridge_permission_resolver(owner, task, event))
         unsubscribe = session.subscribe(handle_event)
         unsubscribe_backpressure = session.agent.subscribe(
             lambda _event, _signal=None: waitForRawStdoutBackpressure()
@@ -1626,11 +1646,7 @@ async def run_desktop_bridge(runtime_host: Any, options: Any = None) -> int:
                     task.cancel()
                 if preparations:
                     await asyncio.gather(*preparations, return_exceptions=True)
-                for fut in list(pending_permissions.values()):
-                    if not fut.done():
-                        fut.set_result({"approved": False, "reason": "aborted"})
-                pending_permissions.clear()
-                pending_permission_tool_names.clear()
+                cancel_permissions()
                 await abort_session.abort()
                 # A run may have been created just before the renderer received its
                 # discipline notice. Cancel that owned startup via the native stop door.
@@ -1677,14 +1693,12 @@ async def run_desktop_bridge(runtime_host: Any, options: Any = None) -> int:
             decision = obj.get("decision", "deny")
             scope = obj.get("scope", "once")
             feedback = obj.get("feedback")
-            fut = pending_permissions.pop(perm_id, None)
-            tool_name = pending_permission_tool_names.pop(perm_id, None)
-            if fut is not None and not fut.done():
-                if decision == "allow" and scope == "session" and tool_name:
-                    session.addSessionPermission(tool_name)
+            pending = pending_permissions.pop(perm_id, None)
+            if pending is not None and pending[0] is session and not pending[1].done():
+                _owner, fut, suggestions = pending
                 fut.set_result({
                     "approved": decision == "allow",
-                    "scope": scope,
+                    "scope": "suggested" if scope in ("suggested", "session") and suggestions else "once",
                     "feedback": feedback,
                 })
                 write_ack(req_id, ok=True)
@@ -3216,12 +3230,17 @@ async def run_desktop_bridge(runtime_host: Any, options: Any = None) -> int:
         await dispatch_command(obj, queued_at)
 
     async def command_worker() -> None:
+        nonlocal permission_channel_open
         while True:
             await commands_available.wait()
             item = commands.popleft()
             if not commands:
                 commands_available.clear()
             if item is None:
+                # No more responses can arrive. Resolve approvals before draining
+                # prompts, or a prompt waiting for its person would deadlock EOF.
+                permission_channel_open = False
+                cancel_permissions()
                 if desktop_tasks:
                     await asyncio.gather(*tuple(desktop_tasks), return_exceptions=True)
                 if prompt_tasks:

@@ -81,15 +81,13 @@ async def test_session_permission_resolver_and_session_grants():
 
 
 @pytest.mark.asyncio
-async def test_subagent_part_session_permissions():
-    from misaka.core.subagent.extension import SubagentPart
-    from misaka.core.subagent.runtime import RoleContext
+async def test_subagent_part_session_permissions(tmp_path, monkeypatch):
+    from tests.test_ccb_permission_modes import _part
 
-    ctx = RoleContext(role="general", profile_dir="", mcp_role="", workspace=".")
-    part = SubagentPart(ctx, permitted=False)
+    part, _, _ = _part(tmp_path, monkeypatch, mode="default")
     assert part.get_permission_settings() is None
 
     part.add_session_permission("write")
-    assert part.get_permission_settings() == {"allow": ["write"]}
+    assert part.get_permission_settings() == {"allow": ["write"], "additionalDirectories": []}
     part.add_session_permission("bash")
-    assert part.get_permission_settings() == {"allow": ["write", "bash"]}
+    assert part.get_permission_settings() == {"allow": ["write", "bash"], "additionalDirectories": []}
