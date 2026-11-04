@@ -19,6 +19,7 @@ from misaka.core.auth_storage import InMemoryAuthStorageBackend
 from misaka.core.tools.truncate import truncateMiddle
 from misaka.extensions.mcp import MAX_SERVERS_SECTION_CHARS, renderServersSection
 from misaka.extensions.mcp.config import (
+    addMcpServerConfig,
     getMcpToolExposure,
     loadMcpConfig,
     updateMcpServerConfig,
@@ -145,6 +146,60 @@ def test_lets_project_entries_override_enabled_and_exposure_of_global_servers(tm
     # Overrides keep `enabled: true`, since it replaces the global value.
     updateMcpServerConfig(project, "tools", {"enabled": True})
     assert json.loads(Path(project).read_text(encoding="utf-8"))["mcpServers"]["tools"] == {"enabled": True}
+
+
+# Regression: #11191.
+def test_reads_and_edits_mcp_json_files_that_start_with_a_utf8_bom(tmp_path):
+    paths = setup(tmp_path, {}, {})
+    globalPath = Path(paths["agentDir"]) / "mcp.json"
+    projectPath = home.project_dir(paths["cwd"]) / "mcp.json"
+    globalPath.write_text('\ufeff{"mcpServers":{"demo":{"command":"echo","enabled":false}}}\n', encoding="utf-8")
+    projectPath.write_text('\ufeff{"mcpServers":{"local":{"command":"local-cmd"}}}\n', encoding="utf-8")
+
+    loaded = loadMcpConfig({**paths, "projectTrusted": True})
+    assert loaded["errors"] == []
+    assert [[server["name"], server["scope"]] for server in loaded["servers"]] == [["demo", "global"], ["local", "project"]]
+
+    assert addMcpServerConfig(str(globalPath), "other", {"command": "other-cmd"}) is False
+    assert json.loads(globalPath.read_text(encoding="utf-8"))["mcpServers"] == {
+        "demo": {"command": "echo", "enabled": False},
+        "other": {"command": "other-cmd"},
+    }
+
+
+def test_a_roles_file_overlays_the_global_one_and_a_trusted_project_overlays_both(tmp_path):
+    """MISAKA fork: a role's `mcp.json` (`roleDir`) is read between the global file and the project's, as a project
+    file is, except that it may use `auth`: the user writes it, not a repository."""
+    globalServers = {"docs": {"command": "global-docs"}, "web": {"url": "https://web.example/mcp"},
+                     "keep": {"command": "keep"}}
+    paths = setup(tmp_path, {"autoEnableCodemode": False, "mcpServers": globalServers}, {
+        "mcpServers": {"docs": {"enabled": False}, "repo": {"url": "https://repo.example/mcp", "auth": {"provider": "x"}}},
+    })
+    role = tmp_path / "role"
+    role.mkdir()
+    (role / "mcp.json").write_text(json.dumps({"autoEnableCodemode": True, "mcpServers": {
+        "docs": {"command": "role-docs"},
+        "web": {"exposure": "direct"},
+        "radius": {"url": "https://radius.example/mcp", "auth": {"provider": "radius"}},
+        "orphan": {"enabled": False},
+    }}), encoding="utf-8")
+    rolePath, projectPath = str(role / "mcp.json"), str(home.project_dir(paths["cwd"]) / "mcp.json")
+
+    loaded = loadMcpConfig({**paths, "roleDir": str(role), "projectTrusted": True})
+
+    entries = {entry["name"]: entry for entry in loaded["servers"]}
+    assert [(name, entry["scope"], entry.get("override")) for name, entry in entries.items()] == [
+        ("docs", "role", projectPath), ("web", "global", rolePath), ("keep", "global", None), ("radius", "role", None),
+    ]
+    assert entries["docs"]["config"] == {"command": "role-docs", "enabled": False}
+    assert entries["web"]["config"] == {"url": "https://web.example/mcp", "exposure": "direct"}
+    assert entries["radius"]["config"]["auth"] == {"provider": "radius"}
+    assert loaded["errors"] == [
+        f'{rolePath}: server "orphan" needs "command" or "url", or a global server to override',
+        f'{projectPath}: server "repo": auth is only allowed in the global mcp.json',
+    ]
+    assert loaded["autoEnableCodemode"] is True
+    assert loaded["roleConfig"] == rolePath and loaded["projectConfig"] == projectPath
 
 
 # Regression: #10239.

@@ -75,6 +75,26 @@ ThemeColorsSchema: dict[str, Any] = {
     "additionalProperties": False,
 }
 
+DesktopThemeSchema: dict[str, Any] = {
+    "type": "object",
+    "description": "Optional styling tokens for the desktop client",
+    "properties": {
+        "surface0": colorValue("Desktop surface 0 (app background)"),
+        "surface1": colorValue("Desktop surface 1 (panels, titlebar)"),
+        "surface2": colorValue("Desktop surface 2 background"),
+        "surface3": colorValue("Desktop surface 3 background"),
+        "surfaceHover": colorValue("Desktop surface hover state"),
+        "borderSubtle": colorValue("Desktop subtle border"),
+        "border": colorValue("Desktop standard border"),
+        "borderStrong": colorValue("Desktop strong border (focus / emphasis)"),
+        "borderAccent": colorValue("Desktop accent border"),
+        "disabled": colorValue("Desktop disabled text / element color"),
+        "focusRing": colorValue("Desktop focus ring outline"),
+        "chart": {"type": "array", "description": "Desktop chart palette", "items": ColorValueSchema},
+    },
+    "additionalProperties": False,
+}
+
 ThemeJsonSchema: dict[str, Any] = {
     "type": "object",
     "required": ["name", "colors"],
@@ -97,6 +117,7 @@ ThemeJsonSchema: dict[str, Any] = {
             "description": "Reusable color variables",
         },
         "colors": ThemeColorsSchema,
+        "desktop": DesktopThemeSchema,
         "export": {
             "type": "object",
             "properties": {
@@ -123,6 +144,21 @@ class _ThemeJsonExport(TypedDict, total=False):
     infoBg: ThemeColorValue
 
 
+class _ThemeJsonDesktop(TypedDict, total=False):
+    surface0: ThemeColorValue
+    surface1: ThemeColorValue
+    surface2: ThemeColorValue
+    surface3: ThemeColorValue
+    surfaceHover: ThemeColorValue
+    borderSubtle: ThemeColorValue
+    border: ThemeColorValue
+    borderStrong: ThemeColorValue
+    borderAccent: ThemeColorValue
+    disabled: ThemeColorValue
+    focusRing: ThemeColorValue
+    chart: list[ThemeColorValue]
+
+
 ValidatedThemeJson = TypedDict(
     "ValidatedThemeJson",
     {
@@ -131,6 +167,7 @@ ValidatedThemeJson = TypedDict(
         "appearance": NotRequired[Literal["dark", "light"]],
         "vars": NotRequired[dict[str, ThemeColorValue]],
         "colors": ThemeColorValues[ThemeColorValue],
+        "desktop": NotRequired[_ThemeJsonDesktop],
         "export": NotRequired[_ThemeJsonExport],
     },
 )

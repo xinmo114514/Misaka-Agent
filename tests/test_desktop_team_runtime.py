@@ -259,10 +259,11 @@ async def test_real_original_agent_recruits_roles_before_native_planner(prompt_h
         intake = next(e for e in entries if e.get('type') == 'custom_message' and e.get('customType') == 'desktop-intake')
         assert intake['display'] is False
         assert intake['content'] == 'Compare the archival evidence'
-        assert 'Desktop research team intake' in str(observed[0].messages[0].content)
+        from misaka.ai.utils.text import getSystemMessageText
+        assert 'Desktop research team intake' in getSystemMessageText(observed[0].messages[0])
         assert runs.action(con,run['id'],runs.root(con,run['id'])['id'],'plan')['payload']['status']=='clarify'
         assert [m['name'] for m in controller.snapshot()['team']['members']] == ['archive-specialist']
-        assert 'archive-specialist' in str(observed[2].messages[0].content)
+        assert 'archive-specialist' in getSystemMessageText(observed[2].messages[0])
         assert any(e['type']=='desktop-team' for e in events)
         assert not any(p.name == 'desktop_recruit_agent' for p in wiring.tools_for(wiring.SessionSpec(
           profile_dir=str(prompt_home/'profiles/last_order'),role='last_order',workspace=str(workspace),kind='foreground')))
@@ -757,9 +758,11 @@ async def test_root_scene_lists_shared_sources_separately_from_task_assignees(tm
     scope=DesktopExecutionScope(team,current_config())
     scene=DesktopScenePart(scope,root=True)
     scene.session=SimpleNamespace(sessionManager=SimpleNamespace(getCwd=lambda:str(tmp_path)))
-    prompt=await scene.before_agent_start({'systemPrompt':'Root'},None)
-    assert 'historical-source' in prompt['systemPrompt']
-    assert 'borrow' in prompt['systemPrompt'].lower()
+    event={'systemPrompt':'Root','systemPromptOptions':{'sections':{}}}
+    assert await scene.before_agent_start(event,None) is None
+    prompt=event['systemPromptOptions']['sections']['desktop_research']
+    assert 'historical-source' in prompt
+    assert 'borrow' in prompt.lower()
     assert sister_catalog(str(team.profile_root))==[]
     member=team.recruit('local-historian','Analyze provenance','Resolve archival uncertainty',
         'Report evidence and gaps',source_id='historical-source')

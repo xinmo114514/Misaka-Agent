@@ -50,12 +50,31 @@ lists them all.
 | `misaka task add TITLE --to SISTER --body-file FILE` | add a card by hand (`--body TEXT`, `--reviewer`, `--priority`, `--model`, `--needs ID`); the body needs `## acceptance criteria` |
 | `misaka task start ID` | run a ready card in this terminal |
 | `misaka task ID --delete` | delete a card and its history |
-| `misaka mcp add SERVER [-l] -- COMMAND [ARGS...]` | add a process MCP server to Last Order's `profiles/last_order/mcp.json` (`-l`: this project's `.misaka/mcp.json`) |
-| `misaka mcp add SERVER [-l] --url URL` | add a Streamable HTTP MCP server; `misaka mcp --help` lists the options |
-| `misaka mcp remove SERVER [-l]` | remove a server |
-| `misaka mcp list [--json]` | connect the servers of Last Order's file and the project's and show their state, tools and errors; exits 1 while anything is wrong |
+| `misaka mcp add SERVER [-g \| -l] -- COMMAND [ARGS...]` | add a process MCP server to the role's `mcp.json` -- Last Order's `profiles/last_order/mcp.json`, or that of the role whose session runs the command (`-g`: the global `~/.misaka/mcp.json`, which every role reads; `-l`: this project's `.misaka/mcp.json`) |
+| `misaka mcp add SERVER [-g \| -l] --url URL` | add a Streamable HTTP MCP server; `misaka mcp --help` lists the options |
+| `misaka mcp remove SERVER [-g \| -l]` | remove a server |
+| `misaka mcp list [--json]` | connect the servers of the global file, the role's and the project's and show their state, tools and errors; exits 1 while anything is wrong |
 | `misaka mcp login SERVER [--timeout SECONDS]` / `logout SERVER` | sign in to an OAuth server through the browser, or delete the stored sign-in. `--timeout` limits the whole sign-in, including the requests to the server's sign-in service (default 300 seconds) |
 | `misaka mcp --as SISTER ...` | any of the above for that Sister: her `mcp.json` and her sign-ins |
+
+### Reading
+
+Reading materials closely with Last Order; see [Reading materials](../guide/reading.md). `open` and
+`graph` call no model. The reading operations use `--model provider/id`, else `MISAKA_READING_MODEL`,
+else Last Order's model; `chat` keeps the model of the conversation that leads the reading unless
+given `--model`.
+
+| Command | What it does |
+|---|---|
+| `misaka read open SOURCE... --question Q` | add files or URLs and open a reading with its entry node N0; `--intent TEXT` records what you care about |
+| `misaka read act RUN_ID ACTION --node NODE_ID` | one of the eight actions on a node (`--focus`, `--lens`, `--context`, `--question`) |
+| `misaka read fork RUN_ID --node NODE_ID --lens "A" --lens "B"` | independent lines from a node, read in parallel |
+| `misaka read compare RUN_ID NODE_ID NODE_ID ... --question Q` | compare two or more nodes in a new node |
+| `misaka read reread RUN_ID --node OLD --using NEW` | reread older material with a newer understanding |
+| `misaka read graph RUN_ID` | the reading map and the node files |
+| `misaka read chat RUN_ID` | talk with the reading's leader, one turn per line of input; `/stop` leaves |
+
+`--workspace`, `--runs-dir` and `--json` are accepted where they apply.
 
 ### Documents and the web
 
@@ -138,6 +157,20 @@ Available in Last Order's window.
 | `/research resume RUN_ID --here` | continue the run in this window (this Last Order will not remember the run's earlier conversation) |
 | `/research help` | the full usage |
 
+### Reading
+
+Available in Last Order's window, which leads the reading it opens ([Reading materials](../guide/reading.md)).
+
+| Command | What it does |
+|---|---|
+| `/read open SOURCE... --question Q` | open a reading in this folder; this window leads it |
+| `/read act RUN_ID ACTION --node NODE_ID` | one action, as in the terminal |
+| `/read fork`, `compare`, `reread`, `graph` | the same operations as `misaka read` |
+| `/read chat RUN_ID [--here]` | which conversation leads a reading; `--here` makes this window lead it |
+| `/read stop` | stop the running operation, whether you or Last Order started it |
+| `/read close` | leave reading mode; the reading stays on disk |
+| `/read --help` | the full usage |
+
 ### The team
 
 | Command | What it does |
@@ -149,7 +182,7 @@ Available in Last Order's window.
 | `/remove [ID]` | remove a Sister (in Last Order's window) |
 | `/board` | the task board of this project |
 | `/agents` | sub-agent types and running sub-agents (in a Sister's window) |
-| `/mcp` | manage MCP servers: sign in, reconnect, enable or disable one (everywhere or in this project only), change how the model reaches its tools |
+| `/mcp` | manage MCP servers: sign in, reconnect, enable or disable one (everywhere, for this role only, or in this project only), change how the model reaches its tools |
 | `/mcp login [SERVER]` / `logout [SERVER]` / `reconnect [SERVER]` | one of those actions without the menu |
 
 ### Models

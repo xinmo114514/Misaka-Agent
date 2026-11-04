@@ -14,9 +14,10 @@ import {
 import { useSettingsStore } from '../../../store/useSettingsStore'
 import { clipboardErrorMessage, copyTextToClipboard } from '../../../lib/clipboard'
 import { SettingsRow } from '../SettingsRow'
+import desktopPackage from '../../../../package.json'
 
 export const AboutSection: React.FC = () => {
-  const [version, setVersion] = useState<string>('0.19.18')
+  const [version, setVersion] = useState<string>(desktopPackage.version)
   const [copiedDiag, setCopiedDiag] = useState(false)
   const [copyingDiag, setCopyingDiag] = useState(false)
   const [copyDiagError, setCopyDiagError] = useState<string | null>(null)
@@ -32,7 +33,7 @@ export const AboutSection: React.FC = () => {
 
   useEffect(() => {
     if (window.app?.getVersion) {
-      window.app.getVersion().then(setVersion)
+      window.app.getVersion().then(setVersion).catch(() => { /* Keep the bundled version if IPC is unavailable. */ })
     }
     // Run diagnostics initially
     runDiagnostics()

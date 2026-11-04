@@ -449,7 +449,10 @@ class DesktopScenePart:
         if member:
             text += ('\nResponsibility: ' + member['responsibility'] + '\nTask goal: ' + member['goal']
                      + '\nRole instructions: ' + member['instructions'] + '\n')
-        return {'systemPrompt': event['systemPrompt'].rstrip() + '\n\n' + text}
+        # Parts contribute sections before extensions add theirs (for example,
+        # MCP's server catalog). A complete prompt here would force that earlier
+        # rendering and discard every section the extensions add afterwards.
+        event['systemPromptOptions']['sections']['desktop_research'] = text
 
     async def session_shutdown(self, _event, _context):
         await self.scope.release_session(self.session)

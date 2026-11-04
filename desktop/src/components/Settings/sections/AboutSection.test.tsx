@@ -21,4 +21,22 @@ describe('AboutSection diagnostic copy feedback', () => {
     expect(await screen.findByRole('alert')).toHaveTextContent('permission denied')
     expect(screen.queryByText('已复制')).not.toBeInTheDocument()
   })
+
+  it('shows the upgraded desktop package version when the shell API is unavailable', () => {
+    window.app = { ...window.app, getVersion: undefined } as any
+    render(<AboutSection />)
+    expect(screen.getByText('v0.19.23')).toBeInTheDocument()
+  })
+
+  it('keeps the package version when the shell version lookup fails', async () => {
+    window.app.getVersion = vi.fn().mockRejectedValue(new Error('shell unavailable'))
+    render(<AboutSection />)
+    expect(await screen.findByText('v0.19.23')).toBeInTheDocument()
+  })
+
+  it('uses the shell version when running a packaged desktop release', async () => {
+    window.app.getVersion = vi.fn().mockResolvedValue('9.8.7')
+    render(<AboutSection />)
+    expect(await screen.findByText('v9.8.7')).toBeInTheDocument()
+  })
 })
