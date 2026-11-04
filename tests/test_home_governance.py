@@ -108,23 +108,30 @@ def test_paths_follow_the_home_at_each_lookup_and_a_test_override_is_undone(tmp_
 
 
 def test_the_home_is_never_a_project(tmp_path, monkeypatch):
-    real = tmp_path / "user" / home.DIR_NAME
-    real.mkdir(parents=True)
+    # The native Windows runner can provision the real symlink before Python
+    # starts when the host restricts link creation in child processes.
+    supplied_root = os.environ.get("MISAKA_TEST_HOME_SYMLINK_ROOT")
+    case_root = Path(supplied_root).resolve() if supplied_root else tmp_path
+    real = case_root / "user" / home.DIR_NAME
+    real.mkdir(parents=True, exist_ok=True)
     monkeypatch.setenv(home.ENV_HOME, str(real))
-    assert home.project_dir(tmp_path / "user") is None                      # run from $HOME
+    assert home.project_dir(case_root / "user") is None                     # run from $HOME
     assert home.project_dir(real / "tasks" / "t_1") == real / "tasks" / "t_1" / home.DIR_NAME
-    assert home.project_dir(tmp_path / "repo") == tmp_path / "repo" / home.DIR_NAME
+    assert home.project_dir(case_root / "repo") == case_root / "repo" / home.DIR_NAME
 
     # The home reached through a symlink is still the home.
-    (tmp_path / "linked").mkdir()
-    (tmp_path / "linked" / home.DIR_NAME).symlink_to(real)
-    assert home.project_dir(tmp_path / "linked") is None
+    (case_root / "linked").mkdir(exist_ok=True)
+    link = case_root / "linked" / home.DIR_NAME
+    if not supplied_root:
+        link.symlink_to(real, target_is_directory=True)
+    assert link.is_symlink() and link.samefile(real)
+    assert home.project_dir(case_root / "linked") is None
 
     # A home that is not called .misaka is only a project's config directory by coincidence.
-    custom = tmp_path / "custom-home"
+    custom = case_root / "custom-home"
     custom.mkdir()
     monkeypatch.setenv(home.ENV_HOME, str(custom))
-    assert home.project_dir(tmp_path / "user") == tmp_path / "user" / home.DIR_NAME
+    assert home.project_dir(case_root / "user") == case_root / "user" / home.DIR_NAME
 
 
 def test_project_scope_is_absent_when_the_working_directory_is_the_users_home(tmp_path, monkeypatch):

@@ -29,12 +29,21 @@
 | 桌面研究、提示词、主题、权限、TUI 与会话绑定 | 113 passed；原生桌面子代理另行隔离运行 1 passed |
 | 上游阅读、MCP/OAuth/HTTP、角色设置、提示词装配、schema 和扩展边界 | 291 passed、1 skipped、20 subtests passed |
 | MCP 真实工具调用与 CLI 列表 | 5 个受合跑影响的用例独立运行通过；临时配置 stdio 冒烟检查发现 `echo`，状态 connected，退出码 0 |
+| 目录治理与真实符号链接 | 原生 Windows 入口运行完整文件：19 passed、2 skipped（POSIX 权限位测试）；符号链接单项通过，未跳过 |
 | 前端关于页面、审批、模式及会话切换 | 33 passed |
 | TypeScript | `tsc --noEmit` 通过 |
 | React/Electron 生产构建 | Vite 构建通过；保留现有的大 bundle 提示 |
 | 生成文件及新增 Python schema/测试静态检查 | `generate_schemas.py --check`、Ruff、Git whitespace 检查通过 |
 | 独立代码审查 | 无待修问题 |
 
-Windows 合跑部分子进程测试时曾出现 `WinError 5`，相关 MCP、schema 子进程和原生桌面子代理已拆开复核。`test_the_home_is_never_a_project` 仍因 Windows 拒绝创建目录软链接而无法通过；未为此放宽测试断言或修改系统权限。
+Windows 合跑部分子进程测试时曾出现 `WinError 5`，相关 MCP、schema 子进程和原生桌面子代理已拆开复核。
+
+部分 Windows 宿主允许原生 PowerShell 创建符号链接，却拒绝 Python 测试进程创建链接。这类环境使用下列入口运行目录治理测试：
+
+```powershell
+& .\scripts\test_home_symlink.ps1
+```
+
+入口在忽略的 `.venv` 目录内创建全新真实目录符号链接，再运行测试并传递退出码。测试验证 `is_symlink()`、`samefile()` 和原有项目目录隔离断言；没有模拟链接、跳过该用例或修改系统权限。未指定原生预建夹具时，测试继续使用普通的 `Path.symlink_to()`。可通过 `-TestPath 'tests/test_home_governance.py::test_the_home_is_never_a_project'` 单独运行此项。
 
 该记录覆盖定向兼容回归，不代表整个仓库的全量测试结果。适配保留本地桌面功能；没有向远端推送或创建 PR。
